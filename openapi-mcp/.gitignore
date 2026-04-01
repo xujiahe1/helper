@@ -1,0 +1,20 @@
+dist/
+build/
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+.DS_Store
+.idea/
+.vscode/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.ps1
+/ref
+.venv/
+
+# 运行时文件
+.wave_mcp.pid
+wave_mcp.log

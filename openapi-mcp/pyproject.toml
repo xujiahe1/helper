@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-server-wave"
+version = "0.1.0"
+description = "Wave Open Platform MCP Server"
+readme = "README.md"
+requires-python = ">=3.12"
+dynamic = ["dependencies"]
+
+[project.scripts]
+mcp-server-wave = "tools.server:main"
+
+[tool.setuptools]
+packages = ["tools"]
+
+[tool.setuptools.package-data]
+tools = ["km_doc.md"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }

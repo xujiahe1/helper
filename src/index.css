@@ -1,0 +1,114 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  overflow: hidden;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+.sidebar-scrollbar::-webkit-scrollbar-thumb {
+  background: #475569;
+}
+
+.sidebar-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
+}
+
+/* Firefox scrollbar */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+}
+
+.sidebar-scrollbar {
+  scrollbar-color: #475569 transparent;
+}
+
+.markdown-body h1 { font-size: 1.5em; font-weight: 700; margin: 1em 0 0.5em; }
+.markdown-body h2 { font-size: 1.25em; font-weight: 600; margin: 0.8em 0 0.4em; }
+.markdown-body h3 { font-size: 1.1em; font-weight: 600; margin: 0.6em 0 0.3em; }
+.markdown-body p { margin: 0.5em 0; line-height: 1.7; }
+.markdown-body ul, .markdown-body ol { margin: 0.5em 0; padding-left: 1.5em; }
+.markdown-body li { margin: 0.25em 0; line-height: 1.6; }
+.markdown-body blockquote {
+  border-left: 3px solid #6366f1;
+  padding-left: 1em;
+  margin: 0.5em 0;
+  color: #64748b;
+}
+.markdown-body table {
+  border-collapse: collapse;
+  margin: 0.5em 0;
+  width: 100%;
+}
+.markdown-body th, .markdown-body td {
+  border: 1px solid #e2e8f0;
+  padding: 0.5em 0.75em;
+  text-align: left;
+}
+.markdown-body th {
+  background: #f8fafc;
+  font-weight: 600;
+}
+.markdown-body a {
+  color: #6366f1;
+  text-decoration: underline;
+}
+.markdown-body hr {
+  border: none;
+  border-top: 1px solid #e2e8f0;
+  margin: 1em 0;
+}
+
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+.typing-cursor::after {
+  content: '▋';
+  animation: blink 1s infinite;
+  color: #6366f1;
+}
+
+@keyframes toastSlideIn {
+  from { transform: translateX(100%); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+.toast-slide-in {
+  animation: toastSlideIn 0.2s ease-out;
+}
+
+@keyframes highlightFade {
+  0% { background-color: rgb(224 231 255); }
+  100% { background-color: transparent; }
+}
+
+.animate-highlight-fade {
+  animation: highlightFade 2.5s ease-out forwards;
+}
