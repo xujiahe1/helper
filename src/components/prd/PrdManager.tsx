@@ -476,6 +476,32 @@ export function PrdManager() {
   }
   const totalEntities = uniqueEntityNames.size
 
+  // 统计实体数：归一化实体 + 未被归一化覆盖的文档原始实体
+  const displayEntityCount = useMemo(() => {
+    if (filteredNormalizedEntities.length === 0) return totalEntities
+
+    // 收集归一化实体已覆盖的名称
+    const coveredNames = new Set<string>()
+    for (const ne of filteredNormalizedEntities) {
+      coveredNames.add(ne.canonicalName)
+      for (const alias of ne.aliases) {
+        coveredNames.add(alias)
+      }
+    }
+
+    // 统计未被归一化覆盖的文档原始实体
+    const uncoveredNames = new Set<string>()
+    for (const doc of filteredDocuments) {
+      for (const entity of doc.entities) {
+        if (!coveredNames.has(entity.name)) {
+          uncoveredNames.add(entity.name)
+        }
+      }
+    }
+
+    return filteredNormalizedEntities.length + uncoveredNames.size
+  }, [filteredNormalizedEntities, filteredDocuments, totalEntities])
+
   // 冲突统计（包含实体冲突和关系冲突）
   const { unresolvedConflictCount, resolvedConflictCount, totalConflictCount } = useMemo(() => {
     let unresolved = 0
@@ -550,7 +576,7 @@ export function PrdManager() {
               <div className="flex items-center gap-4 text-sm text-gray-500">
                 <span>{doneDocsCount}/{totalDocs} 已解析</span>
                 <span className="text-gray-300">|</span>
-                <span>{filteredNormalizedEntities.length > 0 ? filteredNormalizedEntities.length : totalEntities} 个实体</span>
+                <span>{displayEntityCount} 个实体</span>
                 {/* 冲突入口按钮 */}
                 {unresolvedConflictCount > 0 ? (
                   <button
@@ -696,7 +722,7 @@ export function PrdManager() {
                           </span>
                         </>
                       ) : (
-                        <>全部文档 <span className="text-xs text-gray-400">({documents.length})</span></>
+                        <>全部文档 <span className="text-xs text-gray-400">({filteredDocuments.length})</span></>
                       )}
                     </h2>
                     {selectedEntityName && (

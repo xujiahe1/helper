@@ -15,6 +15,7 @@ import { MermaidBlock } from './MermaidBlock'
 import { PrdCardRenderer } from './prd/PrdCardRenderer'
 
 function CodeBlock({ className, children }: { className?: string; children?: ReactNode }) {
+  const [copied, setCopied] = useState(false)
   const match = /language-(\w+)/.exec(className || '')
   const codeString = String(children).replace(/\n$/, '')
   const isBlock = match || codeString.includes('\n')
@@ -22,6 +23,29 @@ function CodeBlock({ className, children }: { className?: string; children?: Rea
   const lang = (match?.[1] || '').toLowerCase()
   const looksLikeMermaid =
     /^\s*(flowchart|sequenceDiagram|classDiagram|stateDiagram|stateDiagram-v2|erDiagram|journey|gantt|pie|mindmap|timeline|quadrantChart|gitGraph|graph)\b/.test(codeString.trim())
+
+  const handleCopy = async () => {
+    try {
+      // 优先使用 clipboard API
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(codeString)
+      } else {
+        // fallback: 使用 textarea + execCommand
+        const textarea = document.createElement('textarea')
+        textarea.value = codeString
+        textarea.style.position = 'fixed'
+        textarea.style.left = '-9999px'
+        document.body.appendChild(textarea)
+        textarea.select()
+        document.execCommand('copy')
+        document.body.removeChild(textarea)
+      }
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch (err) {
+      console.error('Copy failed:', err)
+    }
+  }
 
   if (lang === 'mermaid' || (!lang && isBlock && looksLikeMermaid)) {
     return <MermaidBlock code={codeString} />
@@ -33,10 +57,10 @@ function CodeBlock({ className, children }: { className?: string; children?: Rea
         <div className="flex items-center justify-between bg-slate-800 text-slate-300 px-4 py-2 text-xs">
           <span>{match?.[1] || 'code'}</span>
           <button
-            onClick={() => navigator.clipboard.writeText(codeString)}
-            className="hover:text-white transition-colors"
+            onClick={handleCopy}
+            className="hover:text-white transition-colors flex items-center gap-1"
           >
-            复制
+            {copied ? <><Check size={12} /> 已复制</> : '复制'}
           </button>
         </div>
         <pre className="bg-slate-900 text-slate-100 p-4 overflow-x-auto text-[13px] leading-relaxed">
@@ -163,15 +187,40 @@ function GeneratedImages({ attachments }: { attachments: Message['attachments'] 
 
   const handleCopyImage = async (dataUrl: string, id: string) => {
     try {
-      const res = await fetch(dataUrl)
-      const blob = await res.blob()
-      await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })])
+      // 尝试使用 ClipboardItem API 复制图片
+      if (navigator.clipboard?.write) {
+        const res = await fetch(dataUrl)
+        const blob = await res.blob()
+        await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })])
+      } else {
+        // fallback: 复制 dataUrl 文本
+        const textarea = document.createElement('textarea')
+        textarea.value = dataUrl
+        textarea.style.position = 'fixed'
+        textarea.style.left = '-9999px'
+        document.body.appendChild(textarea)
+        textarea.select()
+        document.execCommand('copy')
+        document.body.removeChild(textarea)
+      }
       setCopiedId(id)
       setTimeout(() => setCopiedId(null), 2000)
     } catch {
-      await navigator.clipboard.writeText(dataUrl)
-      setCopiedId(id)
-      setTimeout(() => setCopiedId(null), 2000)
+      // 最后的 fallback
+      try {
+        const textarea = document.createElement('textarea')
+        textarea.value = dataUrl
+        textarea.style.position = 'fixed'
+        textarea.style.left = '-9999px'
+        document.body.appendChild(textarea)
+        textarea.select()
+        document.execCommand('copy')
+        document.body.removeChild(textarea)
+        setCopiedId(id)
+        setTimeout(() => setCopiedId(null), 2000)
+      } catch (e) {
+        console.error('Copy image failed:', e)
+      }
     }
   }
 
@@ -374,10 +423,25 @@ export const MessageBubble = memo(function MessageBubble({ message, isStreaming,
   const isThinkingPhase = isStreaming && hasThinking && !message.content
   const isFailed = !isUser && message.content.startsWith('\u26a0\ufe0f')
 
-  const handleCopy = () => {
-    navigator.clipboard.writeText(message.content)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
+  const handleCopy = async () => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(message.content)
+      } else {
+        const textarea = document.createElement('textarea')
+        textarea.value = message.content
+        textarea.style.position = 'fixed'
+        textarea.style.left = '-9999px'
+        document.body.appendChild(textarea)
+        textarea.select()
+        document.execCommand('copy')
+        document.body.removeChild(textarea)
+      }
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    } catch (err) {
+      console.error('Copy failed:', err)
+    }
   }
 
   return (

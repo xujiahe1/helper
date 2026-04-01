@@ -117,37 +117,67 @@ export const EntityGraph = memo(function EntityGraph({
   // 节点位置（可被拖拽修改）
   const [nodePositions, setNodePositions] = useState<Map<string, { x: number; y: number }>>(new Map())
 
-  // 优先使用归一化实体，否则从文档聚合
+  // 归一化实体 + 未被归一化覆盖的文档原始实体合并展示
   const entityNodes = useMemo(() => {
-    // 如果有归一化实体，优先使用
-    if (normalizedEntities.length > 0) {
-      return normalizedEntities.map(ne => ({
-        name: ne.canonicalName,
-        count: ne.versions.length,
-        docIds: [...new Set(ne.versions.map(v => v.docId))],
-        normalizedId: ne.id,
-        // 只有未解决的冲突才显示冲突图标
-        hasConflict: ne.hasConflict && !ne.conflictResolution,
-        // 冲突已解决
-        conflictResolved: !!ne.conflictResolution,
-        aliasCount: ne.aliases.length,
-        versionCount: ne.versions.length,
-      })).sort((a, b) => b.count - a.count)
+    // 没有归一化实体时，直接从文档聚合
+    if (normalizedEntities.length === 0) {
+      const entityMap = new Map<string, EntityNode>()
+
+      for (const doc of documents) {
+        for (const entity of doc.entities) {
+          const existing = entityMap.get(entity.name)
+          if (existing) {
+            if (!existing.docIds.includes(doc.id)) {
+              existing.count++
+              existing.docIds.push(doc.id)
+            }
+          } else {
+            entityMap.set(entity.name, {
+              name: entity.name,
+              count: 1,
+              docIds: [doc.id],
+            })
+          }
+        }
+      }
+
+      return Array.from(entityMap.values()).sort((a, b) => b.count - a.count)
     }
 
-    // 否则从文档聚合
-    const entityMap = new Map<string, EntityNode>()
+    // 有归一化实体时：先加入归一化实体，再补充未被覆盖的文档原始实体
+    const result: EntityNode[] = normalizedEntities.map(ne => ({
+      name: ne.canonicalName,
+      count: ne.versions.length,
+      docIds: [...new Set(ne.versions.map(v => v.docId))],
+      normalizedId: ne.id,
+      hasConflict: ne.hasConflict && !ne.conflictResolution,
+      conflictResolved: !!ne.conflictResolution,
+      aliasCount: ne.aliases.length,
+      versionCount: ne.versions.length,
+    }))
 
+    // 收集归一化实体已覆盖的名称（canonicalName + 所有别名）
+    const coveredNames = new Set<string>()
+    for (const ne of normalizedEntities) {
+      coveredNames.add(ne.canonicalName)
+      for (const alias of ne.aliases) {
+        coveredNames.add(alias)
+      }
+    }
+
+    // 从文档中找出未被归一化覆盖的原始实体
+    const uncoveredMap = new Map<string, EntityNode>()
     for (const doc of documents) {
       for (const entity of doc.entities) {
-        const existing = entityMap.get(entity.name)
+        if (coveredNames.has(entity.name)) continue
+        const existing = uncoveredMap.get(entity.name)
         if (existing) {
           if (!existing.docIds.includes(doc.id)) {
             existing.count++
             existing.docIds.push(doc.id)
           }
         } else {
-          entityMap.set(entity.name, {
+          uncoveredMap.set(entity.name, {
             name: entity.name,
             count: 1,
             docIds: [doc.id],
@@ -156,7 +186,7 @@ export const EntityGraph = memo(function EntityGraph({
       }
     }
 
-    return Array.from(entityMap.values()).sort((a, b) => b.count - a.count)
+    return [...result, ...Array.from(uncoveredMap.values())].sort((a, b) => b.count - a.count)
   }, [documents, normalizedEntities])
 
   // 根据频率过滤实体（按分布比例）
