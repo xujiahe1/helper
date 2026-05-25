@@ -1,1 +1,0 @@
-export { PrdManager } from './PrdManager'
