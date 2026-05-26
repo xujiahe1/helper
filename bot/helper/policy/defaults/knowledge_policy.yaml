@@ -1,0 +1,40 @@
+# Knowledge promotion / decay / merge policy — M1 默认快照
+#
+# 设计参见 docs/architecture.md §8.6
+#
+# M1 阶段: 这份默认值打包在 bot 内,bot 启动时拷贝到 spec git repo 的 meta/policies/
+# 作为初始策略(if 不存在),后续策略变更走 spec repo 内的 PR / git diff,可审计。
+# bot 运行时**只从 spec repo 读策略**,这份 default 仅作首次种子。
+
+version: 2026.05.25-v1
+
+entity_promotion:
+  default:
+    min_raw_refs: 3              # 至少 N 条 raw 引用
+    require_spec_relation: true  # 必须关联到 spec / case / fact
+
+  by_type:
+    decision_concept:            # 决策性强,门槛低
+      min_raw_refs: 2
+      require_spec_relation: true
+
+    # 在外部系统已有权威表的类型,整类禁止晋升,只 inline
+    system_name:    { promote: never }
+    ticket_type:    { promote: never }
+    employee:       { promote: never }
+    project:        { promote: never }
+
+decay:
+  default:
+    months: 6
+    action: deprioritize         # frontmatter archived: true,降权但不删
+
+  by_type:
+    decision_concept:
+      action: never              # 决策概念终身保留
+    fact:
+      months: 3                  # 事实性 entity 比概念衰减快
+
+merge:
+  semantic_similarity_threshold: 0.85
+  judge_model: claude-sonnet-4-6

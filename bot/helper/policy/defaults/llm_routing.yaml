@@ -1,0 +1,47 @@
+# LLM model routing — M1 默认快照
+#
+# 设计参见 docs/architecture.md §8.6 — 与 knowledge_policy 同样规则:
+# 策略外置,入 spec git repo,改路由走 PR,git 历史可审计。
+#
+# bot 运行时只从 spec repo 内的 meta/policies/llm_routing.yaml 读;
+# 这份 default 仅作首次 seed。
+
+version: 2026.05.25-v1
+
+defaults:
+  max_tokens: 4096
+
+# task 类型 → 走哪个模型。各 task 用途详见 docs/runtime.md §1。
+tasks:
+  # ── 主路径(Pro): 推理 / 追问 / 冲突 judge / 自写代码 planner ──
+  ask:             { model: claude-opus-4-7, provider: anthropic }
+  elicit:          { model: claude-opus-4-7, provider: anthropic }
+  conflict_judge:  { model: claude-opus-4-7, provider: anthropic }
+  code_plan:       { model: claude-opus-4-7, provider: anthropic }
+
+  # ── 次路径(Sonnet): 结构化 / 分类 / 同义 judge ──
+  intent_classify: { model: claude-sonnet-4-6, provider: anthropic }
+  l1_structure:    { model: claude-sonnet-4-6, provider: anthropic }
+  synonym_judge:   { model: claude-sonnet-4-6, provider: anthropic }
+  schedule_parse:  { model: claude-sonnet-4-6, provider: anthropic }
+
+  # ── L1 预筛(mini): 群聊"听"路径上,关键词没命中时让小模型快速判 yes/no ──
+  # 群消息无差别全量跑 Sonnet L1 太烧;关键词预筛覆盖大头,边缘 case 让 mini 兜底。
+  # 输入只是一句话,目标是过滤噪音,准确率 80% 也比全量 Sonnet 经济得多。
+  l1_prefilter:    { model: qwen3.6-flash, provider: openai }
+
+  # ── 批量后台: M3 起才用上 ──
+  # 用途: 文档批量 ingest 抽事实候选 / Replay judge / L2 候选 entity 批量抽取
+  #
+  # 重要:bulk_extract 接收的是"已切片的小单元"(< 5K 字),不是整篇长文。
+  # 整篇文档的章节/段落切片在调用方用规则做,不用 LLM。
+  # 整篇长文的"全局理解"(主旨/大方向)走 Sonnet/Opus 主路径,不是 bulk_extract。
+  #
+  # 选 Qwen 而非 Claude 的理由:
+  #   1. Athenai 政策禁止 Claude 大批量数据打标
+  #   2. 切片后单元的简单抽取,Qwen flash 准确率够 + 速度快 + 成本低 1-2 个量级
+  bulk_extract:    { model: qwen3.6-flash, provider: openai }
+
+  # ── Embedding / Rerank (走专用入口,不通过 run()) ──
+  embedding:       { model: text-embedding-3-large, provider: openai }
+  rerank:          { model: qwen3-rerank, provider: openai }

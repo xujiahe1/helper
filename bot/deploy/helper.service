@@ -1,0 +1,38 @@
+[Unit]
+Description=Helper bot — decision spec factory
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=helper
+Group=helper
+WorkingDirectory=/opt/helper/bot
+EnvironmentFile=/etc/helper/helper.env
+EnvironmentFile=/etc/helper/wave.env
+
+# Athenai key + wave creds 都从 EnvironmentFile 读,不写在 unit 里
+ExecStart=/opt/helper/bot/.venv/bin/uvicorn helper.server:app \
+    --host 0.0.0.0 \
+    --port 8001 \
+    --log-level info
+
+Restart=always
+RestartSec=5
+
+# 限内存(服务器只 3.6G,docs/runtime.md §3 预算)
+MemoryMax=900M
+CPUQuota=150%
+
+# Sandbox 最小化
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/helper /var/log/helper
+PrivateTmp=true
+
+StandardOutput=append:/var/log/helper/helper.log
+StandardError=append:/var/log/helper/helper.err
+
+[Install]
+WantedBy=multi-user.target

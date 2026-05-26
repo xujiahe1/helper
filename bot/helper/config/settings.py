@@ -1,0 +1,59 @@
+"""集中从 .env 读配置。字段名小写,自动匹配大写 env 变量。"""
+
+from functools import lru_cache
+from pathlib import Path
+
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
+
+    athenai_api_key: str
+    athenai_base_url: str = "https://athenai.mihoyo.com"
+
+    helper_data_dir: Path = Path("./var/helper")
+    helper_spec_git_dir: Path = Path("./var/helper/git-repo")
+
+    wave_app_id: str = ""
+    wave_app_secret: str = ""
+    wave_callback_aes_key: str = ""
+    wave_callback_sign_token: str = ""
+    # Wave 开放平台 HTTP API(服务端 app_id+app_secret 自换 access_token)。
+    # NOT openapi-mcp — MCP 只能用登录用户身份,不能服务端用。
+    wave_open_api_base_url: str = "https://open.hoyowave.com"
+    # 默认米哈游租户(union_id ↔ 域账号互转时需要)。海外站换 cognosphere 那个。
+    wave_user_tenant_id: str = "ot_9c253a6cbabafcaf131ca0ab549049db"
+
+    helper_admin_sk: str = ""
+
+    log_level: str = "INFO"
+
+    @field_validator("helper_data_dir", "helper_spec_git_dir", mode="after")
+    @classmethod
+    def _resolve_path(cls, v: Path) -> Path:
+        return v.expanduser().resolve()
+
+    @property
+    def wave_callback_configured(self) -> bool:
+        return bool(
+            self.wave_app_id
+            and self.wave_callback_aes_key
+            and self.wave_callback_sign_token
+        )
+
+    @property
+    def admin_enabled(self) -> bool:
+        # 空 sk → admin 路由整体 404,不暴露探测面
+        return bool(self.helper_admin_sk)
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()  # type: ignore[call-arg]

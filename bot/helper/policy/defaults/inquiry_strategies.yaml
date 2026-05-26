@@ -1,0 +1,178 @@
+# 追问策略 — M2 灵魂模块,初始 20 条。
+#
+# 触发逻辑见 helper/inquiry/engine.py:
+#   - 每条 raw 进来后,扫所有策略,命中条件即触发追问
+#   - 每个策略每天对同一作者最多触发 max_per_day 次
+#
+# 字段:
+#   id              — 唯一标识,落 inquiry_log
+#   description     — 给人看的说明
+#   when            — 触发条件(简单 DSL,见 engine.py 的 _eval_condition)
+#                     keys: scene_empty / signals_count / tradeoffs_count / choice_empty /
+#                            rationale_empty / contains / not_contains / source_type
+#   question        — 问出去的话(支持 {scene}, {choice} 等变量)
+#   max_per_day     — 防骚扰
+
+version: 2026.05.25-v1
+
+strategies:
+  # ---- 完整性追问(L1 字段缺失) ----
+  - id: missing_rationale
+    description: 用户给了选择但没说原因
+    when:
+      choice_empty: false
+      rationale_empty: true
+    question: "你提到选了「{choice}」,但没说原因。能补一句为什么不选其他方案吗?"
+    max_per_day: 3
+
+  - id: missing_tradeoffs
+    description: 用户描述了选择但没说权衡过什么
+    when:
+      choice_empty: false
+      tradeoffs_count: 0
+    question: "「{choice}」之外,你有没有考虑过别的方案?它们的利弊是什么?"
+    max_per_day: 3
+
+  - id: missing_signals
+    description: 用户给了判断但没说基于什么信号
+    when:
+      signals_count: 0
+      rationale_empty: false
+    question: "你这个判断是基于什么具体观察 / 数据 / 反馈得出的?"
+    max_per_day: 3
+
+  - id: missing_scene
+    description: 看不清场景
+    when:
+      scene_empty: true
+    question: "这个判断是在什么具体场景下做出的?(谁 / 何时 / 何种情况)"
+    max_per_day: 3
+
+  # ---- 边界追问(决策性概念探边) ----
+  - id: edge_general_to_specific
+    description: 表述偏抽象,问反例
+    when:
+      contains: ["通常", "一般", "经常"]
+    question: "你说「通常」,有没有反例?哪种情况下这个判断不成立?"
+    max_per_day: 2
+
+  - id: edge_always_never
+    description: 用了绝对化词,挑战边界
+    when:
+      contains: ["一定", "永远", "绝不", "必须"]
+    question: "「{scene}」真的没有任何例外吗?能想到一个场景这个判断会失效吗?"
+    max_per_day: 2
+
+  - id: edge_quantitative
+    description: 给了模糊数量(几天/几人),量化追问
+    when:
+      contains: ["几天", "几个", "若干", "一些", "大概"]
+    question: "能给一个具体数字或区间吗?(便于后续复用)"
+    max_per_day: 2
+
+  # ---- 关系追问(连接到现有 entity / spec) ----
+  - id: relation_to_existing_spec
+    description: 当前判断和已有 spec 高度相关,问是否复用 / 修订
+    when:
+      has_similar_spec: true
+    question: "我看你这次的判断和已沉淀的「{similar_spec_title}」有关。是新场景还是要修订原规则?"
+    max_per_day: 1
+
+  - id: relation_supersedes
+    description: 看起来在覆盖某条旧规则,确认意图
+    when:
+      contains: ["以前", "之前", "之前是", "原来", "废弃"]
+    question: "你是在替换原来的某条做法吗?如果是,旧的从什么时候开始不适用了?"
+    max_per_day: 2
+
+  # ---- 不确定性追问 ----
+  - id: low_confidence_phrasing
+    description: 用户自己也不确定
+    when:
+      contains: ["可能", "或许", "也许", "不确定"]
+    question: "你说「{choice}」时是有把握的还是偏猜测?如果是猜测,什么情况下你会改变判断?"
+    max_per_day: 2
+
+  - id: hedge_too_many
+    description: 一句话里多个 hedge
+    when:
+      hedge_count_min: 2
+    question: "我读出几处不确定。能不能把这条判断里『确定的部分』和『猜测的部分』分开说一下?"
+    max_per_day: 1
+
+  # ---- 责任 / 谁的判断 ----
+  - id: who_decides
+    description: 没说谁是决策人 / 利益方
+    when:
+      contains: ["他们", "我们", "对方", "客户", "用户"]
+      not_contains: ["我", "I "]
+    question: "这个判断是你做的还是来自别人?如果是别人的判断,他/她的角色是什么?"
+    max_per_day: 2
+
+  # ---- 时效性追问 ----
+  - id: time_sensitivity
+    description: 决策可能有时效
+    when:
+      contains: ["上线前", "deadline", "ddl", "急", "最近"]
+    question: "这个判断的时效性多强?三个月后还成立吗?"
+    max_per_day: 2
+
+  # ---- 反例 / 失败案例追问 ----
+  - id: counter_example
+    description: 决策性强但没说"什么时候失效"
+    when:
+      choice_empty: false
+      tradeoffs_count_min: 1
+      contains_counter: false  # 没提到"除非 / 但 / 反例"
+    question: "这条做法有没有踩过坑?哪种情况下你不会这么做?"
+    max_per_day: 2
+
+  # ---- 复用追问 ----
+  - id: reusable_check
+    description: 决策能否复用到其他场景
+    when:
+      choice_empty: false
+      signals_count_min: 2
+    question: "这个判断只适用于「{scene}」,还是其他类似场景也适用?边界在哪?"
+    max_per_day: 1
+
+  # ---- 数据 / 证据追问 ----
+  - id: evidence_check
+    description: 给了判断但没提供数据
+    when:
+      contains: ["更好", "更快", "更高", "更低", "提升", "降低"]
+      not_contains_numbers: true
+    question: "「{choice}」效果具体提升 / 改善了多少?有量化结果吗?"
+    max_per_day: 2
+
+  # ---- 角色边界 ----
+  - id: role_scope
+    description: 跨角色决策,问授权
+    when:
+      contains: ["我决定", "我推动", "我说服"]
+    question: "这个决策在你的职责范围内吗?如果是跨域,谁最终拍板?"
+    max_per_day: 1
+
+  # ---- 经验 vs 直觉追问 ----
+  - id: gut_vs_data
+    description: 凭直觉
+    when:
+      contains: ["直觉", "感觉", "觉得", "我猜"]
+    question: "这是你的经验直觉还是有数据支撑?如果是直觉,以前类似情况几次成功几次失败?"
+    max_per_day: 2
+
+  # ---- 默认兜底(很久没追问) ----
+  - id: weekly_check_in
+    description: 用户周内首次贡献,问近况
+    when:
+      first_of_week: true
+    question: "本周第一条!最近有没有什么『反复决策的场景』值得沉淀的?"
+    max_per_day: 1
+
+  # ---- 信号噪声追问 ----
+  - id: signal_specificity
+    description: signal 太抽象
+    when:
+      signals_too_abstract: true
+    question: "你提到的信号「{first_signal}」可以更具体吗?哪个数字 / 谁说的 / 什么场景看到?"
+    max_per_day: 2
