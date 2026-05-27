@@ -1,13 +1,15 @@
 """Wave IM 回调端点 — AES 解密 + 签名校验 + event_id 去重 + 1s 响应。
 
-协议参考 KM mheo000ok1zs / 接收消息 v2 (mhmjqlrjlehq)。要点:
+协议参考 KM mheo000ok1zs(事件订阅概述)/ mh4sbu0higfc(回调地址校验事件)
+/ mhmjqlrjlehq(接收消息 v2)。要点:
   - Header: hoyowave-open-signature / -timestamp / -nonce / -appid
   - 加密: AES-CBC, key=secretKey.encode('utf-8'), iv=key[:16], PKCS7,
     密文 base64,Body 形如 {"encrypt": "<base64>"}。
     AES 变种由 key 字节数决定(16/24/32 → AES-128/192/256)。
   - 签名: sha256(timestamp + nonce + RAW_BODY_STRING + sign_token),
     其中 raw body 指**收到的整个 http body 字符串**(还未解密),hex digest 比对。
-  - 校验事件(URL 配置时下发): 解密后 body 含 challenge 字段,1s 内返
+  - 校验事件(URL 配置时下发, event_type=open.callbackurl.updated_v1):
+    challenge 嵌在 **event.challenge**(不是顶层),1.5s 内回
     {"challenge": "<原值>"}。
   - 普通事件: 1s 内 200 + ""(或 "{}"),event_id 7.1h 内去重,落 raw_inputs。
 
@@ -254,8 +256,11 @@ async def wave_callback(
         log.exception("wave webhook: decrypt failed")
         raise HTTPException(status_code=400, detail=f"decrypt failed: {type(e).__name__}") from e
 
-    # 4) 校验事件(URL 配置时下发):明文层有 challenge 字段就回显
-    challenge = payload.get("challenge")
+    # 4) 校验事件(URL 配置时下发):明文 event.challenge 存在就回显
+    #    协议参考 KM mh4sbu0higfc(回调地址校验事件)。事件类型 open.callbackurl.updated_v1,
+    #    challenge 嵌在 event.challenge 而不是顶层。1.5s 内回 {"challenge": "<原值>"}。
+    event_obj = payload.get("event")
+    challenge = event_obj.get("challenge") if isinstance(event_obj, dict) else None
     if isinstance(challenge, str) and challenge:
         return Response(
             content=json.dumps({"challenge": challenge}),
