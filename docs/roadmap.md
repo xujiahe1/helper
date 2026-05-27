@@ -32,13 +32,13 @@
 
 ### 周拆分
 
-| 周 | 交付 | 状态 |
-|---|---|---|
-| 周 1 | 本地: bot core + L1(真实 Athenai)+ sqlite + git store + model_router + Wave 回调签名/AES + admin sk + 后台 L1 sink | ✅ 完成,本地可验收 |
-| 周 2 | Wave 开放平台 API 出站(`wave_client`: access_token 自续期 + send_message + id_convert)+ webhook 接 ack 回执 + union_id → 域账号反查 + IdentityCache | 🟡 代码完成,真凭据 smoke 留待上服务器 |
-| 周 2(剩余) | raw 字段细化 + 部署到服务器(systemd + Wave 回调 URL 配置 + nginx 反代决策) | 待启动 |
-| 周 3 | 全流水线 IM 内打通 + Ask runtime + 联调 | |
-| 周 4 | dogfood: 用户在 IM 实际用,本对话切片作为第一批原料 | |
+| 周 | 交付 |
+|---|---|
+| 周 1 | 本地: bot core + L1(真实 Athenai)+ sqlite + git store + model_router + Wave 回调签名/AES + admin sk + 后台 L1 sink |
+| 周 2 | Wave 开放平台 API 出站(`wave_client`: access_token 自续期 + send_message + id_convert)+ webhook 接 ack 回执 + union_id → 域账号反查 + IdentityCache |
+| 周 2(剩余) | raw 字段细化 + 部署到服务器(systemd + Wave 回调 URL 配置 + nginx 反代决策) |
+| 周 3 | 全流水线 IM 内打通 + Ask runtime + 联调 |
+| 周 4 | dogfood: 用户在 IM 实际用,本对话切片作为第一批原料 |
 
 ### 周 1 本地验收 SOP
 
@@ -139,17 +139,6 @@ git -C var/helper/git-repo log --oneline     # init + 后续策略变更
 ### Kill 条件
 
 - 第二个领域要超过 3 周或大量改产品 → **不是产品,是定制项目** → 整个方向需要重新审视
-
----
-
-## 当前 open 问题(等用户拍)
-
-| # | 问题 | 当前推荐 |
-|---|---|---|
-| OP-1 | Wave bot 应用是否支持 `mhynetcn://` 自定义 scheme | 部署时再确认,不阻塞本地开发 |
-| OP-2 | `mhynetcn://` 协议细节(回调具体怎么投递) | 部署前要从 Wave 后台 / KM 5173 文档树读完整 |
-| OP-3 | 第二个领域专家是谁 | Month 2 末再找,Month 3 启动用 |
-| OP-4 | 服务器 nginx 是否要加 `/wave/webhook` 反代 | 看 OP-1/2 结论;如果 mhynetcn 直连 IP 就不需要 |
 
 ---
 

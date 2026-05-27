@@ -51,10 +51,9 @@ L1/L2/L4/L5 是地基。L3 是护城河。
 
 | 姿势 | 入口 | 处理 |
 |---|---|---|
-| 一句话判断 | IM @bot / Backend Web | L1 结构化 → 进 Inbox 等专家确认 |
+| 一句话判断 | IM @bot | L1 结构化 → 进 Inbox 等专家确认 |
 | 一段语音 | IM 语音 | ASR → L1 → Inbox |
-| 几篇文档 | IM 转发 / Backend Web 上传 | 切块抽取候选 → 进 Inbox 批量 review |
-| 几十篇文档 | Backend Web 批量 | 后台跑(批量模型),Top 20 待 review,其余低优先级入库 |
+| 几篇文档 | IM 转发 | 切块抽取候选 → 进 Inbox 批量 review |
 | 群被动 listen | IM | 默认收下 raw input,**不调 LLM 处理**(成本太重),@bot 或转发才走 LLM |
 
 ### Surface 2 — Inbox(我的待办)
@@ -88,7 +87,7 @@ cases/                 ← 历史 case
 
 ### Surface 4 — Ask(问数字人)
 
-最朴素的对话框(IM @bot 或 Backend Web)。回答**不是 RAG 的"找几段贴一起"**,而是**结构化推理 + 不确定性自标 + 引用**:
+最朴素的对话框(IM @bot)。回答**不是 RAG 的"找几段贴一起"**,而是**结构化推理 + 不确定性自标 + 引用**:
 
 ```
 Q: A 部门提了个加急工单,要不要走加急?
@@ -125,7 +124,7 @@ A: 倾向不走加急。依据:
 └──────────────────────────────────────────────────────────────┘
        ↓                                              ↑
 ┌──────────────────────────────────────────────────────────────┐
-│   IM Adapter (Wave webhook in/out)   ·   Backend Web (FastAPI) │
+│   IM Adapter (Wave webhook in/out)   ·   Browser Web (FastAPI) │
 └──────────────────────────────────────────────────────────────┘
        ↓                                              ↑
 ┌──────────────────────────────────────────────────────────────┐
@@ -391,8 +390,7 @@ helper policy evaluate --version=2026.05.25-v1 --dry-run
   │   ├── specs/
   │   ├── facts/
   │   └── cases/
-  ├── helper.db                ← SQLite: raw input + reasoning log + identity 缓存
-  ├── vectors.db               ← SQLite + sqlite-vec: embedding 索引
+  ├── helper.db                ← SQLite + sqlite-vec: raw input / reasoning log / identity 缓存 / embedding 索引,单库
   └── extensions/              ← 自迭代沉淀(B-持久,只外挂层)
        ├── daily_reminder.py
        └── .attempts/          ← 失败的 sandbox 尝试,归档不删

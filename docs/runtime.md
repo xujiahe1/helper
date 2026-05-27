@@ -21,7 +21,7 @@
 
 ### 1.3 实现 — model_router
 
-`bot/helper/router/model_router.py`(待实现)按 task_type 路由:
+`bot/helper/llm/router.py` 按 task_type 路由,模型表外置在 spec git repo 的 `meta/policies/llm_routing.yaml`,改路由走 PR + git diff:
 
 ```python
 TASK_MODEL = {
@@ -79,11 +79,11 @@ API: 走 Athenai `https://athenai.mihoyo.com/v1/messages`(Anthropic 原生兼容
 | 4 | **普通事件 1 秒内 HTTP 200 + body 为 `""` 或 `{}`** — 实际处理走后台 async,不要在响应链上做 LLM | Wave 退避重试(10s/30s/3m/1h/6h × 5),触发事件风暴 |
 | 5 | **event_id 去重 7.1 小时窗口** — `header.event_id` 写入 sqlite 表 `(event_id PRIMARY KEY, received_at)`,重复 event 直接 200 不处理 | 重试窗口内同一事件被多次执行(发重复消息 / 重复扣 LLM 配额) |
 
-**实现位置**: `bot/helper/im/wave_webhook.py` — FastAPI router,挂在 IM Adapter 进程下(8001 端口)。
+**实现位置**: `bot/helper/im/wave_webhook.py` — FastAPI router,挂在主 bot 进程下,监听 8001 端口(单进程,见 §3.1)。
 
 **密钥来源**: 本地开发用 `bot/.env`,服务器生产从 `/etc/helper/wave.env`(chmod 600 root only)读,**绝不入仓库**。
 
-**为什么不分 IM Adapter 独立进程**: 早期版本(M1)bot core 和 webhook 跑同一个 FastAPI app(同进程不同 router),省内存。M2 流量上来再拆。
+**为什么不分 IM Adapter 独立进程**: bot core / webhook / Browser Web 跑同一个 FastAPI app(同进程不同 router),省内存。流量上来再拆。
 
 ### 2.3 群 listen 边界
 
@@ -123,11 +123,9 @@ Wave union_id / user_id
 | 组件 | 预算 | 备注 |
 |---|---|---|
 | 已有(nginx + openapi-mcp + monitor) | ~250M | 不动 — openapi-mcp 是徐叶佳侧装的,bot 不连它 |
-| Bot Core | 500M | 单进程 + asyncio |
-| IM Adapter (FastAPI webhook) | 200M | 单进程 |
-| Backend Web (FastAPI + 静态) | 200M | 单进程 |
+| Bot 主进程(core + IM webhook + Browser Web 同 FastAPI app) | 900M | 单进程 + asyncio,见 §2.2 |
 | Sandbox | **峰值 800M / 严格串行 1 个** | systemd-run + cgroup |
-| SQLite + sqlite-vec | 200M | 嵌入 |
+| SQLite + sqlite-vec | 200M | 嵌入主进程 |
 | Buffer | 500M | OOM 防护 |
 | **合计** | **~2.6G** | 紧但够 |
 
@@ -210,8 +208,4 @@ systemd-run \
 | 集成测试 | 本地 + 临时 ssh tunnel(可选) | `ssh -R 8001:localhost:8001 root@10.234.81.212` 把本地 8001 露给服务器 |
 | 部署 | 服务器 | 改 Wave 回调 URL → `mhynetcn://10.234.81.212:8001/callback`,deploy systemd unit |
 
-部署清单(M2/M3 才用,现在不动):
-- 服务器装 Python 3.10+(已有)、sqlite-vec 扩展
-- 创建 `/var/lib/helper/`、`helper-sandbox` user
-- 部署 `bot/`,起 systemd unit
-- nginx 加配置反代 8001/8002
+部署清单详见 [`bot/deploy/README.md`](../bot/deploy/README.md)。

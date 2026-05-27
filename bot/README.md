@@ -16,30 +16,12 @@ cp .env.example .env
 helper hello   # 烟测试
 ```
 
-## 目录(随 Month 1 实施填充)
+## 目录
 
-```
-bot/
-  helper/
-    __init__.py
-    cli.py
-    core/         (待建)
-    ingest/       (待建)
-    ontology/     (待建)
-    elicit/       (待建,追问 engine)
-    conflict/     (待建)
-    store/        (待建)
-    compile/      (待建)
-    runtime/      (待建)
-    router/       (待建,model_router)
-    im/           (Month 2 才接 Wave)
-    web/          (待建,Backend Web)
-  pyproject.toml
-  .env.example
-```
+模块拆分见 [`docs/architecture.md`](../docs/architecture.md) §4 内部模块。
 
 `extensions/` 目录(自迭代外挂层)和 `var/`(本地数据)放在仓库根,不在 `bot/` 内。
 
-## 部署目标
+## 部署
 
-`10.234.81.212` — 但**只在 Month 2 末才部署**。开发阶段全程本地。
+部署目标 `10.234.81.212`,流程见 [`bot/deploy/README.md`](deploy/README.md)。

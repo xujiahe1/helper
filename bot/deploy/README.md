@@ -24,7 +24,7 @@ sudo $EDITOR /etc/helper/wave.env       # 填 APP_SECRET / AES_KEY / SIGN_TOKEN
 sudo $EDITOR /etc/helper/helper.env     # 填 ATHENAI_API_KEY / HELPER_ADMIN_SK
 
 # 4) 拉代码 + venv + 装包
-sudo -u helper git clone <repo> /opt/helper/bot
+sudo -u helper git clone https://github.com/xujiahe1/helper.git /opt/helper/bot
 cd /opt/helper/bot
 sudo -u helper python3.11 -m venv .venv
 sudo -u helper .venv/bin/pip install -e .
