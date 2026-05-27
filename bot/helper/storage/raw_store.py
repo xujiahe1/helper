@@ -75,30 +75,35 @@ def list_chat_history(
     *,
     limit: int = 30,
     since_days: int = 3,
+    since_minutes: int | None = None,
     exclude_raw_id: int | None = None,
 ) -> list[RawInput]:
-    """拉某个会话的近期消息。返回按时间正序(老→新),给 ask 拼上下文用。
+    """拉某个会话的近期消息。返回按时间正序(老→新)。
 
-    - chat_id 为空(私聊)直接返空列表 — 私聊用 ask 时本身就只有一问一答,无须上下文
-    - since_days 时间窗:超过这个天数前的消息不算上下文
-    - exclude_raw_id:把当前正在处理的那条排除,避免上下文里再出现一次
+    用途:
+    - ask 拼对话上下文(默认 since_days=3, limit=30)
+    - L1 抽取拉"被 @bot 那条 + 上下文窗口"作为整体素材
+      (传 since_minutes=30, limit=20 — 只要紧邻同话题的几条)
+
+    - chat_id 为空(私聊)直接返空列表
+    - since_minutes 优先于 since_days(传了就走分钟,否则按天)
+    - exclude_raw_id:把当前正在处理的那条排除
     - 仅 IM 来源(source_type 以 im_wave 开头)
     """
     if not chat_id:
         return []
-    cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
-    q = (
-        s.query(RawInput)
-        .filter(
-            RawInput.chat_id == chat_id,
-            RawInput.created_at >= cutoff.replace(tzinfo=None),
-            RawInput.source_type.like("im_wave%"),
-        )
-        .order_by(RawInput.id.desc())
-        .limit(limit)
+    if since_minutes is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
+    else:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
+    q = s.query(RawInput).filter(
+        RawInput.chat_id == chat_id,
+        RawInput.created_at >= cutoff.replace(tzinfo=None),
+        RawInput.source_type.like("im_wave%"),
     )
     if exclude_raw_id is not None:
         q = q.filter(RawInput.id != exclude_raw_id)
+    q = q.order_by(RawInput.id.desc()).limit(limit)
     rows = list(q.all())
     rows.reverse()  # 时间正序
     return rows

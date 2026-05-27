@@ -1,51 +1,44 @@
-"""Raw input → L1 结果的"水槽"。
+"""Raw input → L1 抽取的"水槽"。
 
 设计:
-- 每条 raw_input 至多一个 L1Result(以 raw_id 为主键)
-- process_raw(raw_id) 同步 + 幂等:已有结果(无 error)就跳过;有 error / 不存在则重跑
+- 一条 raw_input 至多一条 L1Result(raw 级元信息: error / model / created_at)
+- 同时写 0..N 条 L1Item(每个知识原子一行,(raw_id, idx) 主键)
+- process_raw(raw_id) 同步 + 幂等:已有成功 L1Result 就跳过;失败 / 不存在则重跑
+  重跑时先 DELETE 旧 L1Item 再写新的,避免 idx 残留
 - run_async_l1(raw_id) 给 webhook 用:fire-and-forget,失败只 log 不抛
-- backfill_pending() 给 CLI 用:扫所有缺 L1 / L1 失败的,重跑
+- backfill_pending() 扫所有缺 / 失败的,重跑
 
 为啥 sync entry + asyncio 包一层:Athenai 是阻塞 SDK 调用,1s 回调窗口塞不下,
-必须挤到独立线程里跑。M1 用 asyncio.to_thread 即可,M2 真要扛量再换 worker。
+必须挤到独立线程里跑。
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
-from helper.ingest.l1_structure import L1Structure, structure
+from helper.ingest.l1_structure import L1Output, structure
 from helper.llm.router import current_routing
 from helper.storage import session
-from helper.storage.models import L1Result, RawInput
+from helper.storage.models import L1Item, L1Result, RawInput
 
 log = logging.getLogger(__name__)
 
 
-def _to_row(raw_id: int, l1: L1Structure, model: str) -> L1Result:
-    import json
-
-    return L1Result(
-        raw_id=raw_id,
-        scene=l1.scene,
-        signals_json=json.dumps(l1.signals, ensure_ascii=False),
-        tradeoffs_json=json.dumps(l1.tradeoffs, ensure_ascii=False),
-        choice=l1.choice,
-        rationale=l1.rationale,
-        error=l1.error,
-        model=model,
-    )
-
-
 def process_raw(raw_id: int, *, force: bool = False) -> L1Result | None:
-    """跑 L1 → 写入 l1_results。失败也写(error 字段非空)。
+    """跑 L1 → 写 L1Result(raw 级)+ 0..N 条 L1Item(原子级)。
 
-    返回写入的行;raw_input 不存在或已有成功结果则返 None / 已存在的行。
-    幂等:已有 error="" 的结果直接返回,不重跑;force=True 强制重跑。
+    幂等: 已有 error="" 的 L1Result 直接返回,不重跑。force=True 强制重跑。
+    重跑时 DELETE 旧 L1Item 后重写。
+
+    群聊 @bot 路径会拉同 chat_id 30 分钟内 ≤20 条上下文 raw 一并喂 L1,
+    让 LLM 把"被 @bot 那条很短"导致的 scene/signals/rationale 缺失从上下文补齐。
     """
+    from helper.storage import raw_store
+
     with session() as s:
         raw = s.get(RawInput, raw_id)
         if raw is None:
@@ -55,38 +48,120 @@ def process_raw(raw_id: int, *, force: bool = False) -> L1Result | None:
         if existing is not None and not existing.error and not force:
             return existing
         text = raw.content_text
+        primary_speaker = raw.author_domain or ""
+        chat_id = raw.chat_id or ""
+        is_at_bot = bool(raw.is_at_bot)
 
-    l1 = structure(text)
+        # 群聊 @bot → 拉上下文窗口(私聊 chat_id 空,跳过;非 @bot 也跳过)
+        context_payload: list[dict] | None = None
+        if chat_id and is_at_bot:
+            ctx_rows = raw_store.list_chat_history(
+                s,
+                chat_id,
+                since_minutes=30,
+                limit=20,
+                exclude_raw_id=raw_id,
+            )
+            if ctx_rows:
+                context_payload = [
+                    {
+                        "raw_id": r.id,
+                        "speaker": r.author_domain or "user",
+                        "text": (r.content_text or "").strip(),
+                        "ts": r.created_at.strftime("%H:%M") if r.created_at else "",
+                    }
+                    for r in ctx_rows
+                ]
+
+    out = structure(
+        text,
+        context=context_payload,
+        primary_raw_id=raw_id,
+        primary_speaker=primary_speaker,
+    )
     routing = current_routing()
     model = routing.tasks["l1_structure"].model
 
     with session() as s:
+        # raw 级 metadata: upsert
         existing = s.get(L1Result, raw_id)
-        new_row = _to_row(raw_id, l1, model)
         if existing is None:
-            s.add(new_row)
+            s.add(L1Result(raw_id=raw_id, error=out.error, model=model))
         else:
-            existing.scene = new_row.scene
-            existing.signals_json = new_row.signals_json
-            existing.tradeoffs_json = new_row.tradeoffs_json
-            existing.choice = new_row.choice
-            existing.rationale = new_row.rationale
-            existing.error = new_row.error
-            existing.model = new_row.model
-        s.flush()
-        # 标 raw.processed(L1 出活就算 processed,后续 L2 / L3 各管各的)
-        if not l1.error:
+            existing.error = out.error
+            existing.model = model
+
+        # item 级: 重跑前先清,避免 idx 残留
+        s.execute(delete(L1Item).where(L1Item.raw_id == raw_id))
+        if out.ok:
+            for idx, it in enumerate(out.items):
+                s.add(L1Item(
+                    raw_id=raw_id,
+                    idx=idx,
+                    type=it.type,
+                    payload_json=json.dumps(it.payload, ensure_ascii=False),
+                ))
+
+        # 标 raw.processed
+        if out.ok:
             raw = s.get(RawInput, raw_id)
             if raw is not None:
                 raw.processed = True
+            # 顺手把 raw 入向量索引(失败 log + 跳过,不阻塞主流程)
+            try:
+                from helper.storage import vector as vec
+                vec.index_raw(s, raw_id)
+            except Exception:  # noqa: BLE001
+                log.exception("index_raw failed raw_id=%s", raw_id)
         s.commit()
+
+    # L1 成功 → 串接 4 个候选 consumer(各自独立 session,失败互不影响)
+    if out.ok:
+        _run_consumers(raw_id)
+
+    with session() as s:
         return s.get(L1Result, raw_id)
+
+
+def _run_consumers(raw_id: int) -> None:
+    """L1Item → 5 类候选表(concept/fact/case/relation;decision 留给 specgen 聚类)
+    + 末尾跑追问 Engine 扫边界缺口。每个 consumer 独立 try/except,失败互不影响。
+    """
+    try:
+        from helper.ontology import consume_concept_items, consume_relation_items
+        consume_concept_items(raw_id)
+    except Exception:  # noqa: BLE001
+        log.exception("consume_concept_items failed raw_id=%s", raw_id)
+    try:
+        consume_relation_items(raw_id)
+    except Exception:  # noqa: BLE001
+        log.exception("consume_relation_items failed raw_id=%s", raw_id)
+    try:
+        from helper.facts import consume_fact_items
+        consume_fact_items(raw_id)
+    except Exception:  # noqa: BLE001
+        log.exception("consume_fact_items failed raw_id=%s", raw_id)
+    try:
+        from helper.cases import consume_case_items
+        consume_case_items(raw_id)
+    except Exception:  # noqa: BLE001
+        log.exception("consume_case_items failed raw_id=%s", raw_id)
+    try:
+        from helper.inquiry import generate_inquiries
+        generate_inquiries(raw_id)
+    except Exception:  # noqa: BLE001
+        log.exception("generate_inquiries failed raw_id=%s", raw_id)
+    try:
+        from helper.conflict import detect_for_raw
+        detect_for_raw(raw_id)
+    except Exception:  # noqa: BLE001
+        log.exception("detect_for_raw failed raw_id=%s", raw_id)
 
 
 def _process_with_prefilter(raw_id: int) -> None:
     """群聊 listen 路径专用:先预筛,有判断信号才跑完整 L1。
 
-    无信号的消息也写一条空 L1Result(error="filtered")标记已处理过,
+    无信号的消息也写一条空 L1Result(error="filtered:...")标记已处理过,
     避免被 backfill_pending 反复扫到再尝试。
     """
     from helper.ingest.prefilter import should_run_l1
@@ -103,7 +178,6 @@ def _process_with_prefilter(raw_id: int) -> None:
         process_raw(raw_id)
         return
 
-    # 不跑 L1,落一条 filtered 标记位,标 raw.processed=True
     with session() as s:
         existing = s.get(L1Result, raw_id)
         if existing is None:
@@ -130,9 +204,9 @@ async def _run_in_thread(raw_id: int, *, prefilter: bool) -> None:
 def schedule_l1(raw_id: int, *, prefilter: bool = False) -> None:
     """给 webhook 用:在当前 event loop 里 fire-and-forget。
 
-    - prefilter=False(默认): 直接跑完整 L1,主路径 / CLI 用
+    - prefilter=False(默认): 直接跑完整 L1
     - prefilter=True: 群聊 listen 路径,先关键词预筛 + mini 模型兜底
-    没有 running loop(同步上下文,如 CLI)就直接同步跑——CLI ingest 本来也阻塞等结果。
+    没有 running loop(同步上下文,如 CLI)就直接同步跑。
     """
     from helper.im.queue import spawn
 
@@ -147,7 +221,6 @@ def schedule_l1(raw_id: int, *, prefilter: bool = False) -> None:
 def backfill_pending(*, limit: int = 50) -> list[int]:
     """扫缺 L1 / L1 失败的 raw_input,重跑。返回处理过的 raw_id 列表。"""
     with session() as s:
-        # 缺 L1Result
         missing = s.execute(
             select(RawInput.id)
             .outerjoin(L1Result, L1Result.raw_id == RawInput.id)
@@ -155,7 +228,6 @@ def backfill_pending(*, limit: int = 50) -> list[int]:
             .order_by(RawInput.id.desc())
             .limit(limit)
         ).scalars().all()
-        # 有 L1Result 但 error 非空(filtered:* 是预筛主动跳过,不算错误)
         errored = s.execute(
             select(L1Result.raw_id)
             .where(L1Result.error != "")

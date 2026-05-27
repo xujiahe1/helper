@@ -84,6 +84,7 @@ def build_bundle() -> Path:
         "version": sha,
         "built_at": datetime.now(timezone.utc).isoformat(),
         "entities": _scan(Path("ontology") / "entities", repo_dir),
+        "relationships": _scan(Path("ontology") / "relationships", repo_dir),
         "specs": _scan(Path("specs"), repo_dir),
         "facts": _scan(Path("facts"), repo_dir),
         "cases": _scan(Path("cases"), repo_dir),

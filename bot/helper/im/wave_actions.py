@@ -199,8 +199,9 @@ def _route_message_sync(
     """
     from helper.ask import ask
     from helper.ask.runtime import render_for_wave
+    from helper.im import km_ingest
     from helper.im.intent import classify
-    from helper.ingest import process_raw
+    from helper.ingest import process_raw, schedule_l1
 
     from helper.scheduler import (
         get_pending_confirm,
@@ -219,7 +220,46 @@ def _route_message_sync(
     else:
         receiver_id, receiver_id_type = sender_id, sender_id_type
 
-    # 优先级 0: 该用户有 pending schedule confirm → 当前消息一律视为对它的回应
+    # 优先级 -1: 消息里含 KM 链接 → 整篇文档拉成 raw + 跑 L1。
+    # @bot 分享 KM 文档当作"喂知识",不再走 intent 分类(避免被 ask 当成问题)。
+    km_urls = km_ingest.find_km_urls(text)
+    if km_urls:
+        try:
+            results = km_ingest.ingest_text(
+                text,
+                sender_domain=domain or sender_id,
+                chat_id=chat_id,
+                parent_message_id=wave_msg_id,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("km_ingest failed raw#%d urls=%s", raw_id, km_urls)
+            _reply_text(wave_msg_id, "⚠️ KM 文档拉取异常,稍后重试", request_id=f"km-err-{raw_id}")
+            return
+        # 成功拉到的 → 各自跑 L1(进 sink → 4 类候选)
+        for r in results:
+            if r.status == "ok" and r.raw_id:
+                schedule_l1(r.raw_id)
+        reply = km_ingest.format_results(results)
+        if reply:
+            _reply_text(wave_msg_id, reply, request_id=f"km-ack-{raw_id}")
+        return
+
+    # 优先级 0a: owner 私聊里的 inbox 回执(批准/驳回/跳过 #N + 答 #N ...)
+    # 在 schedule_confirm 之前,避免「批准 #3」被误绑到无关 confirm
+    if domain and not chat_id:
+        from helper.inbox import try_handle_reply
+
+        inbox_reply = try_handle_reply(
+            text, sender_domain=domain, chat_id=chat_id, answer_raw_id=raw_id,
+        )
+        if inbox_reply is not None:
+            _reply_text(wave_msg_id, inbox_reply.text, request_id=f"inbox-reply-{raw_id}")
+            for action_name, payload in inbox_reply.after_actions:
+                if action_name == "schedule_l1":
+                    schedule_l1(payload)
+            return
+
+    # 优先级 0b: 该用户有 pending schedule confirm → 当前消息一律视为对它的回应
     if domain and get_pending_confirm(domain) is not None:
         reply = handle_confirm(text, domain)
         if reply is not None:

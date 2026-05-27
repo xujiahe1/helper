@@ -40,9 +40,11 @@ class WeeklyDigest:
     raw_count: int = 0
     l1_ok: int = 0
     l1_err: int = 0
-    pending_specs: list[tuple[str, str]] = field(default_factory=list)  # (slug, title)
+    # SpecCandidate.id 一并带上 — 让 owner 用「批准/驳回 #N」回执裁决
+    pending_specs: list[tuple[int, str, str]] = field(default_factory=list)  # (id, slug, title)
     open_conflicts: list[tuple[int, str, str]] = field(default_factory=list)  # (id, spec_slug, severity)
-    unanswered_inquiries: int = 0
+    # 列出未答追问全文 — 让 owner 直接看到要补什么。(id, raw_id, question)
+    unanswered_inquiries: list[tuple[int, int, str]] = field(default_factory=list)
     entity_total: int = 0
     entity_promoted: int = 0
 
@@ -77,7 +79,7 @@ def build_digest() -> WeeklyDigest:
             .order_by(SpecCandidate.created_at.desc())
             .limit(10)
         ).scalars().all()
-        d.pending_specs = [(sc.slug, sc.title) for sc in specs]
+        d.pending_specs = [(sc.id, sc.slug, sc.title) for sc in specs]
 
         conflicts = s.execute(
             select(ConflictLog)
@@ -87,11 +89,14 @@ def build_digest() -> WeeklyDigest:
         ).scalars().all()
         d.open_conflicts = [(c.id, c.spec_slug, c.severity) for c in conflicts]
 
-        d.unanswered_inquiries = len(s.execute(
-            select(InquiryLog.id)
+        inquiry_rows = s.execute(
+            select(InquiryLog)
             .where(InquiryLog.created_at >= start)
             .where(InquiryLog.answer_raw_id.is_(None))
-        ).scalars().all())
+            .order_by(InquiryLog.created_at.desc())
+            .limit(10)
+        ).scalars().all()
+        d.unanswered_inquiries = [(iq.id, iq.raw_id, iq.question) for iq in inquiry_rows]
 
         d.entity_total = len(s.execute(select(EntityCandidate.id)).scalars().all())
         d.entity_promoted = len(s.execute(
@@ -109,20 +114,26 @@ def render_card(d: WeeklyDigest) -> str:
         "",
     ]
     if d.pending_specs:
-        lines.append(f"📝 待 review 的 spec ({len(d.pending_specs)}):")
-        for slug, title in d.pending_specs:
-            lines.append(f"  - {slug}: {title}")
+        lines.append(f"📝 待 review spec ({len(d.pending_specs)}) — 回「批准 #N」/「驳回 #N」裁决:")
+        for sid, slug, title in d.pending_specs:
+            lines.append(f"  #{sid} [{slug}] {title}")
         lines.append("")
     if d.open_conflicts:
         lines.append(f"⚠️  待裁决冲突 ({len(d.open_conflicts)}):")
         for cid, slug, sev in d.open_conflicts:
-            lines.append(f"  - #{cid} vs {slug} ({sev})")
+            lines.append(f"  #{cid} vs {slug} ({sev})")
         lines.append("")
     if d.unanswered_inquiries:
-        lines.append(f"❓ 未答追问: {d.unanswered_inquiries} 条")
+        lines.append(f"❓ 未答追问 ({len(d.unanswered_inquiries)}) — 回「#N 你的答案」或「答 #N ...」:")
+        for qid, rid, q in d.unanswered_inquiries:
+            qline = q.replace("\n", " ").strip()
+            if len(qline) > 80:
+                qline = qline[:78] + "…"
+            lines.append(f"  #{qid} (raw#{rid}) {qline}")
+        lines.append("")
     if not (d.pending_specs or d.open_conflicts or d.unanswered_inquiries):
         lines.append("✓ 本周 inbox 清空")
-    return "\n".join(lines)
+    return "\n".join(lines).rstrip()
 
 
 def send_to(receiver_id: str, *, receiver_id_type: str = "user_id") -> bool:

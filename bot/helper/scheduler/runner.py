@@ -110,11 +110,48 @@ async def _tick() -> None:
         asyncio.create_task(_execute_task(tid))
 
 
+def ensure_owner_inbox_weekly() -> None:
+    """配了 helper_owner_domain 但没有 inbox_weekly 任务 → 自动建一条默认 0 9 * * 1。
+
+    幂等: 已有同 owner+task_type='inbox_weekly' 行(无论 enabled)就不动,避免覆盖
+    用户手动改的 cron / 触碰已被软删的旧任务。
+    """
+    from helper.config import get_settings
+
+    owner = get_settings().helper_owner_domain
+    if not owner:
+        return
+    with session() as s:
+        existing = s.execute(
+            select(ScheduledTask)
+            .where(ScheduledTask.owner_user_id == owner)
+            .where(ScheduledTask.task_type == "inbox_weekly")
+            .limit(1)
+        ).scalar_one_or_none()
+        if existing is not None:
+            return
+        s.add(ScheduledTask(
+            owner_user_id=owner,
+            cron_expr="0 9 * * 1",
+            task_type="inbox_weekly",
+            params_json="{}",
+            receiver_id=owner,
+            receiver_id_type="user_id",
+            summary=f"Inbox 周报 — 每周一 09:00 推送给 {owner}",
+            enabled=True,
+        ))
+    log.info("auto-created inbox_weekly task for owner=%s (cron 0 9 * * 1)", owner)
+
+
 def start_scheduler() -> None:
     """FastAPI startup 调。重复调用安全(已启动则忽略)。"""
     global _scheduler
     if _scheduler is not None and _scheduler.running:
         return
+    try:
+        ensure_owner_inbox_weekly()
+    except Exception:  # noqa: BLE001
+        log.exception("ensure_owner_inbox_weekly failed")
     _scheduler = AsyncIOScheduler(timezone=timezone.utc)
     # 每分钟 tick 一次。第一次延迟 5 秒避免与 startup 抢 event loop
     from apscheduler.triggers.interval import IntervalTrigger

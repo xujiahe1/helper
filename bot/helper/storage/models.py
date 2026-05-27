@@ -253,9 +253,40 @@ class ScheduleConfirm(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
+class VectorIndex(Base):
+    """vec0 表的 sidecar 元信息 — 把"vec0 rowid"对回业务对象 (kind, ref)。
+
+    设计:
+    - vec_items (virtual table, 见 db.py) 只放 rowid + 1024 维 embedding,vec_items 不能加普通列
+    - 这张普通表存:vec_items.rowid → (kind, ref, content_hash, model, indexed_at)
+    - (kind, ref) 唯一索引 → 同一对象重新 index 时找回 rowid,更新 vec_items 那一行 + 这张表的 hash/time
+    - content_hash 用于 dedup:文本没变就跳过 LLM 调用
+    - model 字段记录索引时用的 embedding model,换模型时可以选择性 reindex
+
+    kind ∈ {'spec', 'raw', 'entity'};ref 是 spec slug / raw_id 字符串 / entity slug。
+    """
+
+    __tablename__ = "vector_index"
+
+    rowid: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(String(16))
+    ref: Mapped[str] = mapped_column(String(128))
+    content_hash: Mapped[str] = mapped_column(String(64))
+    model: Mapped[str] = mapped_column(String(64))
+    indexed_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        Index("uq_vector_kind_ref", "kind", "ref", unique=True),
+        Index("ix_vector_kind", "kind"),
+    )
+
+
 class L1Result(Base):
-    """L1 结构化结果。一条 raw_input 至多一条 L1Result(以 raw_id 为主键),
-    重跑 = upsert。失败也写一条记录,error 字段非空 → 下次手动 backfill 才重试。
+    """L1 抽取的 raw 级元信息(成功/失败/模型)。
+
+    实际抽出的知识原子在 L1Item 表里(0..N 条 / raw)。
+    legacy 字段 scene/signals_json/tradeoffs_json/choice/rationale 保留在 sqlite
+    里(不读)— SQLite 不支持 DROP COLUMN,新代码不再写入也不再读取。
     """
 
     __tablename__ = "l1_results"
@@ -271,3 +302,103 @@ class L1Result(Base):
     error: Mapped[str] = mapped_column(Text, default="")
     model: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
+class L1Item(Base):
+    """L1 抽取出的单条知识原子。一条 raw 出 0..N 条 L1Item。
+
+    type ∈ {decision, fact, case, concept, relation}。
+    payload_json 是 type-specific 字段:
+      decision: {scene, signals[], tradeoffs[], choice, rationale}
+      fact:     {subject, predicate, object, scope}
+      case:     {scene, what_happened, outcome, referenced_spec?}
+      concept:  {name, entity_type, description}
+      relation: {entity_a, relation, entity_b}
+
+    复合主键 (raw_id, idx) — 重跑 raw 时 sink 先 DELETE 同 raw_id 全部行再写,保证幂等。
+    """
+
+    __tablename__ = "l1_items"
+
+    raw_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("raw_inputs.id", ondelete="CASCADE"), primary_key=True
+    )
+    idx: Mapped[int] = mapped_column(Integer, primary_key=True)
+    type: Mapped[str] = mapped_column(String(16))
+    payload_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+    __table_args__ = (
+        Index("ix_l1_items_type", "type"),
+    )
+
+
+class FactCandidate(Base):
+    """决策性事实候选 — 主谓宾 + 适用范围。
+
+    fact 与 entity 相比是一句陈述(有谓词);与 spec 相比无"决策选择"。
+    达晋升阈值 → facts/<slug>.md。
+    """
+
+    __tablename__ = "fact_candidates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    slug: Mapped[str] = mapped_column(String(128), unique=True)
+    statement: Mapped[str] = mapped_column(Text)         # 一句话陈述,人类可读
+    subject: Mapped[str] = mapped_column(String(255), default="")
+    predicate: Mapped[str] = mapped_column(String(255), default="")
+    object: Mapped[str] = mapped_column(Text, default="")
+    scope: Mapped[str] = mapped_column(Text, default="")
+    raw_refs_json: Mapped[str] = mapped_column(Text, default="[]")  # [[raw_id, idx], ...]
+    mention_count: Mapped[int] = mapped_column(Integer, default=0)
+    first_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    last_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    promoted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    git_path: Mapped[str] = mapped_column(String(255), default="")
+
+
+class CaseCandidate(Base):
+    """反例 / 决策案例候选 — 一个具体场景里发生了什么、结果如何。
+
+    case 是 episode 级别 — 通常 1 case = 1 文件,不需要聚类,但允许 mention_count
+    去重("同一案例被多人复述")。达阈值 → cases/<slug>.md。
+    """
+
+    __tablename__ = "case_candidates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    slug: Mapped[str] = mapped_column(String(128), unique=True)
+    title: Mapped[str] = mapped_column(String(255))
+    scene: Mapped[str] = mapped_column(Text, default="")
+    what_happened: Mapped[str] = mapped_column(Text, default="")
+    outcome: Mapped[str] = mapped_column(Text, default="")
+    referenced_spec: Mapped[str] = mapped_column(String(128), default="")  # 触发的 spec slug,可空
+    raw_refs_json: Mapped[str] = mapped_column(Text, default="[]")
+    mention_count: Mapped[int] = mapped_column(Integer, default=0)
+    first_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    last_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    promoted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    git_path: Mapped[str] = mapped_column(String(255), default="")
+
+
+class RelationCandidate(Base):
+    """实体关系候选 — (entity_a, relation, entity_b)。
+
+    达晋升阈值 → ontology/relationships/<slug>.md。
+    slug = f"{a_slug}__{relation}__{b_slug}"。
+    """
+
+    __tablename__ = "relation_candidates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    slug: Mapped[str] = mapped_column(String(255), unique=True)
+    entity_a: Mapped[str] = mapped_column(String(128))   # entity slug 或自由文本
+    relation: Mapped[str] = mapped_column(String(64))    # 谓词:has_one / supersedes / part_of / ...
+    entity_b: Mapped[str] = mapped_column(String(128))
+    description: Mapped[str] = mapped_column(Text, default="")
+    raw_refs_json: Mapped[str] = mapped_column(Text, default="[]")
+    mention_count: Mapped[int] = mapped_column(Integer, default=0)
+    first_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    last_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    promoted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    git_path: Mapped[str] = mapped_column(String(255), default="")

@@ -15,6 +15,34 @@ def main() -> None:
     """Helper bot — 决策规约工厂。"""
 
 
+def _print_l1_items(raw_id: int, *, model: str = "") -> None:
+    """打印一条 raw 抽出的 L1Item 列表(按 type 分组)。"""
+    from sqlalchemy import select
+
+    from helper.storage import session
+    from helper.storage.models import L1Item
+
+    with session() as sess:
+        items = sess.execute(
+            select(L1Item).where(L1Item.raw_id == raw_id).order_by(L1Item.idx)
+        ).scalars().all()
+
+    if not items:
+        click.echo(f"L1 stored (model={model}): 0 items")
+        return
+    click.echo(f"L1 stored (model={model}): {len(items)} items")
+    for it in items:
+        try:
+            payload = json.loads(it.payload_json or "{}")
+        except json.JSONDecodeError:
+            payload = {"_raw": it.payload_json}
+        click.echo(f"  [#{it.idx}] {it.type}")
+        click.echo(
+            "    "
+            + json.dumps(payload, ensure_ascii=False, indent=2).replace("\n", "\n    ")
+        )
+
+
 @main.command()
 def hello() -> None:
     """Smoke test:确认包能装、入口能跑。"""
@@ -107,20 +135,7 @@ def ingest(text: str, source: str, author: str) -> None:
     if result is None or result.error:
         click.echo(f"L1 ERROR: {result.error if result else 'process_raw returned None'}", err=True)
         raise SystemExit(1)
-    click.echo(f"L1 stored (model={result.model}):")
-    click.echo(
-        json.dumps(
-            {
-                "scene": result.scene,
-                "signals": json.loads(result.signals_json),
-                "tradeoffs": json.loads(result.tradeoffs_json),
-                "choice": result.choice,
-                "rationale": result.rationale,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
+    _print_l1_items(raw_id, model=result.model)
 
 
 @main.command("raw-list")
@@ -196,20 +211,9 @@ def raw_show(raw_id: int) -> None:
         if l1.error:
             click.echo(f"\nL1: ERROR — {l1.error}")
             return
-        click.echo(f"\nL1 (model={l1.model}):")
-        click.echo(
-            json.dumps(
-                {
-                    "scene": l1.scene,
-                    "signals": json.loads(l1.signals_json),
-                    "tradeoffs": json.loads(l1.tradeoffs_json),
-                    "choice": l1.choice,
-                    "rationale": l1.rationale,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
+
+    click.echo("")
+    _print_l1_items(raw_id, model=l1.model)
 
 
 @main.command("l1-backfill")
@@ -344,63 +348,35 @@ def wave_simulate(text: str, mode: str, author: str, chat_id: str, reply_to: str
     if result is None or result.error:
         click.echo(f"L1 ERROR: {result.error if result else 'process_raw returned None'}", err=True)
         raise SystemExit(1)
-    click.echo(f"\nL1 stored (model={result.model}):")
-    click.echo(
-        _json.dumps(
-            {
-                "scene": result.scene,
-                "signals": _json.loads(result.signals_json),
-                "tradeoffs": _json.loads(result.tradeoffs_json),
-                "choice": result.choice,
-                "rationale": result.rationale,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
+    click.echo("")
+    _print_l1_items(raw_id, model=result.model)
     click.echo(f"\n看完整落库: helper raw-show {raw_id}")
 
 
-@main.command()
-@click.argument("text")
-@click.option("--no-promote", is_flag=True, default=False, help="只抽,不晋升")
-def entities(text: str, no_promote: bool) -> None:
-    """对一段文本抽 entity 候选(独立命令,不需要先 ingest)。"""
-    from helper.config import get_settings
-    from helper.ontology import extract_from_text, promote_eligible
-    from helper.storage import init_engine
-
-    s = get_settings()
-    init_engine(s.helper_data_dir / "helper.db")
-
-    hits = extract_from_text(text)
-    if not hits:
-        click.echo("(no entities extracted)")
-        return
-    for h in hits:
-        click.echo(f"  - {h.slug:30s}  {h.entity_type:20s}  {h.name}")
-    if no_promote:
-        return
-    promoted = promote_eligible()
-    click.echo(f"\npromoted: {promoted}")
-
-
-@main.command("ontology-extract")
+@main.command("consume-l1")
 @click.argument("raw_id", type=int)
-def ontology_extract(raw_id: int) -> None:
-    """从指定 raw 的 L1 抽 entity 候选。"""
+def consume_l1(raw_id: int) -> None:
+    """把指定 raw 的 L1Item 收口到 4 类候选(concept/fact/case/relation)。
+
+    sink.process_raw 已经会自动调,这条命令用于手动重跑(比如改了 consumer 逻辑)。
+    """
+    from helper.cases import consume_case_items
     from helper.config import get_settings
-    from helper.ontology import extract_from_l1
+    from helper.facts import consume_fact_items
+    from helper.ontology import consume_concept_items, consume_relation_items
     from helper.storage import init_engine
 
     s = get_settings()
     init_engine(s.helper_data_dir / "helper.db")
-    out = extract_from_l1(raw_id)
-    if not out:
-        click.echo("(none)")
-        return
-    for ec in out:
-        click.echo(f"  - {ec.slug:30s}  mentions={ec.mention_count}  {ec.name}")
+
+    cs = consume_concept_items(raw_id)
+    rs = consume_relation_items(raw_id)
+    fs = consume_fact_items(raw_id)
+    ks = consume_case_items(raw_id)
+    click.echo(f"  concept   : {len(cs)}")
+    click.echo(f"  relation  : {len(rs)}")
+    click.echo(f"  fact      : {len(fs)}")
+    click.echo(f"  case      : {len(ks)}")
 
 
 @main.command("ontology-promote")
@@ -449,12 +425,35 @@ def specgen_run() -> None:
     if not clusters:
         click.echo("no clusters found")
         return
-    click.echo(f"{len(clusters)} clusters")
+    click.echo(f"{len(clusters)} clusters (decision items)")
     for c in clusters[:10]:
-        click.echo(f"  raws={c}")
+        click.echo(f"  keys={c}")
         sc = draft_spec_from_cluster(c)
         if sc:
             click.echo(f"    → spec_candidate slug={sc.slug} title={sc.title}")
+
+
+@main.command("knowledge-promote")
+@click.option("--limit", default=100, type=int)
+def knowledge_promote(limit: int) -> None:
+    """扫所有候选(entity/relation/fact/case),把够格的全部晋升到 git。"""
+    from helper.cases import promote_eligible as promote_cases
+    from helper.config import get_settings
+    from helper.facts import promote_eligible as promote_facts
+    from helper.ontology import promote_eligible as promote_entities
+    from helper.ontology import promote_eligible_relations
+    from helper.storage import init_engine
+
+    s = get_settings()
+    init_engine(s.helper_data_dir / "helper.db")
+    e = promote_entities(limit=limit)
+    r = promote_eligible_relations(limit=limit)
+    f = promote_facts(limit=limit)
+    k = promote_cases(limit=limit)
+    click.echo(f"  entities  : {len(e)} {e}")
+    click.echo(f"  relations : {len(r)} {r}")
+    click.echo(f"  facts     : {len(f)} {f}")
+    click.echo(f"  cases     : {len(k)} {k}")
 
 
 @main.command("spec-list")
@@ -671,6 +670,86 @@ def replay(limit: int, judge: bool) -> None:
         click.echo(f"\nQ: {it.question[:80]}")
         click.echo(f"  old ({it.original_version}, {it.original_confidence}): {it.original_answer[:120]}")
         click.echo(f"  new ({it.new_version}, {it.new_confidence}): {it.new_answer[:120]}")
+
+
+@main.command("reindex")
+@click.option("--clear", is_flag=True, default=False, help="先清空 vec_items + vector_index 再全量重建")
+@click.option(
+    "--kinds",
+    default="raw,spec,entity",
+    show_default=True,
+    help="逗号分隔,只重建这些 kind",
+)
+def reindex(clear: bool, kinds: str) -> None:
+    """全量重建向量索引。换 embedding 模型 / 修复脏数据时用。
+
+    默认增量:已 index 且 (content_hash, model) 没变的不动。
+    --clear 先全清再重建,适合换模型时。
+    """
+    from sqlalchemy import select
+
+    from helper.config import get_settings
+    from helper.storage import init_engine, session
+    from helper.storage import vector as vec
+    from helper.storage.models import EntityCandidate, L1Result, SpecCandidate
+
+    s = get_settings()
+    init_engine(s.helper_data_dir / "helper.db")
+    selected = {k.strip() for k in kinds.split(",") if k.strip()}
+
+    if clear:
+        with session() as sess:
+            vec.clear_all(sess)
+        click.echo("vec_items + vector_index cleared")
+
+    counts = {"raw": 0, "spec": 0, "entity": 0}
+    failed = {"raw": 0, "spec": 0, "entity": 0}
+
+    if "raw" in selected:
+        with session() as sess:
+            ok_l1 = sess.execute(
+                select(L1Result.raw_id).where(L1Result.error == "")
+            ).scalars().all()
+        for rid in ok_l1:
+            with session() as sess:
+                rowid = vec.index_raw(sess, rid)
+            if rowid is not None:
+                counts["raw"] += 1
+            else:
+                failed["raw"] += 1
+
+    if "spec" in selected:
+        with session() as sess:
+            spec_slugs = sess.execute(
+                select(SpecCandidate.slug).where(SpecCandidate.review_status == "approved")
+            ).scalars().all()
+        for slug in spec_slugs:
+            with session() as sess:
+                rowid = vec.index_spec(sess, slug)
+            if rowid is not None:
+                counts["spec"] += 1
+            else:
+                failed["spec"] += 1
+
+    if "entity" in selected:
+        with session() as sess:
+            ent_slugs = sess.execute(
+                select(EntityCandidate.slug).where(EntityCandidate.promoted_at.isnot(None))
+            ).scalars().all()
+        for slug in ent_slugs:
+            with session() as sess:
+                rowid = vec.index_entity(sess, slug)
+            if rowid is not None:
+                counts["entity"] += 1
+            else:
+                failed["entity"] += 1
+
+    click.echo(f"indexed: raw={counts['raw']} spec={counts['spec']} entity={counts['entity']}")
+    if any(failed.values()):
+        click.echo(
+            f"  (failures: raw={failed['raw']} spec={failed['spec']} entity={failed['entity']})",
+            err=True,
+        )
 
 
 if __name__ == "__main__":

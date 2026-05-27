@@ -48,7 +48,10 @@ def _md_body(ec: EntityCandidate) -> str:
     parts.append("\n## Raw 来源\n")
     refs = json.loads(ec.raw_refs_json or "[]")
     for r in refs:
-        parts.append(f"- raw#{r}")
+        if isinstance(r, list) and len(r) == 2:
+            parts.append(f"- raw#{r[0]}#{r[1]}")
+        else:
+            parts.append(f"- raw#{r}")
     return "\n".join(parts) + "\n"
 
 
@@ -84,6 +87,12 @@ def promote_one(slug: str) -> str | None:
         if ec.promoted_at is None:
             ec.promoted_at = datetime.now(timezone.utc)
         ec.git_path = str(rel)
+        # entity 落 git → 向量索引(失败不阻塞晋升)
+        try:
+            from helper.storage import vector as vec
+            vec.index_entity(sess, ec.slug)
+        except Exception:  # noqa: BLE001
+            log.exception("index_entity failed slug=%s", ec.slug)
         sess.commit()
 
     repo = Repo(s.helper_spec_git_dir)

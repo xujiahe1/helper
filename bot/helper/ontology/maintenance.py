@@ -83,7 +83,9 @@ def _llm_judge_same(a: EntityCandidate, b: EntityCandidate) -> bool:
 def _merge_into(loser: EntityCandidate, winner: EntityCandidate, sess) -> None:
     loser_refs = json.loads(loser.raw_refs_json or "[]")
     winner_refs = json.loads(winner.raw_refs_json or "[]")
-    merged = sorted(set(loser_refs + winner_refs))
+    # 新格式 [[raw_id, idx], ...] 不可哈希,先 tuple 化去重再回 list
+    merged_t = sorted({tuple(r) if isinstance(r, list) else (r,) for r in loser_refs + winner_refs})
+    merged = [list(t) if len(t) == 2 else t[0] for t in merged_t]
     winner.raw_refs_json = json.dumps(merged)
     winner.mention_count = len(merged)
     if loser.first_seen and (winner.first_seen is None or loser.first_seen < winner.first_seen):

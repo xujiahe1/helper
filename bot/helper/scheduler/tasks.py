@@ -60,8 +60,27 @@ async def _periodic_ask(snapshot: dict) -> None:
         log.warning("task #%d send_message failed: %s", snapshot.get("id"), e)
 
 
+async def _inbox_weekly(snapshot: dict) -> None:
+    """到点 build digest + push 给 receiver。
+
+    receiver_id / receiver_id_type 从 ScheduledTask.snapshot 读 — 启动时
+    auto-create 走 helper_owner_domain;手动 create 也行(走 handle_create)。
+    """
+    from helper.inbox import send_to
+
+    receiver_id = snapshot.get("receiver_id", "")
+    receiver_id_type = snapshot.get("receiver_id_type", "user_id")
+    if not receiver_id:
+        log.warning("task #%d inbox_weekly missing receiver", snapshot.get("id"))
+        return
+    ok = await asyncio.to_thread(send_to, receiver_id, receiver_id_type=receiver_id_type)
+    log.info("task #%d inbox_weekly → %s/%s ok=%s",
+             snapshot.get("id"), receiver_id_type, receiver_id, ok)
+
+
 _DISPATCHERS = {
     "periodic_ask": _periodic_ask,
+    "inbox_weekly": _inbox_weekly,
 }
 
 

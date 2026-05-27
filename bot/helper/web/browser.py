@@ -137,26 +137,42 @@ def build_browser_router() -> APIRouter:
 
     @r.get("/raw/{raw_id}", response_class=HTMLResponse)
     def show_raw(raw_id: int) -> HTMLResponse:
+        from helper.storage.l1_view import list_l1_atoms
+
         with session() as s:
             raw = s.get(RawInput, raw_id)
             if raw is None:
                 raise HTTPException(status_code=404)
             l1 = s.get(L1Result, raw_id)
+            atoms = list_l1_atoms(s, raw_id)
             body = [f"<h1>raw#{raw_id}</h1>",
                     f"<p class='meta'>{escape(raw.source_type)} · {escape(raw.author_domain or '')} · "
                     f"{raw.created_at:%Y-%m-%d %H:%M}</p>",
                     f"<pre>{escape(raw.content_text or '')}</pre>"]
-            if l1 is not None:
-                if l1.error:
-                    body.append(f"<h2>L1 ERROR</h2><pre>{escape(l1.error)}</pre>")
-                else:
-                    body.append("<h2>L1</h2><table>")
-                    body.append(f"<tr><th>scene</th><td>{escape(l1.scene)}</td></tr>")
-                    body.append(f"<tr><th>signals</th><td>{escape(l1.signals_json)}</td></tr>")
-                    body.append(f"<tr><th>tradeoffs</th><td>{escape(l1.tradeoffs_json)}</td></tr>")
-                    body.append(f"<tr><th>choice</th><td>{escape(l1.choice)}</td></tr>")
-                    body.append(f"<tr><th>rationale</th><td>{escape(l1.rationale)}</td></tr>")
+            if l1 is not None and l1.error:
+                body.append(f"<h2>L1 ERROR</h2><pre>{escape(l1.error)}</pre>")
+            elif atoms:
+                body.append(f"<h2>L1 atoms ({len(atoms)})</h2>")
+                for a in atoms:
+                    body.append(
+                        f"<h3>idx={a['idx']} <span class='tag'>{escape(a['type'])}</span></h3>"
+                        "<table>"
+                    )
+                    for k, v in a["payload"].items():
+                        if isinstance(v, (dict, list)):
+                            v_str = json.dumps(v, ensure_ascii=False, indent=2)
+                            body.append(
+                                f"<tr><th>{escape(str(k))}</th>"
+                                f"<td><pre>{escape(v_str)}</pre></td></tr>"
+                            )
+                        else:
+                            body.append(
+                                f"<tr><th>{escape(str(k))}</th>"
+                                f"<td>{escape(str(v))}</td></tr>"
+                            )
                     body.append("</table>")
+            elif l1 is not None:
+                body.append("<h2>L1</h2><p class='meta'>(no atoms — likely filtered or empty)</p>")
         return _html(f"raw#{raw_id}", "\n".join(body))
 
     return r

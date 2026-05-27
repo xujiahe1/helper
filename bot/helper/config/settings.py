@@ -28,10 +28,18 @@ class Settings(BaseSettings):
     # Wave 开放平台 HTTP API(服务端 app_id+app_secret 自换 access_token)。
     # NOT openapi-mcp — MCP 只能用登录用户身份,不能服务端用。
     wave_open_api_base_url: str = "https://open.hoyowave.com"
+    # KM 开放平台 HTTP API(文档检索 / 文档读取 / 表格读取)。
+    # access_token 走相同 app_id+app_secret 但独立 host,token 缓存独立(不假设两 host 互通)。
+    km_open_api_base_url: str = "https://km.mihoyo.com"
     # 默认米哈游租户(union_id ↔ 域账号互转时需要)。海外站换 cognosphere 那个。
     wave_user_tenant_id: str = "ot_9c253a6cbabafcaf131ca0ab549049db"
 
     helper_admin_sk: str = ""
+
+    # Inbox 周报 push 对象 — M1/M2 dogfood 阶段单 owner 设计:
+    # 周报每周一 9:00 CST push 给这一人,内容是全局所有 pending 项(冲突/追问/spec候选)。
+    # M3 多专家时再拆 per-author。空 → 不自动创建默认 inbox_weekly 任务(管理员可手动建)。
+    helper_owner_domain: str = ""
 
     log_level: str = "INFO"
 

@@ -108,7 +108,6 @@ def create_app() -> FastAPI:
                                     "status": "error" if l1.error else "ok",
                                     "error": l1.error or None,
                                     "model": l1.model,
-                                    "choice": l1.choice if not l1.error else None,
                                 }
                             ),
                         }
@@ -117,9 +116,8 @@ def create_app() -> FastAPI:
 
         @admin.get("/raw-inputs/{raw_id}")
         def show_raw(raw_id: int) -> dict[str, Any]:
-            import json as _json
-
             from helper.storage import session
+            from helper.storage.l1_view import list_l1_atoms
             from helper.storage.models import L1Result, RawInput
 
             with session() as sess:
@@ -127,6 +125,7 @@ def create_app() -> FastAPI:
                 if raw is None:
                     raise HTTPException(status_code=404, detail=f"raw#{raw_id} not found")
                 l1 = sess.get(L1Result, raw_id)
+                atoms = list_l1_atoms(sess, raw_id)
                 return {
                     "raw": {
                         "id": raw.id,
@@ -142,14 +141,10 @@ def create_app() -> FastAPI:
                         None
                         if l1 is None
                         else {
-                            "scene": l1.scene,
-                            "signals": _json.loads(l1.signals_json),
-                            "tradeoffs": _json.loads(l1.tradeoffs_json),
-                            "choice": l1.choice,
-                            "rationale": l1.rationale,
                             "error": l1.error or None,
                             "model": l1.model,
                             "created_at": l1.created_at.isoformat(),
+                            "atoms": atoms,
                         }
                     ),
                 }

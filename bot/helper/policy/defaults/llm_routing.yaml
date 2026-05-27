@@ -42,6 +42,9 @@ tasks:
   #   2. 切片后单元的简单抽取,Qwen flash 准确率够 + 速度快 + 成本低 1-2 个量级
   bulk_extract:    { model: qwen3.6-flash, provider: openai }
 
-  # ── Embedding / Rerank (走专用入口,不通过 run()) ──
-  embedding:       { model: text-embedding-3-large, provider: openai }
+  # ── Embedding (走专用入口 helper.llm.embed,不通过 run()) ──
+  # bge-m3: BAAI 开源,中文检索表现强,1024 维(text-embedding-3-large 是 3072 维,
+  # 存储/计算贵 3 倍且对中文不占优)。Athenai 走 OpenAI 兼容 /v1/embeddings。
+  # 选 embed_index 这个 task 名是因为后续可能再加 embed_query 走不同模型(M5)。
+  embed_index:     { model: bge-m3, provider: openai }
   rerank:          { model: qwen3-rerank, provider: openai }

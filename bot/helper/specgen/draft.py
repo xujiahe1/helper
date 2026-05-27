@@ -1,4 +1,8 @@
-"""一簇 L1 → candidate spec(LLM draft)。
+"""一簇 decision 原子 → candidate spec(LLM draft)。
+
+cluster keys = [(raw_id, idx), ...] — 每条 decision 是 raw 里的一个 L1Item。
+spec_candidates.cluster_raw_ids_json 重用为 [[raw_id, idx], ...](老数据 [raw_id]
+形式仍可读,会被当成 idx=0)。
 
 走 ask 主路径(claude-opus-4-7)— L2 是产品护城河,不省。
 """
@@ -17,15 +21,15 @@ from sqlalchemy import select
 from helper.config import get_settings
 from helper.llm import run
 from helper.storage import session
-from helper.storage.models import L1Result, RawInput, SpecCandidate
+from helper.storage.models import L1Item, RawInput, SpecCandidate
 
 log = logging.getLogger(__name__)
 
 SPECS_RELDIR = Path("specs")
 
 
-SYSTEM_PROMPT = """你是决策规约编辑。给你 N 条同类决策的 L1 结构化记录,
-你要总结出一条 **可执行的决策规约**(spec)。
+SYSTEM_PROMPT = """你是决策规约编辑。给你 N 条同类 decision 原子(每条已结构化:
+场景 / 信号 / 权衡 / 选择 / 原因),你要总结出一条**可执行的决策规约**(spec)。
 
 输出 JSON:
 {
@@ -57,29 +61,33 @@ def _parse_json(text: str) -> dict | None:
     return result if isinstance(result, dict) else None
 
 
-def _format_cluster(raw_ids: list[int]) -> str:
-    parts = [f"# 共 {len(raw_ids)} 条同类 L1\n"]
+def _format_cluster(keys: list[tuple[int, int]]) -> str:
+    parts = [f"# 共 {len(keys)} 条同类 decision 原子\n"]
     with session() as s:
-        for rid in raw_ids:
-            l1 = s.get(L1Result, rid)
-            raw = s.get(RawInput, rid)
-            if l1 is None or raw is None:
+        for raw_id, idx in keys:
+            it = s.execute(
+                select(L1Item).where(L1Item.raw_id == raw_id, L1Item.idx == idx)
+            ).scalar_one_or_none()
+            raw = s.get(RawInput, raw_id)
+            if it is None or raw is None:
                 continue
-            parts.append(f"## raw#{rid}")
+            payload = json.loads(it.payload_json or "{}")
+            parts.append(f"## raw#{raw_id}#{idx}")
             parts.append(f"- 原文: {raw.content_text[:300]}")
-            parts.append(f"- 场景: {l1.scene}")
-            parts.append(f"- 信号: {l1.signals_json}")
-            parts.append(f"- 选择: {l1.choice}")
-            parts.append(f"- 原因: {l1.rationale}")
+            parts.append(f"- 场景: {payload.get('scene', '')}")
+            parts.append(f"- 信号: {payload.get('signals', [])}")
+            parts.append(f"- 权衡: {payload.get('tradeoffs', [])}")
+            parts.append(f"- 选择: {payload.get('choice', '')}")
+            parts.append(f"- 原因: {payload.get('rationale', '')}")
             parts.append("")
     return "\n".join(parts)
 
 
-def draft_spec_from_cluster(raw_ids: list[int]) -> SpecCandidate | None:
-    """对一簇 raw_ids 跑 spec draft → 入 spec_candidates 表。"""
-    if len(raw_ids) < 2:
+def draft_spec_from_cluster(cluster_keys: list[tuple[int, int]]) -> SpecCandidate | None:
+    """对一簇 decision 原子跑 spec draft → 入 spec_candidates 表。"""
+    if len(cluster_keys) < 2:
         return None
-    cluster_text = _format_cluster(raw_ids)
+    cluster_text = _format_cluster(cluster_keys)
     try:
         reply = run("ask", system=SYSTEM_PROMPT, user=cluster_text, temperature=0.2)
     except Exception as e:  # noqa: BLE001
@@ -98,12 +106,17 @@ def draft_spec_from_cluster(raw_ids: list[int]) -> SpecCandidate | None:
     if not slug or not statement:
         return None
 
+    keys_json = [list(k) for k in cluster_keys]
     with session() as s:
         existing = s.execute(
             select(SpecCandidate).where(SpecCandidate.slug == slug)
         ).scalar_one_or_none()
         if existing is not None:
-            existing.cluster_raw_ids_json = json.dumps(sorted(set(raw_ids + json.loads(existing.cluster_raw_ids_json or "[]"))))
+            old = json.loads(existing.cluster_raw_ids_json or "[]")
+            old_t = {tuple(k) if isinstance(k, list) and len(k) == 2 else (k, 0) for k in old}
+            new_t = {tuple(k) for k in keys_json}
+            merged = sorted(old_t | new_t)
+            existing.cluster_raw_ids_json = json.dumps([list(k) for k in merged])
             existing.statement = statement
             existing.rationale = rationale
             s.commit()
@@ -113,7 +126,7 @@ def draft_spec_from_cluster(raw_ids: list[int]) -> SpecCandidate | None:
             title=title or slug,
             statement=statement,
             rationale=rationale,
-            cluster_raw_ids_json=json.dumps(raw_ids),
+            cluster_raw_ids_json=json.dumps(keys_json),
         )
         s.add(row)
         s.commit()
@@ -146,7 +159,10 @@ def _spec_md(sc: SpecCandidate) -> str:
         "",
     ]
     for r in refs:
-        fm.append(f"- raw#{r}")
+        if isinstance(r, list) and len(r) == 2:
+            fm.append(f"- raw#{r[0]}#{r[1]}")
+        else:
+            fm.append(f"- raw#{r}")
     return "\n".join(fm) + "\n"
 
 
@@ -166,6 +182,11 @@ def promote_spec(slug: str, *, reviewer: str = "") -> str | None:
         abs_path = s.helper_spec_git_dir / rel
         abs_path.parent.mkdir(parents=True, exist_ok=True)
         abs_path.write_text(_spec_md(sc), encoding="utf-8")
+        try:
+            from helper.storage import vector as vec
+            vec.index_spec(sess, sc.slug)
+        except Exception:  # noqa: BLE001
+            log.exception("index_spec failed slug=%s", sc.slug)
         sess.commit()
 
     repo = Repo(s.helper_spec_git_dir)

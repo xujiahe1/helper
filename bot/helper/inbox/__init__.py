@@ -4,6 +4,13 @@
 触发: cron / CLI manual / FastAPI 内部端点。
 """
 
+from helper.inbox.reply import try_handle as try_handle_reply
 from helper.inbox.weekly import WeeklyDigest, build_digest, render_card, send_to
 
-__all__ = ["WeeklyDigest", "build_digest", "render_card", "send_to"]
+__all__ = [
+    "WeeklyDigest",
+    "build_digest",
+    "render_card",
+    "send_to",
+    "try_handle_reply",
+]
