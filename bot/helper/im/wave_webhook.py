@@ -228,13 +228,13 @@ async def wave_callback(
     s = get_settings()
     if not s.wave_callback_configured:
         # WAVE_DEBUG: 临时调试,拿到完整请求后立刻删
-        log.info(
+        log.warning(
             "WAVE_DEBUG entry client=%s headers=%s wave_callback_configured=False",
             request.client.host if request.client else None,
             dict(request.headers),
         )
         # WAVE_DEBUG: 临时调试,拿到完整请求后立刻删
-        log.info("WAVE_DEBUG response status=503 body=%r", "wave callback not configured")
+        log.warning("WAVE_DEBUG response status=503 body=%r", "wave callback not configured")
         # 未配置就不该收事件,直接 503 让对方重试不到
         raise HTTPException(status_code=503, detail="wave callback not configured")
 
@@ -242,7 +242,7 @@ async def wave_callback(
 
     # WAVE_DEBUG: 临时调试,拿到完整请求后立刻删
     from base64 import b64encode as _b64encode
-    log.info(
+    log.warning(
         "WAVE_DEBUG entry client=%s headers=%s raw_body_repr=%r raw_body_b64=%s",
         request.client.host if request.client else None,
         dict(request.headers),
@@ -253,12 +253,12 @@ async def wave_callback(
     # 1) 验签 — 缺 header 一律拒,签错也拒
     if not (sig and ts and nonce):
         # WAVE_DEBUG: 临时调试,拿到完整请求后立刻删
-        log.info("WAVE_DEBUG response status=401 body=%r", "missing signature headers")
+        log.warning("WAVE_DEBUG response status=401 body=%r", "missing signature headers")
         raise HTTPException(status_code=401, detail="missing signature headers")
     if not _verify_signature(ts, nonce, raw_body, s.wave_callback_sign_token, sig):
         log.warning("wave webhook: bad signature ts=%s nonce=%s", ts, nonce)
         # WAVE_DEBUG: 临时调试,拿到完整请求后立刻删
-        log.info("WAVE_DEBUG response status=401 body=%r", "bad signature")
+        log.warning("WAVE_DEBUG response status=401 body=%r", "bad signature")
         raise HTTPException(status_code=401, detail="bad signature")
 
     # 2) 解外层 envelope { "encrypt": "<base64>" }
@@ -266,12 +266,12 @@ async def wave_callback(
         envelope = json.loads(raw_body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         # WAVE_DEBUG: 临时调试,拿到完整请求后立刻删
-        log.info("WAVE_DEBUG response status=400 body=%r", "body not JSON")
+        log.warning("WAVE_DEBUG response status=400 body=%r", "body not JSON")
         raise HTTPException(status_code=400, detail="body not JSON") from None
     encrypted = envelope.get("encrypt") if isinstance(envelope, dict) else None
     if not isinstance(encrypted, str):
         # WAVE_DEBUG: 临时调试,拿到完整请求后立刻删
-        log.info("WAVE_DEBUG response status=400 body=%r", "missing encrypt field")
+        log.warning("WAVE_DEBUG response status=400 body=%r", "missing encrypt field")
         raise HTTPException(status_code=400, detail="missing encrypt field")
 
     # 3) 解密 → 明文 JSON
@@ -281,7 +281,7 @@ async def wave_callback(
     except Exception as e:  # noqa: BLE001
         log.exception("wave webhook: decrypt failed")
         # WAVE_DEBUG: 临时调试,拿到完整请求后立刻删
-        log.info("WAVE_DEBUG response status=400 body=%r", f"decrypt failed: {type(e).__name__}")
+        log.warning("WAVE_DEBUG response status=400 body=%r", f"decrypt failed: {type(e).__name__}")
         raise HTTPException(status_code=400, detail=f"decrypt failed: {type(e).__name__}") from e
 
     # 4) 校验事件(URL 配置时下发):明文 event.challenge 存在就回显
@@ -291,7 +291,7 @@ async def wave_callback(
     challenge = event_obj.get("challenge") if isinstance(event_obj, dict) else None
     # WAVE_DEBUG: 临时调试,拿到完整请求后立刻删
     _header_for_debug = payload.get("header") if isinstance(payload.get("header"), dict) else {}
-    log.info(
+    log.warning(
         "WAVE_DEBUG challenge_parse event_type=%r challenge=%r event_obj=%r",
         _header_for_debug.get("event_type") if isinstance(_header_for_debug, dict) else None,
         challenge,
@@ -300,7 +300,7 @@ async def wave_callback(
     if isinstance(challenge, str) and challenge:
         _challenge_body = json.dumps({"challenge": challenge})
         # WAVE_DEBUG: 临时调试,拿到完整请求后立刻删
-        log.info("WAVE_DEBUG response status=200 body=%s", _challenge_body)
+        log.warning("WAVE_DEBUG response status=200 body=%s", _challenge_body)
         return Response(
             content=_challenge_body,
             media_type="application/json",
@@ -314,7 +314,7 @@ async def wave_callback(
         if seen:
             log.info("wave webhook: duplicate event_id=%s, skip", event_id)
             # WAVE_DEBUG: 临时调试,拿到完整请求后立刻删
-            log.info("WAVE_DEBUG response status=200 body=%r reason=duplicate", "")
+            log.warning("WAVE_DEBUG response status=200 body=%r reason=duplicate", "")
             return Response(content="", media_type="application/json")
     else:
         log.warning("wave webhook: event without event_id, payload keys=%s", list(payload.keys()))
@@ -328,7 +328,7 @@ async def wave_callback(
         except Exception:  # noqa: BLE001
             log.exception("feedback handle failed event_id=%s", event_id)
         # WAVE_DEBUG: 临时调试,拿到完整请求后立刻删
-        log.info("WAVE_DEBUG response status=200 body=%r reason=feedback", "")
+        log.warning("WAVE_DEBUG response status=200 body=%r reason=feedback", "")
         return Response(content="", media_type="application/json")
 
     # 6) 落 raw_inputs
@@ -392,5 +392,5 @@ async def wave_callback(
 
     # 8) 1s 内 200 + 空 body
     # WAVE_DEBUG: 临时调试,拿到完整请求后立刻删
-    log.info("WAVE_DEBUG response status=200 body=%r reason=normal_event", "")
+    log.warning("WAVE_DEBUG response status=200 body=%r reason=normal_event", "")
     return Response(content="", media_type="application/json")
