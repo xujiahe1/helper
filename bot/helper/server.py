@@ -46,7 +46,9 @@ def create_app() -> FastAPI:
     async def _on_startup() -> None:
         # APScheduler 接管定时任务扫描。模块级懒导入,避免测试 / CLI 时强引入 apscheduler。
         from helper.scheduler import start_scheduler
+        from helper.storage.db import init_engine
 
+        init_engine(settings.helper_data_dir / "helper.db")
         start_scheduler()
 
     @app.on_event("shutdown")
