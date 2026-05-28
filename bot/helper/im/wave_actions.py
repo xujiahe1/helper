@@ -271,11 +271,16 @@ def _route_message_sync(
     """主路径: 反查身份 → intent classify → judgment 走 L1+ack / ask 走 Ask runtime + 回复。
 
     全后台跑,任何一步出错只 log,不影响其他。
+
+    可视化: 长路径(KM 富化 / intent classify 进入后)发"思考中"卡片,
+    完成后 active/update 刷成最终内容。短路径(inbox 触发 / pending confirm /
+    inbox reply)毫秒级返回,不发卡片,维持纯文本 reply。
     """
     from helper.ask import ask
     from helper.ask.runtime import render_for_wave
     from helper.im import km_ingest
     from helper.im.intent import classify
+    from helper.im.progress_card import ThinkingTracker
     from helper.ingest import schedule_l1
 
     from helper.scheduler import (
@@ -289,15 +294,14 @@ def _route_message_sync(
     domain, _name = resolve_identity(sender_id, sender_id_type)
     _backfill_author_domain(raw_id, domain)
 
-    # 群里发消息,reply 用 chat_id;单聊用 sender 自身
+    # 群里发消息,卡片发到 chat_id;单聊用 sender 自身
     if chat_id:
         receiver_id, receiver_id_type = chat_id, "chat_id"
     else:
         receiver_id, receiver_id_type = sender_id, sender_id_type
 
-    # 优先级 0a: owner 私聊里的 inbox 触发 / 回执
+    # 优先级 0a: owner 私聊里的 inbox 触发 / 回执 — 短路径,不走卡片
     if domain and not chat_id:
-        # 「/inbox」/「周报」等固定命令 — owner 主动触发当下 digest
         if _is_inbox_trigger(text):
             from helper.config import get_settings
             from helper.inbox import build_digest, render_card, snapshot_digest
@@ -310,7 +314,6 @@ def _route_message_sync(
                 _reply_text(wave_msg_id, body, request_id=f"inbox-now-{raw_id}")
                 return
 
-        # 在 schedule_confirm 之前,避免「批准 1-3」被误绑到无关 confirm
         from helper.inbox import try_handle_reply
 
         inbox_reply = try_handle_reply(
@@ -323,128 +326,99 @@ def _route_message_sync(
                     schedule_l1(payload)
             return
 
-    # 优先级 0b: 该用户有 pending schedule confirm → 当前消息一律视为对它的回应
+    # 优先级 0b: pending schedule confirm — 短路径
     if domain and get_pending_confirm(domain) is not None:
         reply = handle_confirm(text, domain)
         if reply is not None:
             _reply_text(wave_msg_id, reply, request_id=f"sched-confirm-{raw_id}")
             return
 
-    # 前置富化(不是路由):消息里含 KM URL → 拉文档作为这次会话的素材。
-    # 任何一篇 fetch 失败(no_permission / unsupported / error)→ 直接停,不走 intent。
-    # 全部 ok / skipped → 把素材作为 inline_context / l1 输入,继续走 intent 路由。
-    fetched: list[km_ingest.KMIngestResult] = []
-    km_urls = km_ingest.find_km_urls(text)
-    if km_urls:
-        try:
-            fetched = km_ingest.ingest_text(
-                text,
-                sender_domain=domain or sender_id,
-                chat_id=chat_id,
-                parent_message_id=wave_msg_id,
-            )
-        except Exception:  # noqa: BLE001
-            log.exception("km_ingest failed raw#%d urls=%s", raw_id, km_urls)
-            _reply_text(wave_msg_id, "⚠️ 文档拉取异常,请稍后重试", request_id=f"km-err-{raw_id}")
+    # 进入长路径 — 立刻发"思考中"卡片(失败只 log)。
+    # 后续所有出口都要么 finish(text) 要么 fail(),用 try/finally 兜底防泄漏。
+    tracker = ThinkingTracker(
+        receiver_id=receiver_id,
+        receiver_id_type=receiver_id_type,
+        request_id_prefix=f"thinking-{raw_id}",
+    ).start()
+
+    try:
+        # 前置富化:消息里含 KM URL → 拉文档作为这次会话的素材。
+        fetched: list[km_ingest.KMIngestResult] = []
+        km_urls = km_ingest.find_km_urls(text)
+        if km_urls:
+            try:
+                fetched = km_ingest.ingest_text(
+                    text,
+                    sender_domain=domain or sender_id,
+                    chat_id=chat_id,
+                    parent_message_id=wave_msg_id,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("km_ingest failed raw#%d urls=%s", raw_id, km_urls)
+                tracker.finish("⚠️ 文档拉取异常,请稍后重试")
+                return
+            failed = [
+                r for r in fetched if r.status in ("no_permission", "unsupported", "error")
+            ]
+            if failed:
+                tracker.finish(km_ingest.format_results(failed))
+                return
+
+        intent = classify(text)
+
+        if intent == "schedule_create":
+            tracker.finish(handle_create(text, domain))
             return
-        failed = [
-            r for r in fetched if r.status in ("no_permission", "unsupported", "error")
-        ]
-        if failed:
-            _reply_text(
-                wave_msg_id,
-                km_ingest.format_results(failed),
-                request_id=f"km-fail-{raw_id}",
-            )
+        if intent == "schedule_list":
+            tracker.finish(handle_list(domain))
+            return
+        if intent == "schedule_cancel":
+            tracker.finish(handle_cancel(text, domain))
             return
 
-    intent = classify(text)
-
-    # schedule_* 三类直接走 scheduler handler
-    if intent == "schedule_create":
-        reply = handle_create(text, domain)
-        _reply_text(wave_msg_id, reply, request_id=f"sched-create-{raw_id}")
-        return
-    if intent == "schedule_list":
-        reply = handle_list(domain)
-        _reply_text(wave_msg_id, reply, request_id=f"sched-list-{raw_id}")
-        return
-    if intent == "schedule_cancel":
-        reply = handle_cancel(text, domain)
-        _reply_text(wave_msg_id, reply, request_id=f"sched-cancel-{raw_id}")
-        return
-
-    if intent == "ask":
-        # 把 fetched 的 KM 文档塞进 inline_context,让 ask 用文档内容回答
-        inline_ctx = _build_inline_context(fetched)
-        try:
-            ans = ask(
-                text,
-                asker_domain=domain or sender_id,
-                chat_id=chat_id,
-                raw_id=raw_id,
-                inline_context=inline_ctx,
-            )
-        except Exception:  # noqa: BLE001
-            log.exception("ask runtime failed raw#%d", raw_id)
+        if intent == "ask":
+            inline_ctx = _build_inline_context(fetched)
+            try:
+                ans = ask(
+                    text,
+                    asker_domain=domain or sender_id,
+                    chat_id=chat_id,
+                    raw_id=raw_id,
+                    inline_context=inline_ctx,
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("ask runtime failed raw#%d", raw_id)
+                tracker.fail()
+                return
+            tracker.finish(render_for_wave(ans))
+            # 卡片路径暂不挂 👍/👎(active/update 不支持 feedback_config),
+            # ask_answers.wave_msg_id 改成卡片自身 msg_id,reaction 链路保持兜底
+            if tracker.msg_id and ans.answer_id is not None:
+                with session() as s:
+                    row = s.get(AskAnswer, ans.answer_id)
+                    if row is not None:
+                        row.wave_msg_id = tracker.msg_id
+                        s.commit()
             return
-        body = render_for_wave(ans)
-        # 用 reply API,带 feedback_config 让用户能 👍/👎
-        try:
-            resp = wave_client.reply_message(
-                msg_id=wave_msg_id,
-                msg_type="text",
-                content={"text": body},
-                enable_feedback=True,
-                request_id=f"ask-{ans.answer_id}" if ans.answer_id else f"ask-raw{raw_id}",
-            )
-        except WaveAPIError as e:
-            log.warning("reply ask failed raw#%d: %s", raw_id, e)
+
+        if intent == "judgment":
+            targets: list[int] = []
+            if fetched:
+                targets = [r.raw_id for r in fetched if r.status == "ok" and r.raw_id]
+            if not targets:
+                targets = [raw_id]
+            total = sum(_run_l1_and_count(rid) for rid in targets)
+            if total > 0:
+                tracker.finish(_format_judgment_ack(fetched, total))
+            else:
+                tracker.finish("🤔 没看出能沉淀的内容,这条没入库")
             return
-        # 把 bot 回复的 wave_msg_id 回填到 ask_answers,方便 reaction 反查
-        bot_msg_id = ""
-        if isinstance(resp, dict):
-            data = resp.get("data") if isinstance(resp.get("data"), dict) else resp
-            bot_msg_id = data.get("message_id") or data.get("msg_id") or ""
-        if bot_msg_id and ans.answer_id is not None:
-            with session() as s:
-                row = s.get(AskAnswer, ans.answer_id)
-                if row is not None:
-                    row.wave_msg_id = bot_msg_id
-                    s.commit()
-        return
 
-    if intent == "judgment":
-        # 喂知识/分享决策。两条子路径:
-        #   - 有 KM 文档 → 对每篇 ok 的 raw_id 跑 process_raw,统计原子产出
-        #   - 纯文本 → 对当前 raw_id 跑 process_raw
-        # 根据 L1 实际产出决定 ack 文案,不无脑回"已记录"。
-        targets: list[int] = []
-        if fetched:
-            targets = [r.raw_id for r in fetched if r.status == "ok" and r.raw_id]
-        if not targets:
-            targets = [raw_id]
-        total = sum(_run_l1_and_count(rid) for rid in targets)
-        if total > 0:
-            _reply_text(
-                wave_msg_id,
-                _format_judgment_ack(fetched, total),
-                request_id=f"judg-ok-{raw_id}",
-            )
-        else:
-            _reply_text(
-                wave_msg_id,
-                "🤔 没看出能沉淀的内容,这条没入库",
-                request_id=f"judg-empty-{raw_id}",
-            )
-        return
-
-    # unknown 兜底:LLM 抽风、闲聊、不可分类
-    _reply_text(
-        wave_msg_id,
-        "🤔 没明白你的意图,可以换个说法",
-        request_id=f"unk-{raw_id}",
-    )
+        # unknown 兜底
+        tracker.finish("🤔 没明白你的意图,可以换个说法")
+    except Exception:  # noqa: BLE001
+        log.exception("route message failed raw#%d", raw_id)
+        tracker.fail()
 
 
 def schedule_ask_reply(

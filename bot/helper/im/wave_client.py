@@ -312,6 +312,37 @@ def reply_message(
     )
 
 
+# ---------- 主动更新卡片消息 ----------
+
+def update_card_active(
+    msg_id: str,
+    *,
+    content: str | dict[str, Any],
+    receiver_ids: list[str] | None = None,
+    receiver_id_type: str | None = None,
+) -> dict[str, Any]:
+    """主动更新应用已发送的卡片消息(KM mhd3rr0wvj1s)。
+
+    - msg_id: 发卡片时返回的 om_xxx
+    - 共享卡片更新所有人,无需 receiver_ids
+    - 30 天内有效;只能改自己 app 发的卡片
+    """
+    if isinstance(content, dict):
+        content_str = json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+    else:
+        content_str = content
+    body: dict[str, Any] = {"msg_id": msg_id, "content": content_str}
+    if receiver_ids:
+        body["receiver_ids"] = receiver_ids
+    if receiver_id_type:
+        body["receiver_id_type"] = receiver_id_type
+    return _post(
+        "/openapi/im/v1/message/card/active/update",
+        params=None,
+        json_body=body,
+    )
+
+
 # ---------- 拉表情回复(👍/👎 + 其它) ----------
 
 def get_message_reactions(
