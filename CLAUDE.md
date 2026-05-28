@@ -35,7 +35,7 @@
 
 | 项 | 值 |
 |---|---|
-| 服务器 | `10.234.81.212` Ubuntu 22.04 / **2C 3.6G 40G(不可升配)** |
+| 服务器 | `10.234.81.212` Ubuntu 22.04 / **2C 3.6G 40G(不可升配)** / SSH: `ssh root@10.234.81.212`(直连 root) |
 | 域名 | `xueyuhelper.mihoyo.com` |
 | IAM SDK clientId | `9vl37yktgp0ltsk4` |
 | IAM 网关注册 | `xueyuhelper` 应用(@徐叶佳 配置),路径前缀 `/mcp-api/`,上游 `http://10.234.81.212` |

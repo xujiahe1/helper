@@ -1,6 +1,11 @@
-"""Wave im.msg.feedback.action_v1 事件 — 用户对 bot 回复点 👍/👎。
+"""Wave im.msg.reaction.{created,deleted}_v1 — 用户对 bot 回复贴 emoji 表情。
 
-按 (operator_id, msg_id) 复合主键覆盖更新,不做加减统计。
+与 feedback(👍/👎 按钮)是两个独立事件:
+  - feedback action_type ∈ {like, dislike, cancel_like, cancel_dislike}
+  - reaction reaction_type 是任意 emoji_type 字符串(thumbsup / fire / heart / ...)
+
+复用 ReactionLog 表,action_type 列写成 "reaction:<emoji>" / "reaction_deleted:<emoji>"
+作前缀区分,避免新增表。同 (operator_id, msg_id) 仍用覆盖更新。
 """
 
 from __future__ import annotations
@@ -17,12 +22,11 @@ from helper.storage.models import AskAnswer, ReactionLog
 log = logging.getLogger(__name__)
 
 
-def is_feedback_event(event_type: str) -> bool:
-    return event_type.startswith("im.msg.feedback.action")
+def is_reaction_event(event_type: str) -> bool:
+    return event_type.startswith("im.msg.reaction.")
 
 
-def handle(payload: dict[str, Any]) -> None:
-    """处理一个 feedback 事件,落 reaction_log。"""
+def handle(event_type: str, payload: dict[str, Any]) -> None:
     event = payload.get("event") or {}
     if not isinstance(event, dict):
         return
@@ -34,16 +38,20 @@ def handle(payload: dict[str, Any]) -> None:
     operator_user_id = operator.get("user_id") or ""
 
     msg_id = event.get("msg_id") or ""
-    feedback_info = event.get("feedback_info") or {}
-    action_type = (
-        feedback_info.get("action_type") if isinstance(feedback_info, dict) else ""
-    ) or ""
+    reaction_type = event.get("reaction_type") or {}
+    emoji = ""
+    if isinstance(reaction_type, dict):
+        emoji = reaction_type.get("emoji_type") or ""
+    elif isinstance(reaction_type, str):
+        emoji = reaction_type
 
     if not operator_id or not msg_id:
-        log.warning("feedback event missing operator/msg_id: %s", event)
+        log.warning("reaction event missing operator/msg_id: %s", event)
         return
 
-    # 反查这条 bot msg 对应哪次 Ask
+    prefix = "reaction_deleted" if event_type.endswith(".deleted_v1") else "reaction"
+    action_type = f"{prefix}:{emoji}" if emoji else prefix
+
     related_ask_id = None
     with session() as s:
         ask_row = s.execute(

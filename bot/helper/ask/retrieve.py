@@ -434,10 +434,27 @@ def _rrf_fuse(jaccard: list[Hit], vec: list[Hit], top_k: int) -> list[Hit]:
 
 # ---------- 入口 ----------
 
+def _apply_feedback_weights(hits: list[Hit]) -> None:
+    """加用户反馈信号:like/正向 emoji 加分,dislike/负向 emoji 扣分。失败静默。"""
+    try:
+        from helper.ask.feedback_signal import feedback_weights
+        weights = feedback_weights()
+    except Exception as e:  # noqa: BLE001
+        log.warning("feedback_weights failed err=%s", e)
+        return
+    if not weights:
+        return
+    for h in hits:
+        delta = weights.get((h.type, h.ref), 0.0)
+        if delta:
+            h.score += delta
+
+
 def retrieve_relevant(question: str, *, top_k: int = 8) -> list[Hit]:
     """对 question 做检索,返 top_k Hit。
 
     Hybrid:Jaccard + 向量,RRF 融合;向量失败自动降级只走 Jaccard。
+    最后接用户反馈加权(ReactionLog → citations → spec/raw)。
     """
     qtoks = _tokens(question)
     if not qtoks:
@@ -454,6 +471,11 @@ def retrieve_relevant(question: str, *, top_k: int = 8) -> list[Hit]:
                 h.score *= 1.5
             elif h.type == "raw":
                 h.score *= 0.6
+        _apply_feedback_weights(jac)
+        jac.sort(key=lambda h: -h.score)
         return jac[:top_k]
 
-    return _rrf_fuse(jac, vec, top_k)
+    fused = _rrf_fuse(jac, vec, top_k * 4)  # 多取一些再加权重排
+    _apply_feedback_weights(fused)
+    fused.sort(key=lambda h: -h.score)
+    return fused[:top_k]
