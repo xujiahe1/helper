@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -24,6 +25,7 @@ from helper.storage import session
 from helper.storage.models import (
     ConflictLog,
     EntityCandidate,
+    InboxDigest,
     InquiryLog,
     L1Result,
     RawInput,
@@ -40,9 +42,11 @@ class WeeklyDigest:
     raw_count: int = 0
     l1_ok: int = 0
     l1_err: int = 0
-    # SpecCandidate.id 一并带上 — 让 owner 用「批准/驳回 #N」回执裁决
+    # 三段编号(1-N / 2-N / 3-N),序号即周报里给用户呈现的编号(从 1 开始)。
+    # SpecCandidate.id 一并带上 — 让 owner 用「批准 1-N」回执裁决
     pending_specs: list[tuple[int, str, str]] = field(default_factory=list)  # (id, slug, title)
-    open_conflicts: list[tuple[int, str, str]] = field(default_factory=list)  # (id, spec_slug, severity)
+    # ConflictLog: (id, target_type, target_slug, severity, summary)
+    open_conflicts: list[tuple[int, str, str, str, str]] = field(default_factory=list)
     # 列出未答追问全文 — 让 owner 直接看到要补什么。(id, raw_id, question)
     unanswered_inquiries: list[tuple[int, int, str]] = field(default_factory=list)
     entity_total: int = 0
@@ -87,7 +91,10 @@ def build_digest() -> WeeklyDigest:
             .order_by(ConflictLog.created_at.desc())
             .limit(10)
         ).scalars().all()
-        d.open_conflicts = [(c.id, c.spec_slug, c.severity) for c in conflicts]
+        d.open_conflicts = [
+            (c.id, c.target_type or "spec", c.target_slug, c.severity, (c.summary or "")[:120])
+            for c in conflicts
+        ]
 
         inquiry_rows = s.execute(
             select(InquiryLog)
@@ -106,6 +113,11 @@ def build_digest() -> WeeklyDigest:
 
 
 def render_card(d: WeeklyDigest) -> str:
+    """渲染周报。三段编号:
+        1-N 待沉淀(spec 候选)→ 回「批准 1-N」/「驳回 1-N」
+        2-N 待修正(冲突)    → 回「采纳 2-N」(用新覆盖旧) / 「保留 2-N」(否决新)/ 「都留 2-N」(并存)
+        3-N 待回答(追问)    → 回「答 3-N 你的答案」
+    """
     lines = [
         f"📋 Helper 周报 ({d.week_start:%m-%d} ~ {d.week_end:%m-%d})",
         "",
@@ -114,30 +126,77 @@ def render_card(d: WeeklyDigest) -> str:
         "",
     ]
     if d.pending_specs:
-        lines.append(f"📝 待 review spec ({len(d.pending_specs)}) — 回「批准 #N」/「驳回 #N」裁决:")
-        for sid, slug, title in d.pending_specs:
-            lines.append(f"  #{sid} [{slug}] {title}")
+        lines.append(f"📝 1. 待沉淀规约 ({len(d.pending_specs)}) — 回「批准 1-N」/「驳回 1-N」")
+        for n, (_sid, slug, title) in enumerate(d.pending_specs, start=1):
+            lines.append(f"  1-{n}  {title}  〔{slug}〕")
         lines.append("")
     if d.open_conflicts:
-        lines.append(f"⚠️  待裁决冲突 ({len(d.open_conflicts)}):")
-        for cid, slug, sev in d.open_conflicts:
-            lines.append(f"  #{cid} vs {slug} ({sev})")
+        lines.append(
+            f"⚠️ 2. 待修正冲突 ({len(d.open_conflicts)}) — "
+            "回「采纳 2-N」用新覆盖旧 / 「保留 2-N」否决新 / 「都留 2-N」并存"
+        )
+        for n, (_cid, ttype, slug, sev, summary) in enumerate(d.open_conflicts, start=1):
+            type_label = {
+                "spec": "规约", "fact": "事实", "case": "案例",
+                "concept": "概念", "relation": "关系",
+            }.get(ttype, ttype)
+            lines.append(f"  2-{n}  [{type_label}/{slug}] ({sev})")
+            if summary:
+                lines.append(f"        {summary}")
         lines.append("")
     if d.unanswered_inquiries:
-        lines.append(f"❓ 未答追问 ({len(d.unanswered_inquiries)}) — 回「#N 你的答案」或「答 #N ...」:")
-        for qid, rid, q in d.unanswered_inquiries:
+        lines.append(f"❓ 3. 待回答的追问 ({len(d.unanswered_inquiries)}) — 回「答 3-N 你的答案」")
+        for n, (_qid, rid, q) in enumerate(d.unanswered_inquiries, start=1):
             qline = q.replace("\n", " ").strip()
             if len(qline) > 80:
                 qline = qline[:78] + "…"
-            lines.append(f"  #{qid} (raw#{rid}) {qline}")
+            lines.append(f"  3-{n}  {qline}  〔raw#{rid}〕")
         lines.append("")
     if not (d.pending_specs or d.open_conflicts or d.unanswered_inquiries):
         lines.append("✓ 本周 inbox 清空")
     return "\n".join(lines).rstrip()
 
 
-def send_to(receiver_id: str, *, receiver_id_type: str = "user_id") -> bool:
-    """构建当周 digest 并发出去。返成功与否。"""
+def snapshot_digest(owner_domain: str, d: WeeklyDigest) -> None:
+    """把一次周报的 1-N/2-N/3-N → 真实 ID 映射存进 inbox_digest。
+
+    owner 一行,upsert。reply.py 用 owner 域账号反查最新 digest 解析。
+    """
+    if not owner_domain:
+        return
+    payload = {
+        "specs":     [sid for sid, _slug, _title in d.pending_specs],
+        "conflicts": [cid for cid, *_ in d.open_conflicts],
+        "inquiries": [qid for qid, _rid, _q in d.unanswered_inquiries],
+    }
+    with session() as s:
+        row = s.get(InboxDigest, owner_domain)
+        if row is None:
+            row = InboxDigest(
+                owner_domain=owner_domain,
+                items_json=json.dumps(payload, ensure_ascii=False),
+                sent_at=datetime.now(timezone.utc),
+            )
+            s.add(row)
+        else:
+            row.items_json = json.dumps(payload, ensure_ascii=False)
+            row.sent_at = datetime.now(timezone.utc)
+
+
+def send_to(
+    receiver_id: str,
+    *,
+    receiver_id_type: str = "user_id",
+    owner_domain: str = "",
+) -> bool:
+    """构建当周 digest 并发出去。返成功与否。
+
+    owner_domain 给 reply 解析用 — 没传就用 settings.helper_owner_domain。
+    """
+    from helper.config import get_settings
+    if not owner_domain:
+        owner_domain = get_settings().helper_owner_domain
+
     d = build_digest()
     body = render_card(d)
     try:
@@ -151,4 +210,5 @@ def send_to(receiver_id: str, *, receiver_id_type: str = "user_id") -> bool:
     except WaveAPIError as e:
         log.warning("weekly digest send failed → %s/%s: %s", receiver_id_type, receiver_id, e)
         return False
+    snapshot_digest(owner_domain, d)
     return True

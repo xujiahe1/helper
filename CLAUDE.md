@@ -41,7 +41,7 @@
 | IAM 网关注册 | `xueyuhelper` 应用(@徐叶佳 配置),路径前缀 `/mcp-api/`,上游 `http://10.234.81.212` |
 | 应用 app_code | `APP_17764200606379741` |
 | Wave bot APP_ID | `cli_d172001413a848689fa9dbe1cf03eafa`(secret/aes/token 在服务器 `/etc/helper/wave.env`,root only,**不入仓库**) |
-| Wave 回调 URL(部署时配) | `mhynetcn://10.234.81.212:8001/callback` |
+| Wave 回调 URL(部署时配) | `mhynetcn://10.234.81.212:8009/callback` |
 | Wave 开放平台 API | `https://open.hoyowave.com`(出站走这,服务端 app_id+app_secret 自换 access_token) |
 | Athenai API | `https://athenai.mihoyo.com`(兼容 Anthropic `/v1/messages`) |
 

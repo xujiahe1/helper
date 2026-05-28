@@ -104,7 +104,8 @@ def build_browser_router() -> APIRouter:
         if open_conflicts:
             body.append(f"<h2>待裁决冲突 ({len(open_conflicts)})</h2><table>")
             for c in open_conflicts:
-                body.append(f"<tr><td>#{c.id}</td><td>{escape(c.spec_slug)}</td>"
+                target = f"{c.target_type or 'spec'}/{c.target_slug}"
+                body.append(f"<tr><td>#{c.id}</td><td>{escape(target)}</td>"
                             f"<td><span class='tag'>{escape(c.severity)}</span></td>"
                             f"<td>{escape((c.summary or '')[:100])}</td></tr>")
             body.append("</table>")

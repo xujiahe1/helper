@@ -113,6 +113,8 @@ class EntityCandidate(Base):
     last_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     promoted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     git_path: Mapped[str] = mapped_column(String(255), default="")  # ontology/entities/<slug>.md
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 取代它的 raw_id
 
 
 class SpecCandidate(Base):
@@ -133,10 +135,19 @@ class SpecCandidate(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     promoted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     git_path: Mapped[str] = mapped_column(String(255), default="")
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 取代它的 raw_id
 
 
 class ConflictLog(Base):
-    """新输入与已有 spec 冲突 — 等用户/专家裁决。"""
+    """新输入与已有(spec / fact / case / concept / relation)冲突 — 等用户/专家裁决。
+
+    target_type ∈ {spec, fact, case, concept, relation}:决定后续 resolve 时
+    要去哪张候选表打 superseded_at 标记。target_slug 是被冲突候选的 slug。
+
+    历史列名 spec_slug 已映射成 target_slug(改属性不改物理列,旧数据自动归档为 type=spec),
+    由 _backfill_missing_columns 把 target_type 列补出来,默认 'spec'。
+    """
 
     __tablename__ = "conflict_log"
 
@@ -144,7 +155,9 @@ class ConflictLog(Base):
     raw_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("raw_inputs.id", ondelete="CASCADE")
     )
-    spec_slug: Mapped[str] = mapped_column(String(128))  # 与之冲突的已有 spec
+    target_type: Mapped[str] = mapped_column(String(16), default="spec")
+    # 物理列保留 spec_slug,逻辑名 target_slug。
+    target_slug: Mapped[str] = mapped_column("spec_slug", String(255))
     summary: Mapped[str] = mapped_column(Text)           # LLM judge 给的冲突摘要
     severity: Mapped[str] = mapped_column(String(16), default="medium")  # low/medium/high
     resolution: Mapped[str] = mapped_column(String(16), default="open")  # open/superseded/coexist/rejected
@@ -253,6 +266,26 @@ class ScheduleConfirm(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
+class InboxDigest(Base):
+    """最近一次发给某 owner 的 inbox 周报快照 — 用于把 1-N/2-N/3-N 解析回真实 ID。
+
+    每次 send_to(owner) 或主动 /inbox 时 upsert 一行(owner_domain 主键),
+    items_json 形如:
+      {
+        "specs":     [spec_candidate_id, ...],          # 1-N → specs[N-1]
+        "conflicts": [conflict_log_id, ...],            # 2-N → conflicts[N-1]
+        "inquiries": [inquiry_log_id, ...],             # 3-N → inquiries[N-1]
+      }
+    回执处理时按编号 1-based 取下标。owner 同时只保留最新一份。
+    """
+
+    __tablename__ = "inbox_digest"
+
+    owner_domain: Mapped[str] = mapped_column(String(64), primary_key=True)
+    items_json: Mapped[str] = mapped_column(Text, default="{}")
+    sent_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+
+
 class VectorIndex(Base):
     """vec0 表的 sidecar 元信息 — 把"vec0 rowid"对回业务对象 (kind, ref)。
 
@@ -355,6 +388,8 @@ class FactCandidate(Base):
     last_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     promoted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     git_path: Mapped[str] = mapped_column(String(255), default="")
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class CaseCandidate(Base):
@@ -379,6 +414,8 @@ class CaseCandidate(Base):
     last_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     promoted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     git_path: Mapped[str] = mapped_column(String(255), default="")
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class RelationCandidate(Base):
@@ -402,3 +439,5 @@ class RelationCandidate(Base):
     last_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     promoted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     git_path: Mapped[str] = mapped_column(String(255), default="")
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)

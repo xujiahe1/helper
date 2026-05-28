@@ -65,7 +65,9 @@ API: 走 Athenai `https://athenai.mihoyo.com/v1/messages`(Anthropic 原生兼容
 
 入站是 Wave 平台主动 POST 到我们的 `/callback` 端点(本来就是 HTTP,跟 MCP 无关)。
 
-**部署形态**: bot 在 `10.234.81.212:8001` 监听 `/callback`。Wave 后台回调 URL 配 `mhynetcn://10.234.81.212:8001/callback`(`mhynetcn` = mihoyo 办公网 http scheme,我们的服务器在办公网内,**协议层合法,不需要 https / 不需要走网关反代**)。
+**部署形态**: bot 在 `10.234.81.212:8009` 监听 `/callback`。Wave 后台回调 URL 配 `mhynetcn://10.234.81.212:8009/callback`(`mhynetcn` = mihoyo 办公网 http scheme,我们的服务器在办公网内,**协议层合法,不需要 https / 不需要走网关反代**)。
+
+> **端口为啥是 8009 不是 8001**:`:8001` 在这台 IDC 服务器的入向被中间网络层封了(本地办公网 8001 通,服务器 IDC 8001 收不到 SYN),换 8009 后 Wave 内网出口直接握手成功(2026-05-28 验证)。新部署直接用 8009,不要再去试 8001。
 
 > 协议参考: [事件订阅概述](https://km.mihoyo.com/doc/mheo000ok1zs) · [事件办公网推送](https://km.mihoyo.com/doc/mh041f0mt47k)
 
@@ -79,7 +81,7 @@ API: 走 Athenai `https://athenai.mihoyo.com/v1/messages`(Anthropic 原生兼容
 | 4 | **普通事件 1 秒内 HTTP 200 + body 为 `""` 或 `{}`** — 实际处理走后台 async,不要在响应链上做 LLM | Wave 退避重试(10s/30s/3m/1h/6h × 5),触发事件风暴 |
 | 5 | **event_id 去重 7.1 小时窗口** — `header.event_id` 写入 sqlite 表 `(event_id PRIMARY KEY, received_at)`,重复 event 直接 200 不处理 | 重试窗口内同一事件被多次执行(发重复消息 / 重复扣 LLM 配额) |
 
-**实现位置**: `bot/helper/im/wave_webhook.py` — FastAPI router,挂在主 bot 进程下,监听 8001 端口(单进程,见 §3.1)。
+**实现位置**: `bot/helper/im/wave_webhook.py` — FastAPI router,挂在主 bot 进程下,监听 8009 端口(单进程,见 §3.1)。
 
 **密钥来源**: 本地开发用 `bot/.env`,服务器生产从 `/etc/helper/wave.env`(chmod 600 root only)读,**绝不入仓库**。
 
@@ -205,7 +207,7 @@ systemd-run \
 |---|---|---|
 | 开发主循环 | **本地** | 全部组件可本地起(sqlite + git + FastAPI) |
 | Wave IM 测试 | 本地用 mock 事件 | Wave 推不到 localhost,不要为本地开发改 Wave 回调 URL |
-| 集成测试 | 本地 + 临时 ssh tunnel(可选) | `ssh -R 8001:localhost:8001 root@10.234.81.212` 把本地 8001 露给服务器 |
-| 部署 | 服务器 | 改 Wave 回调 URL → `mhynetcn://10.234.81.212:8001/callback`,deploy systemd unit |
+| 集成测试 | 本地 + 临时 ssh tunnel(可选) | `ssh -R 8009:localhost:8009 root@10.234.81.212` 把本地 8009 露给服务器 |
+| 部署 | 服务器 | 改 Wave 回调 URL → `mhynetcn://10.234.81.212:8009/callback`,deploy systemd unit |
 
 部署清单详见 [`bot/deploy/README.md`](../bot/deploy/README.md)。

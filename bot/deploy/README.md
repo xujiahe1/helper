@@ -43,7 +43,7 @@ sudo ln -sf ../sites-available/helper /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl reload nginx
 
 # 8) Wave 后台配置回调 URL
-#    URL = mhynetcn://10.234.81.212:8001/callback
+#    URL = mhynetcn://10.234.81.212:8009/callback
 #    Wave 会下发一条 challenge,bot 解密后回显,看到「URL 验证通过」即接入完成
 ```
 
@@ -59,9 +59,9 @@ sudo systemctl restart helper
 sudo systemctl stop helper
 
 # Smoke test
-curl http://127.0.0.1:8001/healthz
+curl http://127.0.0.1:8009/healthz
 curl -H "X-Helper-Admin-Key: $(sudo grep HELPER_ADMIN_SK /etc/helper/helper.env | cut -d= -f2)" \
-     http://127.0.0.1:8001/admin/healthz
+     http://127.0.0.1:8009/admin/healthz
 
 # 升级
 cd /opt/helper/bot

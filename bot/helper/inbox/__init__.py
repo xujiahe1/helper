@@ -5,12 +5,19 @@
 """
 
 from helper.inbox.reply import try_handle as try_handle_reply
-from helper.inbox.weekly import WeeklyDigest, build_digest, render_card, send_to
+from helper.inbox.weekly import (
+    WeeklyDigest,
+    build_digest,
+    render_card,
+    send_to,
+    snapshot_digest,
+)
 
 __all__ = [
     "WeeklyDigest",
     "build_digest",
     "render_card",
     "send_to",
+    "snapshot_digest",
     "try_handle_reply",
 ]

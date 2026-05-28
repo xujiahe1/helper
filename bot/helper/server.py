@@ -213,7 +213,8 @@ def create_app() -> FastAPI:
                     {
                         "id": r.id,
                         "raw_id": r.raw_id,
-                        "spec_slug": r.spec_slug,
+                        "target_type": r.target_type or "spec",
+                        "target_slug": r.target_slug,
                         "summary": r.summary,
                         "severity": r.severity,
                         "resolution": r.resolution,

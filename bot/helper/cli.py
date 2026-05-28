@@ -87,7 +87,7 @@ def init() -> None:
 
 @main.command()
 @click.option("--host", default="0.0.0.0", show_default=True)
-@click.option("--port", default=8001, show_default=True, type=int)
+@click.option("--port", default=8009, show_default=True, type=int)
 @click.option("--reload", is_flag=True, default=False, help="Auto-reload (dev only)")
 def serve(host: str, port: int, reload: bool) -> None:
     """启 FastAPI server。"""
@@ -565,7 +565,7 @@ def conflict_detect(raw_id: int) -> None:
         click.echo("(no conflict)")
         return
     for h in hits:
-        click.echo(f"  #{h.log_id}  vs spec={h.spec_slug}  [{h.severity}]  {h.summary}")
+        click.echo(f"  #{h.log_id}  vs {h.target_type}={h.target_slug}  [{h.severity}]  {h.summary}")
 
 
 @main.command("conflict-list")
@@ -589,7 +589,8 @@ def conflict_list(status: str) -> None:
             click.echo("(empty)")
             return
         for r in rows:
-            click.echo(f"  #{r.id}  raw={r.raw_id}  spec={r.spec_slug}  [{r.severity}]  {r.resolution}")
+            target = f"{r.target_type or 'spec'}={r.target_slug}"
+            click.echo(f"  #{r.id}  raw={r.raw_id}  {target}  [{r.severity}]  {r.resolution}")
             click.echo(f"      {r.summary[:200]}")
 
 
@@ -614,10 +615,15 @@ def conflict_resolve(log_id: int, resolution: str, resolver: str) -> None:
 @main.command("inbox-weekly")
 @click.option("--receiver", help="若给了就直接 send 到 IM,否则只打印")
 @click.option("--receiver-id-type", default="user_id")
-def inbox_weekly(receiver: str, receiver_id_type: str) -> None:
-    """构建当周 digest;给 receiver 就发出去。"""
+@click.option("--snapshot-owner", default="", help="把 1-N/2-N/3-N → ID 映射存进 inbox_digest(默认走 settings.helper_owner_domain)")
+def inbox_weekly(receiver: str, receiver_id_type: str, snapshot_owner: str) -> None:
+    """构建当周 digest;给 receiver 就发出去。
+
+    --receiver 走 send_to 会自动落 InboxDigest 快照(用 owner 域账号反查)。
+    本地预览也想存快照,用 --snapshot-owner=jiahe.xu 显式指定。
+    """
     from helper.config import get_settings
-    from helper.inbox import build_digest, render_card, send_to
+    from helper.inbox import build_digest, render_card, send_to, snapshot_digest
     from helper.storage import init_engine
 
     s = get_settings()
@@ -628,6 +634,10 @@ def inbox_weekly(receiver: str, receiver_id_type: str) -> None:
         return
     d = build_digest()
     click.echo(render_card(d))
+    owner = snapshot_owner or get_settings().helper_owner_domain
+    if owner:
+        snapshot_digest(owner, d)
+        click.echo(f"\n(snapshot saved for owner={owner})")
 
 
 @main.command("batch-ingest")

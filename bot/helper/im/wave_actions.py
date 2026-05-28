@@ -184,6 +184,23 @@ def _reply_text(wave_msg_id: str, text: str, *, request_id: str = "") -> None:
 
 # ---------- Ask 路径(intent classify → reply with citations) ----------
 
+_INBOX_TRIGGERS = {
+    "/inbox", "inbox", "/digest", "digest",
+    "周报", "看周报", "我的周报", "立刻给我看周报",
+    "我的 inbox", "我的inbox",
+}
+
+
+def _is_inbox_trigger(text: str) -> bool:
+    """owner 私聊里发的 owner 主动触发 — 命中即立刻 build + 推 + 快照。
+
+    简短指令文匹配,不走 LLM intent。命中条件: 整条消息(strip)等于
+    任何一个触发词。避免「我刚发的判断里提了 /inbox」被误命中。
+    """
+    t = (text or "").strip().lower()
+    return t in {x.lower() for x in _INBOX_TRIGGERS}
+
+
 def _route_message_sync(
     *,
     raw_id: int,
@@ -244,9 +261,22 @@ def _route_message_sync(
             _reply_text(wave_msg_id, reply, request_id=f"km-ack-{raw_id}")
         return
 
-    # 优先级 0a: owner 私聊里的 inbox 回执(批准/驳回/跳过 #N + 答 #N ...)
-    # 在 schedule_confirm 之前,避免「批准 #3」被误绑到无关 confirm
+    # 优先级 0a: owner 私聊里的 inbox 回执(批准/驳回/跳过 1-N + 采纳/保留/都留 2-N + 答 3-N ...)
+    # 在 schedule_confirm 之前,避免「批准 1-3」被误绑到无关 confirm
     if domain and not chat_id:
+        # 「/inbox」/「inbox」/「周报」/「立刻给我看周报」等 — owner 主动触发当下 digest
+        if _is_inbox_trigger(text):
+            from helper.config import get_settings
+            from helper.inbox import build_digest, render_card, snapshot_digest
+
+            owner = get_settings().helper_owner_domain
+            if owner and domain == owner:
+                d = build_digest()
+                body = render_card(d)
+                snapshot_digest(domain, d)
+                _reply_text(wave_msg_id, body, request_id=f"inbox-now-{raw_id}")
+                return
+
         from helper.inbox import try_handle_reply
 
         inbox_reply = try_handle_reply(

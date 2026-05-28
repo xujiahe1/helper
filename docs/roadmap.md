@@ -58,10 +58,10 @@ helper raw-show 1              # 看完整 L1 五字段
 helper l1-backfill
 
 # 4. Wave webhook 路径:启服务,模拟 Wave 平台投一条事件
-helper serve --port 8001 &     # 另一个终端跑也行
-curl -s http://127.0.0.1:8001/healthz
-curl -s -H "X-Helper-Admin-Key: $HELPER_ADMIN_SK" http://127.0.0.1:8001/admin/healthz
-curl -s -H "X-Helper-Admin-Key: $HELPER_ADMIN_SK" http://127.0.0.1:8001/admin/raw-inputs | jq .
+helper serve --port 8009 &     # 另一个终端跑也行
+curl -s http://127.0.0.1:8009/healthz
+curl -s -H "X-Helper-Admin-Key: $HELPER_ADMIN_SK" http://127.0.0.1:8009/admin/healthz
+curl -s -H "X-Helper-Admin-Key: $HELPER_ADMIN_SK" http://127.0.0.1:8009/admin/raw-inputs | jq .
 # Wave webhook 自动 smoke 见 bot 的端到端测试脚本(模拟加密/加签后投递,验证 raw + L1 落库)
 
 # 5. 策略外置可见:决定模型路由 / 晋升规则,看 spec git 历史
@@ -98,12 +98,13 @@ git -C var/helper/git-repo log --oneline     # init + 后续策略变更
 
 ### 做
 
-| 新增 | 范围 |
-|---|---|
-| 追问 Engine | 初始 20 条策略,每次追问命中率打标。追问通过 IM 推送 |
-| Conflict Detector v0 | LLM judge 检测新输入和已有规则的矛盾 |
-| Surface 2 (Inbox) | 走 IM 周报形式 — 周一 push 一条卡片消息列出待办 |
-| Ontology 周期体检 | 每周一次合并近似 entity / 标记孤儿 |
+| 新增 | 范围 | 状态 |
+|---|---|---|
+| 追问 Engine | 初始 20 条策略,每次追问命中率打标。追问通过 IM 推送 | ✅ |
+| Conflict Detector | LLM judge(decision vs spec)+ 结构判定(fact/case/relation 同 key 不同 value)— 5 类原子统一走 conflict_log,sink 自动挂载 | ✅ |
+| Surface 2 (Inbox) | 走 IM 周报形式 — 周一 push 一条卡片消息列出待办;owner 私聊「/inbox」主动触发当下 digest | ✅ |
+| 信息修正统一路径 | 任意类型新输入和既有不一致都进 conflict_log,owner 用「采纳 / 保留 / 都留 2-N」三选项裁决;superseded 立刻 build_bundle | ✅ |
+| Ontology 周期体检 | 每周一次合并近似 entity / 标记孤儿 | ⏳ |
 
 ### 验收
 
@@ -122,14 +123,14 @@ git -C var/helper/git-repo log --oneline     # init + 后续策略变更
 
 ### 做
 
-| 新增 | 范围 |
-|---|---|
-| Surface 5 (Conflict) | IM 群里 @相关专家解决冲突 + 简易 Web 仲裁台 |
-| Surface 3 (Browser) | 简易 Web 知识库浏览(只读,git repo 渲染) |
-| 多用户身份打通 | Wave user → 域账号 + 姓名(走 Wave users/get,不对接 IAM),raw input 全部带 author |
-| 文档批量 ingest | 走 Qwen/GPT-mini,后台跑 |
-| Replay / Eval | 历史 Q&A replay,版本对比 |
-| **第二专家接入** | 找一个**完全不同领域**的专家,3 周内跑出 30 条规约 |
+| 新增 | 范围 | 状态 |
+|---|---|---|
+| Surface 5 (Conflict) | IM 群里 @相关专家解决冲突 + 简易 Web 仲裁台 | ⏳ Web 仲裁台 |
+| Surface 3 (Browser) | 简易 Web 知识库浏览(只读,git repo 渲染) | ✅ `/admin/browse` |
+| 多用户身份打通 | Wave user → 域账号 + 姓名(走 Wave users/get,不对接 IAM),raw input 全部带 author | ✅ |
+| 文档批量 ingest | 走 Qwen/GPT-mini,后台跑 | ✅ batch_ingest |
+| Replay / Eval | 历史 Q&A replay,版本对比 | ✅ helper.eval.replay |
+| **第二专家接入** | 找一个**完全不同领域**的专家,3 周内跑出 30 条规约 | ⏳ |
 
 ### 验收(关键: 复用率)
 
@@ -142,14 +143,27 @@ git -C var/helper/git-repo log --oneline     # init + 后续策略变更
 
 ---
 
+## Inbox 节奏 — 周报 vs 主动触发
+
+owner 不必等周一才看到待办。两条触发路径并存:
+
+| 触发 | 谁发起 | 说明 |
+|---|---|---|
+| Cron 周报 | 系统 | 每周一 09:00 自动 build_digest + send_to(owner)。`scheduled_tasks` 里登记 task_type=weekly_report |
+| 主动触发 | owner | 私聊 bot 发「/inbox」/「inbox」/「周报」 — 立刻 build + 推 + snapshot |
+
+回执解析支持两套编号:
+- 周报式: 「批准 1-N」/「采纳 2-N」/「答 3-N ...」(N 是周报里 1-based 序号,从最近一次 InboxDigest 反查真实 ID)
+- 老格式: 「批准 #spec_id」/「答 #inquiry_id ...」(给跨周老候选用)
+
+---
+
 ## 当前 open 问题(等用户拍)
 
 | # | 问题 | 当前状态 |
 |---|---|---|
-| OP-1 | Wave bot 应用是否支持 `mhynetcn://` 自定义 scheme | **未解** — Wave 后台保存 `mhynetcn://10.234.81.212:8001/callback` 返回 retcode 25002 "无效的回调地址",在 challenge 推送之前就被拒;原因不明,2026-05-27 切到本地起服务排查 |
-| OP-2 | `mhynetcn://` 协议细节(回调具体怎么投递) | 部署前要从 Wave 后台 / KM 5173 文档树读完整 |
-| OP-3 | 第二个领域专家是谁 | Month 2 末再找,Month 3 启动用 |
-| OP-4 | 服务器 nginx 是否要加 `/wave/webhook` 反代 | 看 OP-1/2 结论;如果 mhynetcn 直连 IP 就不需要 |
+| OP-1 | Wave 回调端口 | **已解(2026-05-28)** — `:8001` 在服务器入向被中间网络层封掉(本地办公网 8001 通,服务器 IDC 入向 8001 没 SYN);切到 `:8009` 后 Wave 内网出口 `10.231.152.29` 直接握手成功,challenge 通过。生产端口固定 8009,回调 URL = `mhynetcn://10.234.81.212:8009/callback` |
+| OP-2 | 第二个领域专家是谁 | Month 2 末再找,Month 3 启动用 |
 
 ---
 

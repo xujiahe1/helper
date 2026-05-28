@@ -104,7 +104,7 @@ A: 倾向不走加急。依据:
 
 ### Surface 5 — Conflict(冲突解决)
 
-专家 A 提的判断和已有规约不一致 → 触发冲突流。3 类:
+专家 A 提的判断和已有(任意类型)知识不一致 → 触发冲突流。3 类:
 
 | 类型 | 例子 | 处理 |
 |---|---|---|
@@ -113,6 +113,44 @@ A: 倾向不走加急。依据:
 | 权威等级 | 同域 A 是 owner / B 是 consultant | A 默认赢,B 视角作为反例附注 |
 
 每次冲突解决产生 [[conflict-resolution-log]],本身高价值。
+
+### 信息修正统一路径(5 类原子全打)
+
+> 所有修正都走同一条流水线 — **不区分 fact/case/concept/relation/decision**。
+> 任意类型的"新输入和既有不一致"都是冲突,都进 inbox,都由 owner 在
+> 「采纳 / 保留 / 都留」三选项里裁决。
+
+```
+新 raw → L1 五类抽取 → 落候选(fact / case / concept / relation / spec_candidate)
+                              ↓
+            sink._run_consumers 自动跑 conflict.detector
+                              ↓
+        ┌─────────────────────┴─────────────────────┐
+        decision           fact            case        relation
+        ─────             ─────           ─────        ────────
+   LLM judge vs      同(s,p) 不同(o,    同 ref_spec     同(a,b) 不同
+   已晋升 spec       scope)结构判定     不同 outcome    relation 结构判定
+        └─────────────────────┬─────────────────────┘
+                              ↓
+                      conflict_log 一张表
+                  (target_type, target_slug, ...)
+                              ↓
+              inbox 周报 / `/inbox` 主动触发
+                              ↓
+      owner 回「采纳 2-N」/「保留 2-N」/「都留 2-N」
+                              ↓
+   resolve(): superseded → 候选打 superseded_at + git 删 .md + 重建 bundle
+              rejected   → 仅记录,既有不动
+              coexist    → 仅记录,标注并存
+```
+
+落地纪律:
+- **conflict_log 不分表** — `target_type ∈ {spec, fact, case, concept, relation}` 字段决定后续处置
+- **superseded 走软删** — 候选行打 `superseded_at` + `superseded_by(raw_id)`,
+  retrieve 自动过滤;旧候选审计仍可查
+- **bundle 重建是 resolve 的一部分** — 修正完立刻 build_bundle(),agent 下一秒
+  看到的就是新版,不等周报 / 不等 cron
+- **手动节奏不变** — 自动只产「待裁决」,落地永远等 owner 点头
 
 ---
 
