@@ -142,6 +142,17 @@ git -C var/helper/git-repo log --oneline     # init + 后续策略变更
 
 ---
 
+## 当前 open 问题(等用户拍)
+
+| # | 问题 | 当前状态 |
+|---|---|---|
+| OP-1 | Wave bot 应用是否支持 `mhynetcn://` 自定义 scheme | **未解** — Wave 后台保存 `mhynetcn://10.234.81.212:8001/callback` 返回 retcode 25002 "无效的回调地址",在 challenge 推送之前就被拒;原因不明,2026-05-27 切到本地起服务排查 |
+| OP-2 | `mhynetcn://` 协议细节(回调具体怎么投递) | 部署前要从 Wave 后台 / KM 5173 文档树读完整 |
+| OP-3 | 第二个领域专家是谁 | Month 2 末再找,Month 3 启动用 |
+| OP-4 | 服务器 nginx 是否要加 `/wave/webhook` 反代 | 看 OP-1/2 结论;如果 mhynetcn 直连 IP 就不需要 |
+
+---
+
 ## Dogfood 策略
 
 ### 第一批 raw input
