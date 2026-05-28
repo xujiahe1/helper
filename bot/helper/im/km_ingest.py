@@ -41,10 +41,11 @@ class KMIngestResult:
     """单个 KM 链接的处理结果。
 
     status:
-      - ok        : 成功拉取并写入 raw_input(可能是新行,也可能是已存在的旧行)
-      - skipped   : 已经在 raw_inputs 里,跳过重新拉
-      - unsupported: 文档类型不支持(spreadsheet 没传 sheetId / smart_spreadsheet / 文件 / 视频 等)
-      - error     : 拉取失败(权限不足 / 限流 / 网络),message 里有原因
+      - ok           : 成功拉取并写入 raw_input(可能是新行,也可能是已存在的旧行)
+      - skipped      : 已经在 raw_inputs 里,跳过重新拉
+      - no_permission: 应用对该文档没有可见性(retcode=10401305) — 让用户授权后重发
+      - unsupported  : 文档类型不支持(spreadsheet 没传 sheetId / smart_spreadsheet / 文件 / 视频 等)
+      - error        : 其它拉取失败(限流 / 网络 / KM 内部错),message 里有原因
     """
 
     url: str
@@ -120,13 +121,17 @@ def _fetch_doc_text(enc_id: str, sheet_id: str | None) -> tuple[str, str, str, s
     """拉文档 → (status, doc_type, title, content_text)。
 
     status:
-      ok          : 拉到正文
-      unsupported : 类型不支持
-      error       : KMAPIError(message 在 content_text 字段返回)
+      ok            : 拉到正文
+      no_permission : 应用对文档无权限(retcode=10401305)
+      unsupported   : 类型不支持(retcode=10401307)
+      error         : 其它 KM 错误(限流 / 网络 / 内部)
     """
     try:
         info = km_client.get_doc_detail(enc_id)
     except KMAPIError as e:
+        # 应用对文档无可见性 → 让用户去授权
+        if e.retcode == 10401305:
+            return "no_permission", "", "", ""
         # 不支持的文档类型 → 上层用专门 status 回告
         if e.retcode == 10401307:
             return "unsupported", "", "", str(e.message or "")
@@ -195,6 +200,11 @@ def ingest_one(
         )
 
     status, doc_type, title, text = _fetch_doc_text(enc_id, sheet_id)
+    if status == "no_permission":
+        return KMIngestResult(
+            url=url, enc_id=enc_id, sheet_id=sheet_id,
+            status="no_permission",
+        )
     if status == "unsupported":
         return KMIngestResult(
             url=url, enc_id=enc_id, sheet_id=sheet_id,
@@ -285,6 +295,10 @@ def _format_one(r: KMIngestResult) -> str:
         return f"📄 已学习《{label}》({r.doc_type}, raw#{r.raw_id})"
     if r.status == "skipped":
         return f"⏭️ 《{label}》已学过 (raw#{r.raw_id}),跳过"
+    if r.status == "no_permission":
+        # 没拉到正文,title 也是空的 — 文案不带《》
+        return "❌ 我没权限读这篇文档,你需要先进行授权"
     if r.status == "unsupported":
-        return f"⚠️ 《{label}》类型不支持({r.doc_type or 'unknown'}): {r.message}"
-    return f"⚠️ 《{label}》拉取失败: {r.message}"
+        return f"⚠️ 文档类型不支持({r.doc_type or 'unknown'}),无法读取"
+    # error: 限流 / 网络 / KM 内部错 — 不暴露 retcode 给用户
+    return "⚠️ 文档拉取失败,请稍后重试"

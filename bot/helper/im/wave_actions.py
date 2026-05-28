@@ -201,6 +201,64 @@ def _is_inbox_trigger(text: str) -> bool:
     return t in {x.lower() for x in _INBOX_TRIGGERS}
 
 
+def _build_inline_context(fetched: list) -> list[dict] | None:
+    """把 km_ingest 拉到的文档(ok 的)拼成 ask 的 inline_context。
+
+    从 raw_inputs 取 content_text(_fetch_doc_text 已在 ingest 时存好)。
+    skipped 状态(已学过)也算进来,从 DB 重读正文。
+    """
+    if not fetched:
+        return None
+    out: list[dict] = []
+    with session() as s:
+        for r in fetched:
+            if r.status not in ("ok", "skipped") or not r.raw_id:
+                continue
+            raw = s.get(RawInput, r.raw_id)
+            if raw is None:
+                continue
+            body = (raw.content_text or "").strip()
+            if not body:
+                continue
+            out.append({
+                "title": r.title or "",
+                "body": body,
+                "source_url": r.url,
+            })
+    return out or None
+
+
+def _run_l1_and_count(raw_id: int) -> int:
+    """同步跑 process_raw,然后查 l1_items 统计该 raw 抽到几条原子。失败返 0。"""
+    from helper.ingest import process_raw
+    from helper.storage.models import L1Item
+    from sqlalchemy import select, func
+
+    try:
+        process_raw(raw_id)
+    except Exception:  # noqa: BLE001
+        log.exception("process_raw failed raw#%d", raw_id)
+        return 0
+    with session() as s:
+        return s.execute(
+            select(func.count()).select_from(L1Item).where(L1Item.raw_id == raw_id)
+        ).scalar_one() or 0
+
+
+def _format_judgment_ack(fetched: list, total_atoms: int) -> str:
+    """judgment 路径的 ack 文案。
+
+    - 有 KM 文档:用 km_ingest.format_results(显示《标题》)+ 末尾追加原子数
+    - 纯文本:简短"✓ 已记录(N 条原子)"
+    """
+    from helper.im import km_ingest as _km
+
+    if fetched:
+        head = _km.format_results(fetched)
+        return f"{head}\n(共抽出 {total_atoms} 条原子)"
+    return f"✓ 已记录({total_atoms} 条原子)"
+
+
 def _route_message_sync(
     *,
     raw_id: int,
@@ -218,7 +276,7 @@ def _route_message_sync(
     from helper.ask.runtime import render_for_wave
     from helper.im import km_ingest
     from helper.im.intent import classify
-    from helper.ingest import process_raw, schedule_l1
+    from helper.ingest import schedule_l1
 
     from helper.scheduler import (
         get_pending_confirm,
@@ -237,34 +295,9 @@ def _route_message_sync(
     else:
         receiver_id, receiver_id_type = sender_id, sender_id_type
 
-    # 优先级 -1: 消息里含 KM 链接 → 整篇文档拉成 raw + 跑 L1。
-    # @bot 分享 KM 文档当作"喂知识",不再走 intent 分类(避免被 ask 当成问题)。
-    km_urls = km_ingest.find_km_urls(text)
-    if km_urls:
-        try:
-            results = km_ingest.ingest_text(
-                text,
-                sender_domain=domain or sender_id,
-                chat_id=chat_id,
-                parent_message_id=wave_msg_id,
-            )
-        except Exception:  # noqa: BLE001
-            log.exception("km_ingest failed raw#%d urls=%s", raw_id, km_urls)
-            _reply_text(wave_msg_id, "⚠️ KM 文档拉取异常,稍后重试", request_id=f"km-err-{raw_id}")
-            return
-        # 成功拉到的 → 各自跑 L1(进 sink → 4 类候选)
-        for r in results:
-            if r.status == "ok" and r.raw_id:
-                schedule_l1(r.raw_id)
-        reply = km_ingest.format_results(results)
-        if reply:
-            _reply_text(wave_msg_id, reply, request_id=f"km-ack-{raw_id}")
-        return
-
-    # 优先级 0a: owner 私聊里的 inbox 回执(批准/驳回/跳过 1-N + 采纳/保留/都留 2-N + 答 3-N ...)
-    # 在 schedule_confirm 之前,避免「批准 1-3」被误绑到无关 confirm
+    # 优先级 0a: owner 私聊里的 inbox 触发 / 回执
     if domain and not chat_id:
-        # 「/inbox」/「inbox」/「周报」/「立刻给我看周报」等 — owner 主动触发当下 digest
+        # 「/inbox」/「周报」等固定命令 — owner 主动触发当下 digest
         if _is_inbox_trigger(text):
             from helper.config import get_settings
             from helper.inbox import build_digest, render_card, snapshot_digest
@@ -277,6 +310,7 @@ def _route_message_sync(
                 _reply_text(wave_msg_id, body, request_id=f"inbox-now-{raw_id}")
                 return
 
+        # 在 schedule_confirm 之前,避免「批准 1-3」被误绑到无关 confirm
         from helper.inbox import try_handle_reply
 
         inbox_reply = try_handle_reply(
@@ -296,13 +330,37 @@ def _route_message_sync(
             _reply_text(wave_msg_id, reply, request_id=f"sched-confirm-{raw_id}")
             return
 
-    try:
-        intent = classify(text)
-    except Exception as e:  # noqa: BLE001
-        log.warning("intent classify failed raw#%d: %s", raw_id, e)
-        intent = "judgment"
+    # 前置富化(不是路由):消息里含 KM URL → 拉文档作为这次会话的素材。
+    # 任何一篇 fetch 失败(no_permission / unsupported / error)→ 直接停,不走 intent。
+    # 全部 ok / skipped → 把素材作为 inline_context / l1 输入,继续走 intent 路由。
+    fetched: list[km_ingest.KMIngestResult] = []
+    km_urls = km_ingest.find_km_urls(text)
+    if km_urls:
+        try:
+            fetched = km_ingest.ingest_text(
+                text,
+                sender_domain=domain or sender_id,
+                chat_id=chat_id,
+                parent_message_id=wave_msg_id,
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("km_ingest failed raw#%d urls=%s", raw_id, km_urls)
+            _reply_text(wave_msg_id, "⚠️ 文档拉取异常,请稍后重试", request_id=f"km-err-{raw_id}")
+            return
+        failed = [
+            r for r in fetched if r.status in ("no_permission", "unsupported", "error")
+        ]
+        if failed:
+            _reply_text(
+                wave_msg_id,
+                km_ingest.format_results(failed),
+                request_id=f"km-fail-{raw_id}",
+            )
+            return
 
-    # 优先级 1: schedule_* 三类直接走 scheduler handler
+    intent = classify(text)
+
+    # schedule_* 三类直接走 scheduler handler
     if intent == "schedule_create":
         reply = handle_create(text, domain)
         _reply_text(wave_msg_id, reply, request_id=f"sched-create-{raw_id}")
@@ -317,12 +375,15 @@ def _route_message_sync(
         return
 
     if intent == "ask":
+        # 把 fetched 的 KM 文档塞进 inline_context,让 ask 用文档内容回答
+        inline_ctx = _build_inline_context(fetched)
         try:
             ans = ask(
                 text,
                 asker_domain=domain or sender_id,
                 chat_id=chat_id,
                 raw_id=raw_id,
+                inline_context=inline_ctx,
             )
         except Exception:  # noqa: BLE001
             log.exception("ask runtime failed raw#%d", raw_id)
@@ -353,20 +414,37 @@ def _route_message_sync(
                     s.commit()
         return
 
-    # judgment / other → L1 + ack
     if intent == "judgment":
-        process_raw(raw_id)
-    if receiver_id and receiver_id_type in ("user_id", "union_id", "chat_id"):
-        try:
-            wave_client.send_message(
-                receiver_id,
-                msg_type="text",
-                content={"text": "✓ 已记录"},
-                receiver_id_type=receiver_id_type,
-                send_type=1,
+        # 喂知识/分享决策。两条子路径:
+        #   - 有 KM 文档 → 对每篇 ok 的 raw_id 跑 process_raw,统计原子产出
+        #   - 纯文本 → 对当前 raw_id 跑 process_raw
+        # 根据 L1 实际产出决定 ack 文案,不无脑回"已记录"。
+        targets: list[int] = []
+        if fetched:
+            targets = [r.raw_id for r in fetched if r.status == "ok" and r.raw_id]
+        if not targets:
+            targets = [raw_id]
+        total = sum(_run_l1_and_count(rid) for rid in targets)
+        if total > 0:
+            _reply_text(
+                wave_msg_id,
+                _format_judgment_ack(fetched, total),
+                request_id=f"judg-ok-{raw_id}",
             )
-        except WaveAPIError as e:
-            log.warning("ack send failed raw#%d: %s", raw_id, e)
+        else:
+            _reply_text(
+                wave_msg_id,
+                "🤔 没看出能沉淀的内容,这条没入库",
+                request_id=f"judg-empty-{raw_id}",
+            )
+        return
+
+    # unknown 兜底:LLM 抽风、闲聊、不可分类
+    _reply_text(
+        wave_msg_id,
+        "🤔 没明白你的意图,可以换个说法",
+        request_id=f"unk-{raw_id}",
+    )
 
 
 def schedule_ask_reply(

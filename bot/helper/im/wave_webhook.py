@@ -36,6 +36,7 @@ from fastapi import APIRouter, Header, HTTPException, Request, Response
 
 from helper.config import get_settings
 from helper.im import feedback as fb
+from helper.im import reaction as rx
 from helper.im.wave_actions import schedule_ask_reply, schedule_post_message
 from helper.ingest import schedule_l1
 from helper.storage import raw_store, session
@@ -110,7 +111,9 @@ def _extract_message_text(payload: dict[str, Any]) -> str | None:
     text = inner.get("text") or inner.get("content")
     if isinstance(text, str) and text.strip():
         return text.strip()
-    # rich_text 类: 把所有段的 text 拼起来
+    # rich_text 类: 把所有段的 text / url 拼起来
+    # 注意: type=="url" 段必须取 content.url 拼进去,否则用户在消息里粘贴的 KM 链接、
+    # 外部链接会被整段丢掉,下游 km_ingest.find_km_urls 永远找不到 URL。
     tags = inner.get("tags")
     if isinstance(tags, list):
         chunks: list[str] = []
@@ -121,10 +124,16 @@ def _extract_message_text(payload: dict[str, Any]) -> str | None:
             if not isinstance(items, list):
                 continue
             for it in items:
-                if isinstance(it, dict) and it.get("type") == "text":
-                    c = it.get("content")
-                    if isinstance(c, dict) and isinstance(c.get("text"), str):
-                        chunks.append(c["text"])
+                if not isinstance(it, dict):
+                    continue
+                c = it.get("content")
+                if not isinstance(c, dict):
+                    continue
+                t = it.get("type")
+                if t == "text" and isinstance(c.get("text"), str):
+                    chunks.append(c["text"])
+                elif t == "url" and isinstance(c.get("url"), str):
+                    chunks.append(c["url"])
             chunks.append("\n")
         joined = "".join(chunks).strip()
         if joined:
@@ -282,6 +291,9 @@ async def wave_callback(
 
     event_type = header.get("event_type", "") if isinstance(header, dict) else ""
 
+    # 6) 显式事件白名单分发。**未列入白名单的事件一律 drop,不落 raw_inputs**,
+    #    避免 reaction / bot.entered / chat.members.* / auth.* / docs.* 等非消息事件
+    #    被当成对话语料污染知识管线。
     if fb.is_feedback_event(event_type):
         try:
             fb.handle(payload)
@@ -289,7 +301,19 @@ async def wave_callback(
             log.exception("feedback handle failed event_id=%s", event_id)
         return Response(content="", media_type="application/json")
 
-    # 6) 落 raw_inputs
+    if rx.is_reaction_event(event_type):
+        try:
+            rx.handle(event_type, payload)
+        except Exception:  # noqa: BLE001
+            log.exception("reaction handle failed event_id=%s", event_id)
+        return Response(content="", media_type="application/json")
+
+    # 只有真正的"接收消息"事件继续走落 raw + LLM 路径
+    if event_type not in {"im.msg.direct.sent_v2", "im.msg.group.sent_v2"}:
+        log.info("wave webhook: drop non-message event type=%s event_id=%s", event_type, event_id)
+        return Response(content="", media_type="application/json")
+
+    # 7) 落 raw_inputs
     #    - content_text: 优先抽消息纯文本(L1 直接消费);抽不到退化到完整明文 JSON
     #    - attachments_json: 永远存完整 envelope,留作审计 / 后续重抽
     #    - author_domain: 先落 sender_id 占位,后台 schedule_post_message 反查到域账号再回填
