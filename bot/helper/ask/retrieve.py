@@ -63,64 +63,147 @@ def _jaccard_score(query_toks: set[str], doc_text: str) -> float:
     return len(overlap) / max(len(query_toks), 1)
 
 
-# ---------- superseded raw 过滤 ----------
+# ---------- superseded raw 过滤(差集策略) ----------
+
+# 5 张候选表 + 各自的 raw_refs 字段名(SpecCandidate 历史叫 cluster_raw_ids_json)
+_CANDIDATE_TABLES: list[tuple[type, str]] = [
+    (SpecCandidate, "cluster_raw_ids_json"),
+    (FactCandidate, "raw_refs_json"),
+    (CaseCandidate, "raw_refs_json"),
+    (EntityCandidate, "raw_refs_json"),
+    (RelationCandidate, "raw_refs_json"),
+]
+
+
+def _parse_raw_refs(j: str | None) -> set[int]:
+    """raw_refs_json 兼容三种格式:[[raw_id, idx], ...] / [raw_id, ...] / ["raw_id", ...]。
+    解析失败返空集。"""
+    try:
+        refs = _json_top.loads(j or "[]")
+    except _json_top.JSONDecodeError:
+        return set()
+    out: set[int] = set()
+    for r in refs:
+        if isinstance(r, list) and r and isinstance(r[0], int):
+            out.add(r[0])
+        elif isinstance(r, int):
+            out.add(r)
+        elif isinstance(r, str) and r.isdigit():
+            out.add(int(r))
+    return out
 
 
 def _superseded_raw_ids() -> set[int]:
-    """扫 5 张候选表,凡是 superseded_at 非空的候选,把它支撑的 raw_id 全部收上来。
-    这些 raw 在 retrieve 阶段从 raw 命中里剔除 — 否则旧值会跟新值一起被 ask 看到。
+    """返回"应该被 retrieve 过滤掉的 raw_id"集合。
 
-    注意:同一条 raw 可能同时支撑多个候选(decision + fact 等),只要其中一个被
-    superseded,这条 raw 在该 fact 上下文里就不应再被 ask 引用 — 简化处理:整条 raw
-    踢出 retrieve raw 召回。代价是少量误伤(decision 那部分也读不到了),
-    但 demo 阶段够用,且 spec/fact 候选 bundle 里通常已有正确版。
+    策略:差集 = (任一已 superseded 候选支撑的 raw) − (任一仍 alive 候选支撑的 raw)。
+    一条 raw 只要还撑着任何一个未 superseded 候选(decision/fact/concept 等),
+    它在 retrieve 里仍可被召回 — 只过滤"仅被 superseded 候选独占引用"的 raw。
+
+    这样消除以下误伤:同一条 raw 抽出 decision + fact,其中 fact 后来被 supersede,
+    decision 仍然有效 → raw 应保留。
     """
-    # SpecCandidate 用 cluster_raw_ids_json,其它 4 张是 raw_refs_json
-    targets = [
-        (SpecCandidate, "cluster_raw_ids_json"),
-        (FactCandidate, "raw_refs_json"),
-        (CaseCandidate, "raw_refs_json"),
-        (EntityCandidate, "raw_refs_json"),
-        (RelationCandidate, "raw_refs_json"),
-    ]
-    out: set[int] = set()
+    superseded: set[int] = set()
+    alive: set[int] = set()
     with session() as s:
-        for cls, field_name in targets:
+        for cls, field_name in _CANDIDATE_TABLES:
             col = getattr(cls, field_name)
-            rows = s.execute(
+            sup_rows = s.execute(
                 select(col).where(cls.superseded_at.is_not(None))
             ).scalars().all()
-            for j in rows:
-                try:
-                    refs = _json_top.loads(j or "[]")
-                except _json_top.JSONDecodeError:
-                    continue
-                for r in refs:
-                    if isinstance(r, list) and r and isinstance(r[0], int):
-                        out.add(r[0])
-                    elif isinstance(r, int):
-                        out.add(r)
-                    elif isinstance(r, str) and r.isdigit():
-                        out.add(int(r))
+            for j in sup_rows:
+                superseded |= _parse_raw_refs(j)
+            alive_rows = s.execute(
+                select(col).where(cls.superseded_at.is_(None))
+            ).scalars().all()
+            for j in alive_rows:
+                alive |= _parse_raw_refs(j)
+    return superseded - alive
+
+
+# ---------- 候选表直接召回(未晋升的也能被 ask 用) ----------
+
+
+def _candidate_pass(qtoks: set[str]) -> list[Hit]:
+    """直接从 fact_candidates / case_candidates / relation_candidates 召回。
+
+    问题:bundle 只编译已晋升 (mention_count >= MIN_MENTION_TO_PROMOTE) 的候选,
+    早期 / dogfood 阶段几乎所有 fact 都是 mention=1 进不了 bundle,ask 看不到。
+    所以平行从候选表召回,过滤 superseded_at IS NOT NULL,与 bundle 路径用
+    (type, slug) 去重。
+    """
+    out: list[Hit] = []
+    with session() as s:
+        # fact
+        for fc in s.execute(
+            select(FactCandidate).where(FactCandidate.superseded_at.is_(None))
+        ).scalars():
+            text = " ".join([fc.subject, fc.predicate, fc.object, fc.scope or "", fc.statement or ""])
+            sc = _jaccard_score(qtoks, text)
+            if sc > 0:
+                out.append(Hit(
+                    type="fact",
+                    ref=fc.slug,
+                    title=f"{fc.subject} {fc.predicate} {fc.object}".strip(),
+                    body=fc.statement or "",
+                    score=sc,
+                    sources=["jaccard"],
+                ))
+        # case
+        for cc in s.execute(
+            select(CaseCandidate).where(CaseCandidate.superseded_at.is_(None))
+        ).scalars():
+            text = " ".join([cc.title or "", cc.scene or "", cc.what_happened or "", cc.outcome or ""])
+            sc = _jaccard_score(qtoks, text)
+            if sc > 0:
+                out.append(Hit(
+                    type="case",
+                    ref=cc.slug,
+                    title=cc.title or cc.slug,
+                    body=(cc.what_happened or "") + " | " + (cc.outcome or ""),
+                    score=sc,
+                    sources=["jaccard"],
+                ))
+        # relation
+        for rc in s.execute(
+            select(RelationCandidate).where(RelationCandidate.superseded_at.is_(None))
+        ).scalars():
+            text = " ".join([rc.entity_a, rc.relation, rc.entity_b, rc.description or ""])
+            sc = _jaccard_score(qtoks, text)
+            if sc > 0:
+                out.append(Hit(
+                    type="relation",
+                    ref=rc.slug,
+                    title=f"{rc.entity_a} —[{rc.relation}]→ {rc.entity_b}",
+                    body=rc.description or "",
+                    score=sc,
+                    sources=["jaccard"],
+                ))
     return out
 
 
 # ---------- Jaccard 路径 ----------
 
 def _jaccard_pass(question: str, qtoks: set[str], skip_raw_ids: set[int]) -> list[Hit]:
-    """从 bundle 找 spec/entity/fact/case 命中,从 l1_items + raw 找 raw 命中。"""
+    """从 bundle 找 spec/entity/fact/case 命中,从 l1_items + raw 找 raw 命中。
+    再从候选表(未晋升)直接捞 fact/case/relation,保证早期没晋升的也能召回。
+    bundle 与候选表同 (type, slug) 时去重(bundle 优先 — 已 review 过)。
+    """
     import json as _json
 
     bundle = load_bundle()
     hits: list[Hit] = []
+    seen_keys: set[tuple[str, str]] = set()
 
     for spec in bundle.get("specs", []):
         text = " ".join([str(spec.get("title", "")), str(spec.get("_body", ""))])
         sc = _jaccard_score(qtoks, text)
         if sc > 0:
+            ref = str(spec.get("slug", ""))
+            seen_keys.add(("spec", ref))
             hits.append(Hit(
                 type="spec",
-                ref=str(spec.get("slug", "")),
+                ref=ref,
                 title=str(spec.get("title", "")),
                 body=str(spec.get("_body", ""))[:1000],
                 score=sc,
@@ -131,9 +214,11 @@ def _jaccard_pass(question: str, qtoks: set[str], skip_raw_ids: set[int]) -> lis
         text = " ".join([str(ent.get("name", "")), str(ent.get("_body", ""))])
         sc = _jaccard_score(qtoks, text)
         if sc > 0:
+            ref = str(ent.get("slug", ""))
+            seen_keys.add(("entity", ref))
             hits.append(Hit(
                 type="entity",
-                ref=str(ent.get("slug", "")),
+                ref=ref,
                 title=str(ent.get("name", "")),
                 body=str(ent.get("_body", ""))[:600],
                 score=sc,
@@ -144,9 +229,11 @@ def _jaccard_pass(question: str, qtoks: set[str], skip_raw_ids: set[int]) -> lis
         text = " ".join([str(fact.get("subject", "")), str(fact.get("_body", ""))])
         sc = _jaccard_score(qtoks, text)
         if sc > 0:
+            ref = str(fact.get("slug", ""))
+            seen_keys.add(("fact", ref))
             hits.append(Hit(
                 type="fact",
-                ref=str(fact.get("slug", "")),
+                ref=ref,
                 title=str(fact.get("subject", "")) or str(fact.get("slug", "")),
                 body=str(fact.get("_body", ""))[:600],
                 score=sc,
@@ -157,14 +244,23 @@ def _jaccard_pass(question: str, qtoks: set[str], skip_raw_ids: set[int]) -> lis
         text = " ".join([str(case.get("title", "")), str(case.get("_body", ""))])
         sc = _jaccard_score(qtoks, text)
         if sc > 0:
+            ref = str(case.get("slug", ""))
+            seen_keys.add(("case", ref))
             hits.append(Hit(
                 type="case",
-                ref=str(case.get("slug", "")),
+                ref=ref,
                 title=str(case.get("title", "")) or str(case.get("slug", "")),
                 body=str(case.get("_body", ""))[:600],
                 score=sc,
                 sources=["jaccard"],
             ))
+
+    # 候选表直接召回(覆盖未晋升的 fact/case/relation)
+    for h in _candidate_pass(qtoks):
+        if (h.type, h.ref) in seen_keys:
+            continue
+        seen_keys.add((h.type, h.ref))
+        hits.append(h)
 
     # raw 命中: content_text + 它的所有 L1Item payload 拼成检索文本
     with session() as s:
