@@ -77,12 +77,12 @@ def test_format_context_block_renders_user_and_bot(db):
 
 
 def test_format_context_block_window_excludes_old_messages(db):
-    """超过 60 分钟的消息不进窗口。"""
+    """超过窗口(默认 1 天)的消息不进上下文。"""
     from helper.storage import raw_store, session
 
     with session() as s:
         _make_msg(s, source_type="im_wave_msg",
-                  content_text="昨天的话", author_domain="alice", offset_minutes=24 * 60)
+                  content_text="三天前的话", author_domain="alice", offset_minutes=3 * 24 * 60)
         _make_msg(s, source_type="im_wave_msg",
                   content_text="刚才的话", author_domain="alice", offset_minutes=5)
         s.commit()
@@ -91,7 +91,7 @@ def test_format_context_block_window_excludes_old_messages(db):
         block = raw_store.format_context_block(s, chat_id="", fallback_author="alice")
 
     assert "刚才的话" in block
-    assert "昨天的话" not in block
+    assert "三天前的话" not in block
 
 
 def test_format_context_block_excludes_current_raw(db):

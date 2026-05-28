@@ -9,9 +9,9 @@ from sqlalchemy.orm import Session
 from helper.storage.models import RawInput
 
 # 上下文窗口默认值 — intent classify / ask runtime / 后续需要"短期记忆"
-# 的地方共用。8 条 / 1 小时,够覆盖一两轮承接,不让 prompt 膨胀。
-CONTEXT_DEFAULT_LIMIT = 8
-CONTEXT_DEFAULT_MINUTES = 60
+# 的地方共用。16 条 / 1 天,覆盖跨日承接但不让 prompt 失控。
+CONTEXT_DEFAULT_LIMIT = 16
+CONTEXT_DEFAULT_MINUTES = 24 * 60
 
 
 def append(
