@@ -75,14 +75,20 @@ def _superseded_raw_ids() -> set[int]:
     踢出 retrieve raw 召回。代价是少量误伤(decision 那部分也读不到了),
     但 demo 阶段够用,且 spec/fact 候选 bundle 里通常已有正确版。
     """
+    # SpecCandidate 用 cluster_raw_ids_json,其它 4 张是 raw_refs_json
+    targets = [
+        (SpecCandidate, "cluster_raw_ids_json"),
+        (FactCandidate, "raw_refs_json"),
+        (CaseCandidate, "raw_refs_json"),
+        (EntityCandidate, "raw_refs_json"),
+        (RelationCandidate, "raw_refs_json"),
+    ]
     out: set[int] = set()
     with session() as s:
-        for cls in (
-            SpecCandidate, FactCandidate, CaseCandidate,
-            EntityCandidate, RelationCandidate,
-        ):
+        for cls, field_name in targets:
+            col = getattr(cls, field_name)
             rows = s.execute(
-                select(cls.raw_refs_json).where(cls.superseded_at.is_not(None))
+                select(col).where(cls.superseded_at.is_not(None))
             ).scalars().all()
             for j in rows:
                 try:
