@@ -179,12 +179,26 @@ def ask(
 
 
 def render_for_wave(ans: Answer) -> str:
-    """把 Answer 渲染成给 IM 用户看的纯文本(带置信度 + 引用)。"""
+    """把 Answer 渲染成给 IM 用户看的纯文本。
+
+    - high 置信度:只展示答复正文,不附加引用(引用对用户是噪音)
+    - 非 high:展示答复 + 一句"参考了 N 条 spec/事实/历史判断"(只露聚合,不露 ID)
+    """
     parts = [ans.answer]
     if ans.confidence != "high":
-        parts.append(f"\n(置信度: {ans.confidence})")
-    if ans.citations:
-        parts.append("\n引用:")
+        type_count: dict[str, int] = {}
         for c in ans.citations:
-            parts.append(f"  - {c['type']}#{c['ref']}")
+            t = c.get("type", "")
+            type_count[t] = type_count.get(t, 0) + 1
+        if type_count:
+            label_map = {
+                "spec": "规约", "entity": "概念", "fact": "事实",
+                "case": "案例", "raw": "历史判断",
+            }
+            tag = "、".join(
+                f"{n} 条{label_map.get(t, t)}" for t, n in type_count.items()
+            )
+            parts.append(f"\n(置信度: {ans.confidence};参考: {tag})")
+        else:
+            parts.append(f"\n(置信度: {ans.confidence})")
     return "\n".join(parts)

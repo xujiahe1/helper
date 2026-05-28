@@ -123,7 +123,7 @@ def test_resolve_marks_log(db, settings, make_raw):
 
     rid = make_raw("x")
     with session() as s:
-        c = ConflictLog(raw_id=rid, spec_slug="spec-a", summary="s", severity="medium")
+        c = ConflictLog(raw_id=rid, target_slug="spec-a", summary="s", severity="medium")
         s.add(c)
         s.flush()
         log_id = c.id

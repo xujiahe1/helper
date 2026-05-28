@@ -247,11 +247,11 @@ def _detect_fact(raw_id: int, items: list[L1Item]) -> list[ConflictHit]:
                 # 跳过自身(本次刚 upsert 的同陈述)
                 if fc.object == obj and (fc.scope or "") == scope:
                     continue
+                scope_suffix_new = f"(适用 {scope})" if scope else ""
+                scope_suffix_old = f"(适用 {fc.scope})" if fc.scope else ""
                 summary = (
-                    f"新陈述 {subject} {predicate} 「{obj}」"
-                    f"(scope={scope or '-'}) "
-                    f"vs 既有 {subject} {predicate} 「{fc.object}」"
-                    f"(scope={fc.scope or '-'})"
+                    f"{subject} {predicate}: 新「{obj}」{scope_suffix_new}"
+                    f" 与既有「{fc.object}」{scope_suffix_old}不一致"
                 )
                 hit = _record_conflict(
                     raw_id,
@@ -299,8 +299,8 @@ def _detect_case(raw_id: int, items: list[L1Item]) -> list[ConflictHit]:
                 if not _scenes_similar(cc.scene, scene):
                     continue
                 summary = (
-                    f"同场景 case 出现新结果: 既有「{(cc.outcome or '')[:80]}」"
-                    f" → 新「{outcome[:80]}」"
+                    f"同场景出现新结果: 新「{outcome[:80]}」"
+                    f" 与既有「{(cc.outcome or '')[:80]}」不一致"
                 )
                 hit = _record_conflict(
                     raw_id,
@@ -354,8 +354,8 @@ def _detect_relation(raw_id: int, items: list[L1Item]) -> list[ConflictHit]:
                 if rc.relation == rel:
                     continue
                 summary = (
-                    f"实体关系新表述: 既有 {a} —[{rc.relation}]→ {b}"
-                    f" 与新 {a} —[{rel}]→ {b} 不一致"
+                    f"{a} 与 {b} 的关系: 新「{rel}」"
+                    f" 与既有「{rc.relation}」不一致"
                 )
                 hit = _record_conflict(
                     raw_id,

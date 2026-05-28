@@ -14,11 +14,22 @@ import logging
 import re
 from dataclasses import dataclass, field
 
+import json as _json_top
+
 from sqlalchemy import select
 
 from helper.compiler import load_bundle
 from helper.storage import session, vector
-from helper.storage.models import L1Item, L1Result, RawInput
+from helper.storage.models import (
+    CaseCandidate,
+    EntityCandidate,
+    FactCandidate,
+    L1Item,
+    L1Result,
+    RawInput,
+    RelationCandidate,
+    SpecCandidate,
+)
 
 log = logging.getLogger(__name__)
 
@@ -52,9 +63,45 @@ def _jaccard_score(query_toks: set[str], doc_text: str) -> float:
     return len(overlap) / max(len(query_toks), 1)
 
 
+# ---------- superseded raw 过滤 ----------
+
+
+def _superseded_raw_ids() -> set[int]:
+    """扫 5 张候选表,凡是 superseded_at 非空的候选,把它支撑的 raw_id 全部收上来。
+    这些 raw 在 retrieve 阶段从 raw 命中里剔除 — 否则旧值会跟新值一起被 ask 看到。
+
+    注意:同一条 raw 可能同时支撑多个候选(decision + fact 等),只要其中一个被
+    superseded,这条 raw 在该 fact 上下文里就不应再被 ask 引用 — 简化处理:整条 raw
+    踢出 retrieve raw 召回。代价是少量误伤(decision 那部分也读不到了),
+    但 demo 阶段够用,且 spec/fact 候选 bundle 里通常已有正确版。
+    """
+    out: set[int] = set()
+    with session() as s:
+        for cls in (
+            SpecCandidate, FactCandidate, CaseCandidate,
+            EntityCandidate, RelationCandidate,
+        ):
+            rows = s.execute(
+                select(cls.raw_refs_json).where(cls.superseded_at.is_not(None))
+            ).scalars().all()
+            for j in rows:
+                try:
+                    refs = _json_top.loads(j or "[]")
+                except _json_top.JSONDecodeError:
+                    continue
+                for r in refs:
+                    if isinstance(r, list) and r and isinstance(r[0], int):
+                        out.add(r[0])
+                    elif isinstance(r, int):
+                        out.add(r)
+                    elif isinstance(r, str) and r.isdigit():
+                        out.add(int(r))
+    return out
+
+
 # ---------- Jaccard 路径 ----------
 
-def _jaccard_pass(question: str, qtoks: set[str]) -> list[Hit]:
+def _jaccard_pass(question: str, qtoks: set[str], skip_raw_ids: set[int]) -> list[Hit]:
     """从 bundle 找 spec/entity/fact/case 命中,从 l1_items + raw 找 raw 命中。"""
     import json as _json
 
@@ -119,6 +166,7 @@ def _jaccard_pass(question: str, qtoks: set[str]) -> list[Hit]:
             r for r in s.execute(
                 select(L1Result.raw_id).where(L1Result.error == "")
             ).scalars().all()
+            if r not in skip_raw_ids
         ]
         if ok_raw_ids:
             items_by_raw: dict[int, list[str]] = {}
@@ -218,14 +266,22 @@ def _hydrate_vector_hits(vec_hits: list[vector.VectorHit]) -> list[Hit]:
     return out
 
 
-def _vector_pass(question: str) -> list[Hit]:
+def _vector_pass(question: str, skip_raw_ids: set[int]) -> list[Hit]:
     try:
         with session() as s:
             vec_hits = vector.search(s, query=question, top_k=VECTOR_TOP_K)
     except Exception as e:  # noqa: BLE001
         log.warning("vector_pass failed err=%s", e)
         return []
-    return _hydrate_vector_hits(vec_hits)
+    hydrated = _hydrate_vector_hits(vec_hits)
+    if not skip_raw_ids:
+        return hydrated
+    out = []
+    for h in hydrated:
+        if h.type == "raw" and h.ref.isdigit() and int(h.ref) in skip_raw_ids:
+            continue
+        out.append(h)
+    return out
 
 
 # ---------- RRF 融合 ----------
@@ -285,8 +341,9 @@ def retrieve_relevant(question: str, *, top_k: int = 8) -> list[Hit]:
     if not qtoks:
         return []
 
-    jac = _jaccard_pass(question, qtoks)
-    vec = _vector_pass(question)
+    skip = _superseded_raw_ids()
+    jac = _jaccard_pass(question, qtoks, skip)
+    vec = _vector_pass(question, skip)
 
     if not vec:
         # 向量没出活:走纯 Jaccard 旧逻辑(spec 权重 * 1.5, raw 权重 * 0.6)

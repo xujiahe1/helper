@@ -34,9 +34,20 @@ import logging
 import re
 from dataclasses import dataclass, field
 
+from sqlalchemy import select
+
 from helper.config import get_settings
 from helper.storage import session
-from helper.storage.models import ConflictLog, InboxDigest, InquiryLog, SpecCandidate
+from helper.storage.models import (
+    CaseCandidate,
+    ConflictLog,
+    EntityCandidate,
+    FactCandidate,
+    InboxDigest,
+    InquiryLog,
+    RelationCandidate,
+    SpecCandidate,
+)
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +73,38 @@ _LEGACY_ANSWER_BARE_RE = re.compile(r"^\s*#(\d+)[\s,，:]+(.+)$", re.DOTALL)
 
 
 # ---------- helpers ----------
+
+
+def _humanize_target(s, target_type: str, slug: str) -> str:
+    """把 target_type+slug 转成给用户看的人话标签。失败回落 slug。"""
+    type_label = {
+        "spec": "规约", "fact": "事实", "case": "案例",
+        "concept": "概念", "relation": "关系",
+    }.get(target_type, target_type)
+    try:
+        if target_type == "fact":
+            row = s.execute(select(FactCandidate).where(FactCandidate.slug == slug)).scalar_one_or_none()
+            if row is not None:
+                return f"{type_label} · {row.subject} {row.predicate} {row.object}".strip()
+        elif target_type == "spec":
+            row = s.execute(select(SpecCandidate).where(SpecCandidate.slug == slug)).scalar_one_or_none()
+            if row is not None:
+                return f"{type_label} · {row.title}"
+        elif target_type == "case":
+            row = s.execute(select(CaseCandidate).where(CaseCandidate.slug == slug)).scalar_one_or_none()
+            if row is not None:
+                return f"{type_label} · {row.title}"
+        elif target_type == "relation":
+            row = s.execute(select(RelationCandidate).where(RelationCandidate.slug == slug)).scalar_one_or_none()
+            if row is not None:
+                return f"{type_label} · {row.entity_a} —[{row.relation}]→ {row.entity_b}"
+        elif target_type == "concept":
+            row = s.execute(select(EntityCandidate).where(EntityCandidate.slug == slug)).scalar_one_or_none()
+            if row is not None:
+                return f"{type_label} · {row.name}"
+    except Exception:  # noqa: BLE001
+        pass
+    return f"{type_label}"
 
 
 def _is_owner(domain: str) -> bool:
@@ -152,7 +195,7 @@ def _handle_conflict_action(action: str, log_id: int, sender_domain: str) -> Rep
             return ReplyResult(text=f"找不到冲突 conflict#{log_id}")
         if row.resolution != "open":
             return ReplyResult(text=f"该冲突已裁决({row.resolution}),无需再处理。")
-        target_label = f"{row.target_type or 'spec'}/{row.target_slug}"
+        target_label = _humanize_target(s, row.target_type or "spec", row.target_slug)
 
     try:
         from helper.conflict import resolve as do_resolve

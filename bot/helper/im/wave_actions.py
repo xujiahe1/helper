@@ -115,7 +115,7 @@ def send_ack(receiver_id: str, receiver_id_type: str, raw_id: int) -> None:
         wave_client.send_message(
             receiver_id,
             msg_type="text",
-            content={"text": f"✓ 已记录 (#{raw_id})"},
+            content={"text": "✓ 已记录"},
             receiver_id_type=receiver_id_type,
             send_type=1,
         )
@@ -361,7 +361,7 @@ def _route_message_sync(
             wave_client.send_message(
                 receiver_id,
                 msg_type="text",
-                content={"text": f"✓ 已记录 (#{raw_id})"},
+                content={"text": "✓ 已记录"},
                 receiver_id_type=receiver_id_type,
                 send_type=1,
             )

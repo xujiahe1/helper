@@ -54,8 +54,8 @@ def test_render_card_shows_reply_hint(db, settings, make_raw):
     rid = make_raw("x")
     _make_inquiry(rid, "为什么这么定?")
     body = render_card(build_digest())
-    assert "答 #" in body
-    assert "回「" in body or "回 「" in body or "「答" in body
+    assert "3-1" in body
+    assert "答 3-N" in body
 
 
 def test_render_card_empty_inbox(db, settings):

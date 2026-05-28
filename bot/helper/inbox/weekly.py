@@ -121,36 +121,33 @@ def render_card(d: WeeklyDigest) -> str:
     lines = [
         f"📋 Helper 周报 ({d.week_start:%m-%d} ~ {d.week_end:%m-%d})",
         "",
-        f"本周新增 {d.raw_count} 条判断 / L1 成功 {d.l1_ok} 失败 {d.l1_err}",
-        f"Entity: 候选 {d.entity_total} 已晋升 {d.entity_promoted}",
+        f"本周新增 {d.raw_count} 条判断",
         "",
     ]
     if d.pending_specs:
         lines.append(f"📝 1. 待沉淀规约 ({len(d.pending_specs)}) — 回「批准 1-N」/「驳回 1-N」")
-        for n, (_sid, slug, title) in enumerate(d.pending_specs, start=1):
-            lines.append(f"  1-{n}  {title}  〔{slug}〕")
+        for n, (_sid, _slug, title) in enumerate(d.pending_specs, start=1):
+            lines.append(f"  1-{n}  {title}")
         lines.append("")
     if d.open_conflicts:
         lines.append(
             f"⚠️ 2. 待修正冲突 ({len(d.open_conflicts)}) — "
             "回「采纳 2-N」用新覆盖旧 / 「保留 2-N」否决新 / 「都留 2-N」并存"
         )
-        for n, (_cid, ttype, slug, sev, summary) in enumerate(d.open_conflicts, start=1):
+        for n, (_cid, ttype, _slug, _sev, summary) in enumerate(d.open_conflicts, start=1):
             type_label = {
                 "spec": "规约", "fact": "事实", "case": "案例",
                 "concept": "概念", "relation": "关系",
             }.get(ttype, ttype)
-            lines.append(f"  2-{n}  [{type_label}/{slug}] ({sev})")
-            if summary:
-                lines.append(f"        {summary}")
+            lines.append(f"  2-{n}  [{type_label}] {summary}")
         lines.append("")
     if d.unanswered_inquiries:
         lines.append(f"❓ 3. 待回答的追问 ({len(d.unanswered_inquiries)}) — 回「答 3-N 你的答案」")
-        for n, (_qid, rid, q) in enumerate(d.unanswered_inquiries, start=1):
+        for n, (_qid, _rid, q) in enumerate(d.unanswered_inquiries, start=1):
             qline = q.replace("\n", " ").strip()
             if len(qline) > 80:
                 qline = qline[:78] + "…"
-            lines.append(f"  3-{n}  {qline}  〔raw#{rid}〕")
+            lines.append(f"  3-{n}  {qline}")
         lines.append("")
     if not (d.pending_specs or d.open_conflicts or d.unanswered_inquiries):
         lines.append("✓ 本周 inbox 清空")
