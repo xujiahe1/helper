@@ -457,7 +457,12 @@ def _route_message_sync(
         if intent == "judgment":
             targets: list[int] = []
             if fetched:
-                targets = [r.raw_id for r in fetched if r.status == "ok" and r.raw_id]
+                # ok = 这次新拉到的;skipped = 同一篇之前已经入库(raw_id 指向旧的 km_doc)。
+                # 两种都能作为 L1 抽取的对象 — 文档已经在 raw_inputs 里。
+                targets = [
+                    r.raw_id for r in fetched
+                    if r.status in ("ok", "skipped") and r.raw_id
+                ]
             if not targets:
                 targets = [raw_id]
             total = sum(_run_l1_and_count(rid) for rid in targets)
