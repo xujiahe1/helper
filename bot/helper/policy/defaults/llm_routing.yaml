@@ -21,7 +21,7 @@ tasks:
 
   # ── 次路径(Sonnet): 结构化 / 分类 / 同义 judge ──
   intent_classify: { model: claude-sonnet-4-6, provider: anthropic }
-  l1_structure:    { model: claude-sonnet-4-6, provider: anthropic }
+  l1_structure:    { model: claude-sonnet-4-6, provider: anthropic, max_tokens: 16384 }
   synonym_judge:   { model: claude-sonnet-4-6, provider: anthropic }
   schedule_parse:  { model: claude-sonnet-4-6, provider: anthropic }
 

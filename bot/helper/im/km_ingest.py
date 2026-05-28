@@ -22,6 +22,7 @@ from sqlalchemy import and_
 
 from helper.im import km_client
 from helper.im.km_client import KMAPIError
+from helper.im.prosemirror import looks_like_prosemirror, render_prosemirror
 from helper.storage import session
 from helper.storage.models import RawInput
 from helper.storage.raw_store import append as raw_append
@@ -142,6 +143,14 @@ def _fetch_doc_text(enc_id: str, sheet_id: str | None) -> tuple[str, str, str, s
 
     if doc_type in {"document", "markdown"}:
         body = (info.get("content") or "").strip()
+        # 协同文档(document)正文是 ProseMirror JSON tree,需要渲染成纯文本
+        # 才能让 L1 LLM 读懂。markdown 类型直接当文本用。
+        # 探测: 字符串以 {"type":"doc" 开头 → 走渲染;失败回退原文(不阻塞链路)。
+        if looks_like_prosemirror(body):
+            try:
+                body = render_prosemirror(body)
+            except ValueError as e:
+                log.warning("prosemirror render failed enc_id=%s: %s", enc_id, e)
         text = f"# {title}\n\n{body}" if title else body
         return "ok", doc_type, title, text
 

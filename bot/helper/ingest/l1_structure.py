@@ -81,10 +81,14 @@ B) 群聊 @bot 触发,带"## 上下文" + "## 主消息" 两块:
 
 硬性要求:
 - 只抽文本里直接出现 / 直接可推导的内容,不编造。
-- 抽多少条由文本含量决定:0 / 1 / 几十都可,不要用类型预设条数。
+- **宁可多抽不要漏抽** — 文档/对话里出现的每个独立概念、关系、事实、案例、决策,
+  都单独成一条原子,不要为了简洁合并相似条目。一篇 8K 字文档抽 30+ 条原子是常态,
+  不是异常。如果你犹豫"这条是不是不重要",倾向于抽出来。
+- 抽多少条由文本含量决定:0 / 1 / 几十甚至上百都可,不要用类型预设条数。
 - 群聊场景下,**主消息是决策核心**,如果上下文里也有独立的判断/事实/反例(不是为
   主消息服务的素材),也分别抽出来 — 一次抽完所有原子。
-- 同一原子重复提及只抽一次。
+- 同一原子重复提及只抽一次,但**字面相似但语义不同**(如同一术语在不同章节有不同
+  侧重)要分别抽。
 - 群聊 decision 的 source_raw_ids 要把"被引用作 signal/rationale 的上下文 raw_id"
   也列出来,不能只填主消息。
 - 直接输出 JSON 数组,不要解释、不要代码块。空 → []。"""
@@ -136,37 +140,93 @@ def _build_user_prompt(
     )
 
 
-def structure(
-    raw_text: str,
-    *,
-    context: list[dict] | None = None,
-    primary_raw_id: int | None = None,
-    primary_speaker: str = "",
-) -> L1Output:
-    """L1 入口。LLM/解析失败时返回 error 字段非空,不抛。
+# 长文档按 H2 章节切片的字符阈值。Sonnet 4.6 单次 output 上限 64K tokens(中文
+# ~1.5 字符/token),广抽取 ~5x 包装系数,12K 字符可能产 ~5K tokens 输出 — 留足
+# 16K max_tokens 余量。超过这个阈值就切,避免单次输出被截。
+LONG_DOC_THRESHOLD = 12000
 
-    群聊 @bot 路径传 context = [{raw_id, speaker, text, ts}, ...] 把上下文窗口
-    一并喂给 LLM,让它从上下文补齐主消息缺失的 scene/signals/rationale。
+
+def _chunk_by_h2(text: str) -> list[str]:
+    """按 ^## 行边界切 — 每块自带一个 H2 标题。
+
+    切片前缀:H1(如果有)+ 当前 H2 段落。这样 LLM 看每个 chunk 时仍知道这是哪
+    篇文档的哪一章。
+    没 H2 → 按字符数硬切(尽量在段落边界),保证每块 ≤ LONG_DOC_THRESHOLD。
     """
-    if not (raw_text or "").strip():
-        return L1Output(raw_text=raw_text)
-    user_prompt = _build_user_prompt(
-        raw_text,
-        context=context,
-        primary_raw_id=primary_raw_id,
-        primary_speaker=primary_speaker,
-    )
+    lines = text.split("\n")
+    h1 = ""
+    for ln in lines:
+        if ln.startswith("# ") and not ln.startswith("## "):
+            h1 = ln.strip()
+            break
+
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    has_h2 = False
+    for ln in lines:
+        if ln.startswith("## "):
+            has_h2 = True
+            if current:
+                chunks.append(current)
+            current = [ln]
+        else:
+            current.append(ln)
+    if current:
+        chunks.append(current)
+
+    if not has_h2:
+        return _chunk_by_size(text, LONG_DOC_THRESHOLD)
+
+    out: list[str] = []
+    for ch in chunks:
+        body = "\n".join(ch).strip()
+        if not body:
+            continue
+        # 第一个 chunk 经常只是 H1 + 空行(没有实际段落),跳过
+        if body == h1 or (h1 and body.replace(h1, "").strip() == ""):
+            continue
+        prefix = (h1 + "\n\n") if (h1 and not body.startswith(h1)) else ""
+        full = prefix + body
+        # 单个 H2 段也可能超阈值 — 再按字符切
+        if len(full) > LONG_DOC_THRESHOLD:
+            for sub in _chunk_by_size(full, LONG_DOC_THRESHOLD):
+                out.append(sub)
+        else:
+            out.append(full)
+    return out
+
+
+def _chunk_by_size(text: str, max_chars: int) -> list[str]:
+    """段落边界切 — 优先 \\n\\n,然后 \\n,最后强切。"""
+    if len(text) <= max_chars:
+        return [text]
+    out: list[str] = []
+    remaining = text
+    while len(remaining) > max_chars:
+        cut = remaining.rfind("\n\n", 0, max_chars)
+        if cut <= max_chars // 2:
+            cut = remaining.rfind("\n", 0, max_chars)
+        if cut <= max_chars // 2:
+            cut = max_chars
+        out.append(remaining[:cut].strip())
+        remaining = remaining[cut:].lstrip()
+    if remaining.strip():
+        out.append(remaining.strip())
+    return out
+
+
+def _structure_one_chunk(
+    user_prompt: str,
+) -> tuple[list[L1Item], str]:
+    """单次 LLM 调用 — 返回 (items, error)。"""
     try:
         reply = run("l1_structure", system=SYSTEM_PROMPT, user=user_prompt, temperature=0)
-    except Exception as e:  # noqa: BLE001 — 任何 LLM/网络错误都该捕获
-        return L1Output(raw_text=raw_text, error=f"LLM call failed: {type(e).__name__}: {e}")
+    except Exception as e:  # noqa: BLE001
+        return [], f"LLM call failed: {type(e).__name__}: {e}"
 
     arr = _parse_json_array(reply)
     if arr is None:
-        return L1Output(
-            raw_text=raw_text,
-            error=f"bad JSON from LLM, first 200 chars: {reply[:200]!r}",
-        )
+        return [], f"bad JSON from LLM, first 200 chars: {reply[:200]!r}"
 
     items: list[L1Item] = []
     for item in arr:
@@ -178,24 +238,156 @@ def structure(
             continue
         payload = {k: v for k, v in item.items() if k != "type"}
         items.append(L1Item(type=t, payload=payload))
-    return L1Output(items=items, raw_text=raw_text)
+    return items, ""
+
+
+def structure(
+    raw_text: str,
+    *,
+    context: list[dict] | None = None,
+    primary_raw_id: int | None = None,
+    primary_speaker: str = "",
+) -> L1Output:
+    """L1 入口。LLM/解析失败时返回 error 字段非空,不抛。
+
+    群聊 @bot 路径传 context = [{raw_id, speaker, text, ts}, ...] 把上下文窗口
+    一并喂给 LLM,让它从上下文补齐主消息缺失的 scene/signals/rationale。
+
+    长文档(纯文本 > LONG_DOC_THRESHOLD 字符)按 H2 章节切片,每片独立抽取后合并。
+    群聊路径(有 context)不切 — 主消息肯定短,且切片会破坏上下文承接。
+    """
+    if not (raw_text or "").strip():
+        return L1Output(raw_text=raw_text)
+
+    # 群聊路径或短文本 — 单次抽取
+    if context or len(raw_text) <= LONG_DOC_THRESHOLD:
+        user_prompt = _build_user_prompt(
+            raw_text,
+            context=context,
+            primary_raw_id=primary_raw_id,
+            primary_speaker=primary_speaker,
+        )
+        items, err = _structure_one_chunk(user_prompt)
+        if err and not items:
+            return L1Output(raw_text=raw_text, error=err)
+        return L1Output(items=items, raw_text=raw_text)
+
+    # 长文档 — 切片后逐片抽取
+    chunks = _chunk_by_h2(raw_text)
+    log.info(
+        "l1: long doc %d chars → %d chunks (avg %d chars)",
+        len(raw_text), len(chunks), len(raw_text) // max(1, len(chunks)),
+    )
+    all_items: list[L1Item] = []
+    errors: list[str] = []
+    for i, chunk in enumerate(chunks):
+        items, err = _structure_one_chunk(chunk)
+        log.info("l1 chunk %d/%d: %d items, err=%s", i + 1, len(chunks), len(items), err or "ok")
+        all_items.extend(items)
+        if err:
+            errors.append(f"chunk{i}: {err}")
+    # 至少 1 个 chunk 成功就当整体成功;全失败才返 error
+    if not all_items and errors:
+        return L1Output(raw_text=raw_text, error="; ".join(errors))
+    return L1Output(items=all_items, raw_text=raw_text)
 
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.+?)\s*```", re.DOTALL)
 
 
 def _parse_json_array(text: str) -> list | None:
-    """容忍 ```json``` 包裹 / 前后多余文字。空数组合法。"""
+    """容忍 ```json``` 包裹 + 数组未闭合(尾部截断)+ 单个 obj 损坏。
+
+    流程:
+    1. 剥 ```json``` 围栏 / 前后多余文字
+    2. 先尝试整段 json.loads — 成功最好(99% 情况)
+    3. 失败则降级到逐对象切:从首个 `[` 后开始,按大括号深度扫,把每个顶层
+       `{...}` 切出来独立 json.loads。坏的丢 warning 跳过,好的累积返回。
+       这样 LLM 输出尾部被 max_tokens 截断 / 中间一条 obj 字符串没转义,都能尽量
+       挽救;最差返回 [],而不是整批 None 丢光。
+
+    返回 None 仅表示"完全识别不出数组形态"(连首 `[` 都没找到)。
+    空数组 [] 合法,语义是"LLM 看完没东西可抽"。
+    """
     text = (text or "").strip()
     m = _FENCE_RE.search(text)
     if m:
         text = m.group(1)
     start = text.find("[")
+    if start == -1:
+        return None
+
+    # 尝试 1: 整段 parse
     end = text.rfind("]")
-    if start == -1 or end <= start:
-        return None
-    try:
-        result = json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-    return result if isinstance(result, list) else None
+    if end > start:
+        try:
+            result = json.loads(text[start : end + 1])
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            pass
+
+    # 尝试 2: 逐对象切 — 容错截断 / 局部坏数据
+    return _salvage_objects(text, start)
+
+
+def _salvage_objects(text: str, array_start: int) -> list:
+    """从 `[` 之后扫,按大括号深度提取每个顶层 `{...}`,逐个 json.loads。
+
+    跳过字符串字面量内的大括号(包括转义);未闭合的尾部丢弃。
+    """
+    items: list = []
+    i = array_start + 1
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch.isspace() or ch == ",":
+            i += 1
+            continue
+        if ch == "]":
+            break
+        if ch != "{":
+            i += 1
+            continue
+        # 找匹配的 `}` — 跟踪字符串/转义
+        depth = 0
+        j = i
+        in_str = False
+        esc = False
+        while j < n:
+            c = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = False
+            else:
+                if c == '"':
+                    in_str = True
+                elif c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+            j += 1
+        if depth != 0 or j >= n:
+            # 尾部对象未闭合(被 max_tokens 截了),丢弃
+            log.info("l1: trailing object unclosed at offset %d, dropped", i)
+            break
+        chunk = text[i : j + 1]
+        try:
+            obj = json.loads(chunk)
+            if isinstance(obj, dict):
+                items.append(obj)
+            else:
+                log.info("l1: object at offset %d not a dict (%s), skipped", i, type(obj).__name__)
+        except json.JSONDecodeError as e:
+            log.warning(
+                "l1: bad object at offset %d (%s), skipped: %.120s",
+                i, e.msg, chunk.replace("\n", " "),
+            )
+        i = j + 1
+    return items
