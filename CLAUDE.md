@@ -43,6 +43,7 @@
 | Wave bot APP_ID | `cli_d172001413a848689fa9dbe1cf03eafa`(secret/aes/token 在服务器 `/etc/helper/wave.env`,root only,**不入仓库**) |
 | Wave 回调 URL(部署时配) | `mhynetcn://10.234.81.212:8009/callback` |
 | Wave 开放平台 API | `https://open.hoyowave.com`(出站走这,服务端 app_id+app_secret 自换 access_token) |
+| KM 开放平台 API | `https://open.hoyowave.com`(同 host,文档拉取 / 表格读取走这,凭据复用 wave 但 token 独立缓存) |
 | Athenai API | `https://athenai.mihoyo.com`(兼容 Anthropic `/v1/messages`) |
 
 > **关于 openapi-mcp**: 服务器或开发者桌面装的 `openapi-mcp` 仅供**登录用户身份**使用(给 Claude Code 之类的 desktop agent 用),**不支持服务端身份**。bot 出站发消息 / 反查域账号一律走 Wave 开放平台 HTTP API,不经 MCP。

@@ -29,8 +29,9 @@ class Settings(BaseSettings):
     # NOT openapi-mcp — MCP 只能用登录用户身份,不能服务端用。
     wave_open_api_base_url: str = "https://open.hoyowave.com"
     # KM 开放平台 HTTP API(文档检索 / 文档读取 / 表格读取)。
-    # access_token 走相同 app_id+app_secret 但独立 host,token 缓存独立(不假设两 host 互通)。
-    km_open_api_base_url: str = "https://km.mihoyo.com"
+    # 实际入口跟 wave 同一个 host(open.hoyowave.com) — 官方文档 mhayl60navc8/mhisg59mwgzu 确认。
+    # 凭据复用 wave_app_id + wave_app_secret,但 token 独立缓存(token 域不假设互通)。
+    km_open_api_base_url: str = "https://open.hoyowave.com"
     # 默认米哈游租户(union_id ↔ 域账号互转时需要)。海外站换 cognosphere 那个。
     wave_user_tenant_id: str = "ot_9c253a6cbabafcaf131ca0ab549049db"
 
