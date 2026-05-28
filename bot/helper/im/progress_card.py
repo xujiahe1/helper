@@ -35,13 +35,13 @@ ERROR_TEXT = "⚠️ 出问题了,稍后重试"
 
 
 def _card_payload(text: str) -> dict[str, Any]:
-    """最简卡片 schema — header 留空,正文一个 markdown 组件。
+    """最简卡片 schema — 不带 header(空 header 会渲染成多余的空白行),
+    只一个 markdown 组件作为正文。
 
     flow tag = 流式布局容器(从主动更新文档示例里抠出来的最简结构)。
     用 markdown 是为了 finish 时能把 ask 答案的换行 / 引用块原样渲染。
     """
     return {
-        "header": {"title": ""},
         "card": {
             "tag": "flow",
             "elements": [
