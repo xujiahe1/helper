@@ -245,6 +245,42 @@ def _run_l1_and_count(raw_id: int) -> int:
         ).scalar_one() or 0
 
 
+def _persist_bot_reply(
+    *,
+    text: str,
+    receiver_domain: str,
+    chat_id: str,
+    parent_message_id: str,
+    bot_msg_id: str,
+) -> None:
+    """把 bot 发出的最终回复写到 raw_inputs(source_type=im_wave_bot),
+    供下一轮上下文使用。
+
+    只对 ask / judgment / unknown 这三类"对话型"回复调用 — schedule_*
+    操作回执 / 出错文案 / 文档拉取失败提示等噪音不存。
+
+    author_domain 记录的是接收方域账号(谁正在跟 bot 对话),这样单聊兜底
+    list_chat_history(fallback_author=domain) 能把 user/bot 双方消息都拉到。
+    """
+    if not text:
+        return
+    try:
+        with session() as s:
+            from helper.storage import raw_store
+            raw_store.append(
+                s,
+                source_type="im_wave_bot",
+                content_text=text,
+                author_domain=receiver_domain or "",
+                chat_id=chat_id or "",
+                parent_message_id=parent_message_id or "",
+                wave_message_id=bot_msg_id or "",
+            )
+            s.commit()
+    except Exception:  # noqa: BLE001
+        log.exception("persist bot reply failed bot_msg=%s", bot_msg_id)
+
+
 def _format_judgment_ack(fetched: list, total_atoms: int) -> str:
     """judgment 路径的 ack 文案。
 
@@ -364,7 +400,19 @@ def _route_message_sync(
                 tracker.finish(km_ingest.format_results(failed))
                 return
 
-        intent = classify(text)
+        # 历史对话上下文(8 条 / 1h)— 默认所有长路径都注入,
+        # intent 分类 / ask runtime 共用同一段
+        from helper.storage import raw_store
+
+        with session() as s:
+            chat_context = raw_store.format_context_block(
+                s,
+                chat_id=chat_id,
+                fallback_author=domain,
+                exclude_raw_id=raw_id,
+            )
+
+        intent = classify(text, chat_context=chat_context)
 
         if intent == "schedule_create":
             tracker.finish(handle_create(text, domain))
@@ -390,7 +438,12 @@ def _route_message_sync(
                 log.exception("ask runtime failed raw#%d", raw_id)
                 tracker.fail()
                 return
-            tracker.finish(render_for_wave(ans))
+            ask_body = render_for_wave(ans)
+            tracker.finish(ask_body)
+            _persist_bot_reply(
+                text=ask_body, receiver_domain=domain, chat_id=chat_id,
+                parent_message_id=wave_msg_id, bot_msg_id=tracker.msg_id,
+            )
             # 卡片路径暂不挂 👍/👎(active/update 不支持 feedback_config),
             # ask_answers.wave_msg_id 改成卡片自身 msg_id,reaction 链路保持兜底
             if tracker.msg_id and ans.answer_id is not None:
@@ -409,13 +462,23 @@ def _route_message_sync(
                 targets = [raw_id]
             total = sum(_run_l1_and_count(rid) for rid in targets)
             if total > 0:
-                tracker.finish(_format_judgment_ack(fetched, total))
+                judgment_body = _format_judgment_ack(fetched, total)
             else:
-                tracker.finish("🤔 没看出能沉淀的内容,这条没入库")
+                judgment_body = "🤔 没看出能沉淀的内容,这条没入库"
+            tracker.finish(judgment_body)
+            _persist_bot_reply(
+                text=judgment_body, receiver_domain=domain, chat_id=chat_id,
+                parent_message_id=wave_msg_id, bot_msg_id=tracker.msg_id,
+            )
             return
 
         # unknown 兜底
-        tracker.finish("🤔 没明白你的意图,可以换个说法")
+        unknown_body = "🤔 没明白你的意图,可以换个说法"
+        tracker.finish(unknown_body)
+        _persist_bot_reply(
+            text=unknown_body, receiver_domain=domain, chat_id=chat_id,
+            parent_message_id=wave_msg_id, bot_msg_id=tracker.msg_id,
+        )
     except Exception:  # noqa: BLE001
         log.exception("route message failed raw#%d", raw_id)
         tracker.fail()

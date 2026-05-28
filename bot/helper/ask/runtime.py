@@ -13,7 +13,7 @@ from helper.compiler import current_bundle_version
 from helper.llm import run
 from helper.llm.router import current_routing
 from helper.storage import raw_store, session
-from helper.storage.models import AskAnswer, RawInput
+from helper.storage.models import AskAnswer
 
 log = logging.getLogger(__name__)
 
@@ -30,8 +30,9 @@ class Answer:
 
 SYSTEM_PROMPT = """你是企业内部决策规约助手。回答必须基于检索到的"已沉淀规约/entity/历史 raw 判断"。
 
-如果用户问题里有指代(它/这个/上面说的),先看「最近群聊上下文」段把指代解出来,再回答。
-群聊上下文只用于解指代和理解情境,不能作为引用依据,citations 仍只从检索结果里挑。
+如果消息附了「历史对话」段(用户和 bot 之前几轮的对话),用它来理解当前问题里的
+指代和承接(如"再读一下"是对上一条 bot 回复的回应,"那个文档"指上文出现过的 KM 链接)。
+历史对话只用于解情境,不能作为引用依据,citations 仍只从检索结果里挑。
 
 如果消息里有「引用文档」段(用户随消息附的 KM 文档全文),回答时优先用文档内容,
 但 citations 仍只能从「检索结果」里挑(文档可能还没沉淀到知识库)。
@@ -64,30 +65,16 @@ def _format_hits(hits: list[Hit]) -> str:
 
 
 def _format_chat_context(
-    chat_id: str, *, limit: int = 30, since_days: int = 3, exclude_raw_id: int | None = None
+    chat_id: str, *, fallback_author: str = "", exclude_raw_id: int | None = None
 ) -> str:
-    """拉本地 raw_inputs 拼出近期群聊上下文。空则返空串。
-
-    格式: 每行 "[时间] 域账号: 内容"。
-    内容裁到 200 字以内,避免 prompt 爆炸。
-    """
-    if not chat_id:
-        return ""
+    """统一走 raw_store.format_context_block(8 条 / 1 小时窗口,user/bot 双角色)。"""
     with session() as s:
-        rows: list[RawInput] = raw_store.list_chat_history(
-            s, chat_id, limit=limit, since_days=since_days, exclude_raw_id=exclude_raw_id
+        return raw_store.format_context_block(
+            s,
+            chat_id=chat_id,
+            fallback_author=fallback_author,
+            exclude_raw_id=exclude_raw_id,
         )
-        if not rows:
-            return ""
-        lines = [f"## 最近群聊上下文(近 {since_days} 天 / {len(rows)} 条)"]
-        for r in rows:
-            ts = r.created_at.strftime("%m-%d %H:%M") if r.created_at else "?"
-            who = r.author_domain or "?"
-            text = (r.content_text or "").strip().replace("\n", " ")
-            if len(text) > 200:
-                text = text[:200] + "…"
-            lines.append(f"[{ts}] {who}: {text}")
-    return "\n".join(lines)
 
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.+?)\s*```", re.DOTALL)
@@ -143,7 +130,10 @@ def ask(
     """
     hits = retrieve_relevant(question, top_k=8)
     parts = [f"# 用户问题\n{question}"]
-    ctx = _format_chat_context(chat_id, exclude_raw_id=raw_id) if chat_id else ""
+    # 群聊用 chat_id,单聊用 asker_domain 兜底,默认都拼上下文
+    ctx = _format_chat_context(
+        chat_id, fallback_author=asker_domain, exclude_raw_id=raw_id,
+    )
     if ctx:
         parts.append(ctx)
     inline = _format_inline_docs(inline_context)

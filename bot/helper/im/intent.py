@@ -31,6 +31,9 @@ SYSTEM_PROMPT = """你是消息意图分类器。判断用户在 IM 里 @bot 说
 - schedule_cancel: 用户想取消定时任务,通常带 #编号 或"取消"二字。如"取消 #3"、"删掉那个周报"
 - unknown: 闲聊、招呼、不可分类。如"你好"、"在吗"
 
+如果消息附了「历史对话」段:仅用于解开当前消息里的指代/承接(如"再试一下"是接刚才那条),
+不要让历史话题带偏当前意图判断。当前消息本身才是要分类的对象。
+
 只输出一个词: judgment / ask / schedule_create / schedule_list / schedule_cancel / unknown"""
 
 
@@ -40,15 +43,20 @@ _INTENT_RE = re.compile(
 )
 
 
-def classify(text: str) -> Intent:
+def classify(text: str, *, chat_context: str = "") -> Intent:
     """文本 → 意图。语义全交给 LLM,不做语义启发式。
 
+    chat_context: 可选的历史对话标注块(已格式化好的字符串,空表示没有)。
     LLM 失败 / 解析失败 → unknown,由调用方决定怎么兜,不再悄悄默认成 judgment。
     """
     if not text or not text.strip():
         return "unknown"
+    if chat_context:
+        user_msg = f"{chat_context}\n\n## 当前消息(请分类这条)\n{text}"
+    else:
+        user_msg = text
     try:
-        reply = run("intent_classify", system=SYSTEM_PROMPT, user=text, temperature=0)
+        reply = run("intent_classify", system=SYSTEM_PROMPT, user=user_msg, temperature=0)
     except Exception as e:  # noqa: BLE001
         log.warning("intent classify failed, default to unknown: %s", e)
         return "unknown"
