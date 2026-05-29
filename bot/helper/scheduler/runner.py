@@ -162,8 +162,25 @@ def start_scheduler() -> None:
         id="schedule_tick",
         replace_existing=True,
     )
+    _scheduler.add_job(
+        _bot_routing_expire_tick,
+        IntervalTrigger(minutes=1, start_date=_utcnow_naive() + timedelta(seconds=10)),
+        id="bot_routing_expire",
+        replace_existing=True,
+    )
     _scheduler.start()
-    log.info("scheduler started — 每分钟扫 scheduled_tasks")
+    log.info("scheduler started — 每分钟扫 scheduled_tasks + 路由超时清理")
+
+
+def _bot_routing_expire_tick() -> None:
+    """每分钟扫一次 PendingRouting, 5min 没回的标 expired 并通知用户。"""
+    try:
+        from helper.im.bot_routing import expire_old_routings
+        n = expire_old_routings()
+        if n:
+            log.info("bot routing expired %d entries", n)
+    except Exception:  # noqa: BLE001
+        log.exception("bot routing expire tick failed")
 
 
 def stop_scheduler() -> None:

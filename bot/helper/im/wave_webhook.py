@@ -308,6 +308,22 @@ async def wave_callback(
             log.exception("reaction handle failed event_id=%s", event_id)
         return Response(content="", media_type="application/json")
 
+    # bot-to-bot 私聊路由回执: sender.id_type=app_id 且不是自己 → 走 bot_routing,
+    # 关联回 PendingRouting 把答案回贴到原会话; **不** 落 raw_inputs(防止外 bot 消息污染语料)。
+    sender_obj = (payload.get("event") or {}).get("sender") if isinstance(payload.get("event"), dict) else None
+    if (
+        event_type in {"im.msg.direct.sent_v2", "im.msg.group.sent_v2"}
+        and isinstance(sender_obj, dict)
+        and sender_obj.get("id_type") == "app_id"
+        and sender_obj.get("id") != s.wave_app_id
+    ):
+        from helper.im.bot_routing import handle_bot_reply
+        try:
+            handle_bot_reply(payload, sender_app_id=str(sender_obj.get("id") or ""))
+        except Exception:  # noqa: BLE001
+            log.exception("bot routing reply failed event_id=%s", event_id)
+        return Response(content="", media_type="application/json")
+
     # 只有真正的"接收消息"事件继续走落 raw + LLM 路径
     if event_type not in {"im.msg.direct.sent_v2", "im.msg.group.sent_v2"}:
         log.info("wave webhook: drop non-message event type=%s event_id=%s", event_type, event_id)

@@ -469,3 +469,33 @@ class Memory(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 取代它的 memory id
+
+
+class PendingRouting(Base):
+    """bot 路由的"待回执"凭据 — helper 私聊外部 bot 后, 等对方回复关联回原会话。
+
+    用户在群里 @helper 问的某类问题, 通过 procedural memory 配置成应路由给外部 bot。
+    helper 私聊外部 bot 转发查询 → 外部 bot 回复(进 webhook, sender.id_type=app_id)
+    → 按 target_app_id + 时间窗找最近未消费 PendingRouting → 按 original_chat_id
+    判断在群里 / 私聊里把答案回贴。
+
+    consumed_at 非空 = 已关联回贴; expired_at 非空 = 超时失败已通知用户。
+    两者互斥; 都为空 = 还在等。
+    """
+
+    __tablename__ = "pending_routings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    sent_msg_id: Mapped[str] = mapped_column(String(64), default="")  # helper → target_bot 的 msg_id
+    target_app_id: Mapped[str] = mapped_column(String(64))            # 外部 bot app_id
+    via_label: Mapped[str] = mapped_column(String(64), default="")    # 显示用名字, e.g. "tachi"
+    original_raw_id: Mapped[int] = mapped_column(Integer)             # 用户原问题 raw_id
+    original_chat_id: Mapped[str] = mapped_column(String(64), default="")     # 群 chat_id, 单聊空
+    original_wave_msg_id: Mapped[str] = mapped_column(String(64), default="") # 用户原消息 id, 用于 quote
+    original_asker_domain: Mapped[str] = mapped_column(String(64), default="")  # 原提问人, @他
+    tracker_card_msg_id: Mapped[str] = mapped_column(String(64), default="")    # 思考中卡片 id, 收回执时原地替换
+    tracker_receiver_id: Mapped[str] = mapped_column(String(64), default="")    # 卡片 receiver, 用于 update_card_active 兜底
+    tracker_receiver_id_type: Mapped[str] = mapped_column(String(16), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    expired_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

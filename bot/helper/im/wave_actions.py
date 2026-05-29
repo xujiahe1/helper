@@ -438,6 +438,32 @@ def _route_message_sync(
                 log.exception("ask runtime failed raw#%d", raw_id)
                 tracker.fail()
                 return
+
+            # 路由分支: ask runtime 判定要转外部 bot, 用户原 text 原样转发
+            from helper.ask.runtime import RouteRequest
+            from helper.im.bot_routing import dispatch_route
+            if isinstance(ans, RouteRequest):
+                ok = dispatch_route(
+                    target_app_id=ans.target_app_id,
+                    via_label=ans.via_label,
+                    forwarded_text=text,
+                    original_raw_id=raw_id,
+                    original_chat_id=chat_id,
+                    original_wave_msg_id=wave_msg_id,
+                    original_asker_domain=domain or sender_id,
+                    tracker=tracker,
+                )
+                if ok:
+                    # tracker 不 finish: 等 handle_bot_reply 收到 tachi 回执时
+                    # 用 update_card_active 原地替换为最终答案。
+                    # 只更新一下卡片让用户看到"咨询中"反馈。
+                    tracker._update(f"🔄 已咨询 @{ans.via_label}, 等回复中...")  # noqa: SLF001
+                else:
+                    tracker.finish(
+                        f"⚠️ 转发给 @{ans.via_label} 失败, 你可以直接 @ 它再试一次"
+                    )
+                return
+
             ask_body = render_for_wave(ans)
             tracker.finish(ask_body)
             _persist_bot_reply(
