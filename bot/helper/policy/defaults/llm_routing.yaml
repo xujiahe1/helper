@@ -13,16 +13,18 @@ defaults:
 
 # task 类型 → 走哪个模型。各 task 用途详见 docs/runtime.md §1。
 tasks:
-  # ── 主路径(Pro): 推理 / 追问 / 冲突 judge / 自写代码 planner ──
+  # ── 主路径(Pro): 推理 / 追问 / 自写代码 planner ──
   ask:             { model: claude-opus-4-7, provider: anthropic }
   elicit:          { model: claude-opus-4-7, provider: anthropic }
-  conflict_judge:  { model: claude-opus-4-7, provider: anthropic }
   code_plan:       { model: claude-opus-4-7, provider: anthropic }
 
-  # ── 次路径(Sonnet): 结构化 / 分类 / 同义 judge ──
+  # ── 次路径(Sonnet): 结构化 / 分类 / 同义 judge / 冲突 judge ──
+  # conflict_judge 从 opus 降到 sonnet:任务是结构化二选一 + 短摘要,sonnet 完全够;
+  # 5 类全过 LLM 后调用量上涨,opus 性价比不合理(M6 收口)
   intent_classify: { model: claude-sonnet-4-6, provider: anthropic }
   l1_structure:    { model: claude-sonnet-4-6, provider: anthropic, max_tokens: 16384 }
   synonym_judge:   { model: claude-sonnet-4-6, provider: anthropic }
+  conflict_judge:  { model: claude-sonnet-4-6, provider: anthropic }
   schedule_parse:  { model: claude-sonnet-4-6, provider: anthropic }
   memory_extract:  { model: claude-sonnet-4-6, provider: anthropic }
 
