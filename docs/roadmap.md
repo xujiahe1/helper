@@ -248,10 +248,14 @@ git -C var/helper/git-repo log --oneline     # init + 后续策略变更
 - 改成**内容入库时 LLM 语义判定 topic** → `RawInput.acl_topic_id` 落值;5 类 atom 候选表
   (`l1_items` / `entity_candidates` / `fact_candidates` / `case_candidates` / `relation_candidates`)
   都加列冗余继承,retrieve 出口纯列过滤 + 不 join。
-- **两道闸**:
+- **四道闸**(任一拦截即生效,数据流防漏 + 模型幻觉兜底):
   1. retrieve 出口:asker 不在 topic.allowed_domains → 带该 topic 标的 hit 全过滤
   2. ask 入口:对 question + chat_context 也跑一次 acl_tag,命中且非白名单 → 短路返
      deny_response(`这个话题我不知道。`),**不调主路径 LLM**
+  3. chat_context 过滤:拼群历史时按 asker 过滤,带 acl 标的 raw 直接跳过 — 防白名单
+     连续聊敏感话题后非白名单穿插提问拿到敏感上下文
+  4. 出口 scrub_output:主路径生成 answer 后扫 `output_blocklist_terms`(如"刘佳翔"),
+     命中且非白名单 → 整段替换 deny_response — 兜底防 LLM 凭参数知识脑补
 
 ### yaml 格式 — `meta/policies/topic_acl.yaml`
 
@@ -264,6 +268,7 @@ topics:
     owner_domain: jiahe.xu
     allowed_domains: [jiahe.xu, ting.zhou02, xiao.yang]
     deny_response: "这个话题我不知道。"
+    output_blocklist_terms: ["刘佳翔"]   # 第 4 闸 scrub_output 用
 ```
 
 owner-only 修改:走 git PR + jiahe.xu merge,鉴权天然依赖仓库权限。
@@ -278,6 +283,8 @@ owner-only 修改:走 git PR + jiahe.xu merge,鉴权天然依赖仓库权限。
 | ingest sink hook:新 raw + 派生 atom 同步打标 | ✅ |
 | `helper acl-backfill` / `helper acl-status` CLI | ✅ |
 | memory 层"哥别复述身份"保留(白名单内的人问起仍按这条走) | ✅ |
+| 出口侧硬过滤 scrub_output + `output_blocklist_terms` 黑词 | ✅ commit 4640ecc(2026-05-29) |
+| chat_context 按 asker_domain 过滤(防穿插提问拿敏感历史) | ✅ commit 4640ecc(2026-05-29) |
 
 ### 验收
 

@@ -31,12 +31,14 @@
 ```yaml
 ask, elicit, code_plan:                     claude-opus-4-7   (anthropic)
 intent_classify, l1_structure, synonym_judge,
-conflict_judge, schedule_parse, memory_extract:
-                                            claude-sonnet-4-6 (anthropic)
+conflict_judge, schedule_parse, memory_extract,
+acl_tag:                                    claude-sonnet-4-6 (anthropic, max_tokens=64 + 1 retry)
 l1_prefilter, bulk_extract:                 qwen3.6-flash     (openai 兼容)
 embed_index:                                bge-m3            (openai 兼容,1024 维)
 rerank:                                     qwen3-rerank      (openai 兼容)
 ```
+
+> `acl_tag`(M8)频次:每条新 raw 入库 1 次 + 每次 ask 1 次。max_tokens=64 因为输出只是 topic_id(`ge` / 空串 / `UNCERTAIN`)。失败重试 1 次,仍失败 fallback 走 yaml `default_on_uncertain`(默认空,不强制安全侧)。
 
 API: 走 Athenai `https://athenai.mihoyo.com/v1/messages`(Anthropic 原生兼容)+
 `/v1/chat/completions`(OpenAI 兼容,跑 Qwen / bge-m3)。`Authorization: Bearer sk-xxx` header。
@@ -114,6 +116,8 @@ API: 走 Athenai `https://athenai.mihoyo.com/v1/messages`(Anthropic 原生兼容
 
 A 和 B 都是 fire-and-forget,通过 `helper.im.queue.spawn` 起协程,1s 回调窗口外异步跑。
 
+> A 分支内部:`schedule_ask_reply` 第一道是 ACL 入口短路(`deny_for_question`)— 命中受控 topic 且 asker 非白名单时直接发 deny_response,不调主路径 LLM。详见 §2.7。
+
 **bot-to-bot 入站分流(M6)**: 当 `event.sender.id_type == "app_id"` 且 sender 不是自己 → 走
 `bot_routing.handle_bot_reply` 把外部 bot 的回执贴回 PendingRouting 关联的原会话,**不落 raw_inputs**(避免外部 bot 消息污染语料)。详见 §2.5。
 
@@ -157,6 +161,50 @@ Wave union_id / user_id
 
 > IAM SDK / 认证网关 是给**登录用户身份**(浏览器/桌面 agent)用的,bot 后台 daemon
 > 用应用凭据自己换 access_token + 直接拿身份,链路更短。
+
+### 2.7 Topic ACL 数据流(M8)
+
+四道闸,从入库到出口逐级过滤:
+
+```
+[1. 入库打标]  raw 落 raw_inputs (acl_topic_id="")
+                    ↓ ingest sink._run_consumers
+                acl.tag_raw(raw_id) ── acl_tag LLM 判 topic_id
+                    ↓ 同步派生
+              l1_items / *_candidates 全部冗余继承同 topic_id
+                    ↓
+              落库后 retrieve 出口 / chat_context 拼装时 O(1) 列过滤
+
+[2. retrieve 出口] retrieve_relevant(question, asker_domain="alice")
+                    ↓ 三路融合后
+                filter_hits(asker_domain, hits) ── 反查每条 hit 对应表的
+                    ↓                              acl_topic_id, asker 不在
+                allowed only                       allowed_domains 整条丢
+
+[3. ask 入口短路] ask(question, asker_domain="alice", chat_id="oc1")
+                    ↓ 拼 chat_context (此时已第 4 道过滤)
+                deny_for_question(asker, question, chat_context)
+                    ↓ acl_tag 跑 (question + chat_context)
+                命中且非白名单 → 返 deny_response, 不调主路径 LLM
+
+[4. chat_context 过滤] format_context_block(chat_id, asker_domain="alice")
+                    ↓ list_chat_history 拉同 chat_id 最近 16 条
+                按 asker_domain 过滤 ── 跳过 acl_topic_id != "" 且 asker 不在
+                    ↓                    allowed_domains 的 raw
+                outsider 看到的群历史 = 被 ACL 裁剪过的世界
+
+[5. 出口 scrub_output] ask 主路径生成 answer 后
+                    ↓
+                scrub_output(asker, answer_text) ── 文本含 yaml output_blocklist_terms
+                    ↓                                的词且 asker 非白名单
+                整段替换为 deny_response, 兜底防 LLM 凭参数知识脑补
+```
+
+任何一道命中即生效,后续闸不再触发。前 4 道是数据流防漏,第 5 道是模型幻觉兜底。
+
+代码: `bot/helper/acl/`(policy.py + tagger.py)+ `bot/helper/policy/loader.py::TopicAcl` + `bot/helper/policy/defaults/topic_acl.yaml`(seed)。yaml 真实生效路径在 spec git repo `meta/policies/topic_acl.yaml`,owner-only 修改靠 git PR + repo 权限。
+
+CLI: `helper acl-backfill`(批量给存量 raw 打标)/ `helper acl-status`(看当前白名单 / topic 列表)。
 
 ---
 
