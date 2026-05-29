@@ -775,7 +775,7 @@ def acl_backfill(max_id: int | None) -> None:
     from helper.storage.db import init_engine
 
     s = get_settings()
-    init_engine(s.helper_data_dir / "helper.sqlite")
+    init_engine(s.helper_data_dir / "helper.db")
 
     n = backfill_all(max_id=max_id)
     click.echo(f"acl-backfill: scanned {n} raw rows")
@@ -796,7 +796,7 @@ def acl_status() -> None:
     )
 
     s = get_settings()
-    init_engine(s.helper_data_dir / "helper.sqlite")
+    init_engine(s.helper_data_dir / "helper.db")
 
     acl = current_acl()
     click.echo(f"ACL yaml version: {acl.version}")
