@@ -111,9 +111,12 @@ def test_dispatch_route_send_failure_returns_false_no_db_row(
         assert sess.query(PendingRouting).count() == 0
 
 
-def test_handle_bot_reply_group_replies_with_at_user_and_via_suffix(
+def test_handle_bot_reply_group_replies_with_prefix_and_forwards(
     db, settings, wave_action_log,
 ):
+    """群聊: 1 条 reply 前缀("@asker 已咨询 @via:") + 1 条 send 原样透传(msg_type=text)。"""
+    import json as _json
+
     from helper.im.bot_routing import dispatch_route, handle_bot_reply
     from helper.storage import session
     from helper.storage.models import PendingRouting
@@ -126,7 +129,6 @@ def test_handle_bot_reply_group_replies_with_at_user_and_via_suffix(
         tracker=None,
     )
 
-    # tachi 回了一条文本消息
     reply_payload = {
         "event": {
             "sender": {"id": "cli_tachi", "id_type": "app_id"},
@@ -139,13 +141,18 @@ def test_handle_bot_reply_group_replies_with_at_user_and_via_suffix(
     ok = handle_bot_reply(reply_payload, sender_app_id="cli_tachi")
     assert ok is True
 
-    # 群里发了 reply (因为 wave_quote 非空 → 走 reply_message)
+    # a) 前缀走 reply_message(quote 用户原问题)
     reply_calls = [e for e in wave_action_log if e["kind"] == "reply"]
     assert len(reply_calls) == 1
-    text = reply_calls[0]["content"]["text"]
-    assert "@alice" in text
-    assert "HYG谷多曼" in text
-    assert "—— 答复来自 @tachi" in text
+    prefix_payload = _json.loads(reply_calls[0]["content"])
+    assert prefix_payload["text"] == "@alice 已咨询 @tachi:"
+    assert reply_calls[0]["msg_type"] == "text"
+
+    # b) 透传走 send_message(receiver=chat_id, msg_type=text, content 原 JSON 字符串)
+    sends = [e for e in wave_action_log if e["kind"] == "send" and e.get("receiver_id") == "oc_group"]
+    assert len(sends) == 1
+    assert sends[0]["msg_type"] == "text"
+    assert sends[0]["content"] == '{"text":"agent_name: HYG谷多曼, owner: zhishuang.li"}'
 
     # consumed_at 已标
     with session() as sess:
@@ -156,6 +163,9 @@ def test_handle_bot_reply_group_replies_with_at_user_and_via_suffix(
 def test_handle_bot_reply_dm_replies_in_dm_no_at(
     db, settings, wave_action_log,
 ):
+    """私聊: 2 条 send 给 asker(无 chat_id 不走 reply): 前缀 "已咨询 @via:" + 原样透传。"""
+    import json as _json
+
     from helper.im.bot_routing import dispatch_route, handle_bot_reply
 
     dispatch_route(
@@ -175,16 +185,21 @@ def test_handle_bot_reply_dm_replies_in_dm_no_at(
     }
     handle_bot_reply(reply_payload, sender_app_id="cli_tachi")
 
-    # 私聊场景: 没有 chat_id → 直接 send_message 给 alice 的 user_id, 不走 reply_message
     sends_to_alice = [
         e for e in wave_action_log
         if e["kind"] == "send" and e.get("receiver_id") == "alice"
     ]
-    assert len(sends_to_alice) == 1
-    text = sends_to_alice[0]["content"]["text"]
-    assert "@alice" not in text  # 私聊不 @ 自己
-    assert "answer body" in text
-    assert "—— 答复来自 @tachi" in text
+    assert len(sends_to_alice) == 2
+
+    # 第 1 条: 前缀, 私聊不 @ 自己
+    prefix = _json.loads(sends_to_alice[0]["content"])
+    assert prefix["text"] == "已咨询 @tachi:"
+    assert "@alice" not in prefix["text"]
+    assert sends_to_alice[0]["msg_type"] == "text"
+
+    # 第 2 条: 原样透传
+    assert sends_to_alice[1]["msg_type"] == "text"
+    assert sends_to_alice[1]["content"] == '{"text":"answer body"}'
 
 
 def test_handle_bot_reply_no_pending_drops(db, settings, wave_action_log):
@@ -202,8 +217,8 @@ def test_handle_bot_reply_no_pending_drops(db, settings, wave_action_log):
     assert wave_action_log == []
 
 
-def test_handle_bot_reply_extracts_card_i18n_text(db, settings, wave_action_log):
-    """tachi 实际回的就是 card + i18n_text.zh-cn (raw#71 的 envelope)。"""
+def test_handle_bot_reply_forwards_card_msg_type_verbatim(db, settings, wave_action_log):
+    """tachi 回 card 时, helper 透传保真: 第二条外发 msg_type=card + content 原 JSON 字符串。"""
     from helper.im.bot_routing import dispatch_route, handle_bot_reply
     import json as _json
 
@@ -213,21 +228,28 @@ def test_handle_bot_reply_extracts_card_i18n_text(db, settings, wave_action_log)
         original_wave_msg_id="om_q", original_asker_domain="bob",
         tracker=None,
     )
+    card_content_str = _json.dumps({
+        "i18n_text": {"zh-cn": "查询到了 👇 agent_name: HYG", "en": "got it"}
+    })
     payload = {
         "event": {
             "sender": {"id": "cli_tachi", "id_type": "app_id"},
-            "message": {
-                "msg_type": "card",
-                "content": _json.dumps({
-                    "i18n_text": {"zh-cn": "查询到了 👇 agent_name: HYG", "en": "got it"}
-                }),
-            },
+            "message": {"msg_type": "card", "content": card_content_str},
         },
     }
     handle_bot_reply(payload, sender_app_id="cli_tachi")
+
+    # a) 前缀: reply_message text
     reply_calls = [e for e in wave_action_log if e["kind"] == "reply"]
     assert len(reply_calls) == 1
-    assert "HYG" in reply_calls[0]["content"]["text"]
+    assert reply_calls[0]["msg_type"] == "text"
+    assert _json.loads(reply_calls[0]["content"])["text"] == "@bob 已咨询 @tachi:"
+
+    # b) 透传: send_message msg_type=card, content 原样
+    sends = [e for e in wave_action_log if e["kind"] == "send" and e.get("receiver_id") == "oc_group"]
+    assert len(sends) == 1
+    assert sends[0]["msg_type"] == "card"
+    assert sends[0]["content"] == card_content_str
 
 
 def test_handle_bot_reply_consumed_routing_not_picked_again(

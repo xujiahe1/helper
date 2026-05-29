@@ -103,20 +103,28 @@ def dispatch_route(
     return True
 
 
-def _extract_reply_text(payload: dict[str, Any]) -> str:
-    """从 webhook 入站 payload 抽出对方 bot 回复的纯文本。
+def _extract_raw_message(payload: dict[str, Any]) -> tuple[str, str]:
+    """从 webhook 入站 payload 抽出对方 bot 原消息的 (msg_type, content_str)。
 
-    支持 text / rich_text / card(card 里 i18n_text.zh-cn 或 markdown 节点)。
-    抽不到返空串, 上层降级文案"<via_label> 回复了, 但内容拿不到, 你去会话看一下"。
+    content_str 是 Wave 协议要求的 JSON 字符串原文, 直接喂回 send_message 即可保真转发
+    (card / rich_text 的所有视觉元素都能透传)。
+    抽不到返 ("", "")。
     """
     event = payload.get("event")
     if not isinstance(event, dict):
-        return ""
+        return "", ""
     msg = event.get("message")
     if not isinstance(msg, dict):
-        return ""
-    content_str = msg.get("content")
-    if not isinstance(content_str, str):
+        return "", ""
+    msg_type = msg.get("msg_type") if isinstance(msg.get("msg_type"), str) else ""
+    content_str = msg.get("content") if isinstance(msg.get("content"), str) else ""
+    return msg_type or "", content_str or ""
+
+
+def _extract_reply_text(payload: dict[str, Any]) -> str:
+    """fallback: 抽对方回复的纯文本(仅在原样转发失败时兜底用)。"""
+    _, content_str = _extract_raw_message(payload)
+    if not content_str:
         return ""
     try:
         inner = json.loads(content_str)
@@ -177,30 +185,59 @@ def _extract_reply_text(payload: dict[str, Any]) -> str:
     return ""
 
 
-def _format_final_reply(answer_text: str, via_label: str, asker_domain: str = "") -> str:
-    """最终给用户看的文本: 答案 + 归属。
-
-    群聊里 asker_domain 非空时, 在最前面 @他;
-    私聊不需要 @, asker_domain 可空。
-    归属"—— 答复来自 @<via_label>"放尾(已和用户对齐)。
-    """
-    parts: list[str] = []
+def _format_prefix(via_label: str, asker_domain: str = "") -> str:
+    """转发前缀: 群聊里 @asker + "已咨询 @via:"; 私聊只 "已咨询 @via:"。"""
     if asker_domain:
-        parts.append(f"@{asker_domain}")
-    parts.append(answer_text or "(空回复)")
-    parts.append(f"\n—— 答复来自 @{via_label}")
-    return "\n".join(parts)
+        return f"@{asker_domain} 已咨询 @{via_label}:"
+    return f"已咨询 @{via_label}:"
+
+
+def _send_to_origin(
+    *,
+    chat_id: str,
+    asker: str,
+    wave_quote: str,
+    msg_type: str,
+    content_str: str,
+) -> None:
+    """把 (msg_type, content_str) 发回原会话: 群里优先 reply 原问题, 私聊发 asker。
+
+    content_str 是 Wave 协议要求的 JSON 字符串原文, 直接喂给 wave_client 即可保真转发。
+    wave_quote 传空串 → 强制走 send_message(避免重复 reply 同一条原问题)。
+    """
+    if chat_id:
+        if wave_quote:
+            wave_client.reply_message(wave_quote, msg_type=msg_type, content=content_str)
+        else:
+            wave_client.send_message(
+                chat_id,
+                receiver_id_type="chat_id",
+                msg_type=msg_type,
+                content=content_str,
+            )
+    elif asker:
+        wave_client.send_message(
+            asker,
+            receiver_id_type="user_id",
+            msg_type=msg_type,
+            content=content_str,
+        )
 
 
 def handle_bot_reply(payload: dict[str, Any], *, sender_app_id: str) -> bool:
-    """target bot 私聊回 helper → 找最近未消费 PendingRouting → 回贴 + 标 consumed。
+    """target bot 私聊回 helper → 找最近未消费 PendingRouting → 前缀 + 原样透传 + 标 consumed。
+
+    流程:
+      a) 前缀("@asker 已咨询 @via:") → 优先替换 tracker 卡片, 否则发一条 text
+      b) 原样转发对方原消息(card/rich_text/text 按原 msg_type+content 直发, 视觉保真)
+      c) 透传失败(unsupported msg_type 等) → 兜底抽 text 再发一遍
 
     返回 True = 关联到一条 routing 并回贴; False = 没找到 routing(应丢弃, 不走 raw_inputs)。
     """
     if not sender_app_id:
         return False
 
-    answer_text = _extract_reply_text(payload)
+    msg_type, content_str = _extract_raw_message(payload)
     cutoff = _utcnow() - ROUTING_TTL
 
     with session() as s:
@@ -225,14 +262,10 @@ def handle_bot_reply(payload: dict[str, Any], *, sender_app_id: str) -> bool:
         tracker_card = row.tracker_card_msg_id
         wave_quote = row.original_wave_msg_id
 
-    final_text = _format_final_reply(
-        answer_text or "(对方回了, 但内容抽不到, 请直接看会话)",
-        via_label=via,
-        asker_domain=asker if chat_id else "",  # 私聊不必 @
-    )
+    prefix = _format_prefix(via_label=via, asker_domain=asker if chat_id else "")
 
-    delivered = False
-    # 1) 优先原地替换 thinking 卡片(用户感知一气呵成)
+    # a) 前缀: 优先替换 thinking 卡片(用户感知一气呵成), 否则单发一条 text
+    prefix_via_card = False
     if tracker_card:
         try:
             wave_client.update_card_active(
@@ -241,40 +274,58 @@ def handle_bot_reply(payload: dict[str, Any], *, sender_app_id: str) -> bool:
                     "card": {
                         "tag": "flow",
                         "elements": [
-                            {"tag": "markdown", "text": final_text, "text_align": "left"},
+                            {"tag": "markdown", "text": prefix, "text_align": "left"},
                         ],
                     }
                 },
             )
-            delivered = True
+            prefix_via_card = True
         except WaveAPIError as e:
             log.warning("update_card_active failed card=%s: %s", tracker_card, e)
 
-    # 2) 卡片更新失败 / 没 tracker → 发新消息(群里 reply 用户原问题, 私聊直接发 sender)
-    if not delivered:
+    if not prefix_via_card:
         try:
-            if chat_id:
-                if wave_quote:
-                    wave_client.reply_message(
-                        wave_quote, msg_type="text", content={"text": final_text}
-                    )
-                else:
-                    wave_client.send_message(
-                        chat_id,
-                        receiver_id_type="chat_id",
-                        msg_type="text",
-                        content={"text": final_text},
-                    )
-            elif asker:
-                wave_client.send_message(
-                    asker,
-                    receiver_id_type="user_id",
-                    msg_type="text",
-                    content={"text": final_text},
-                )
-            delivered = True
+            _send_to_origin(
+                chat_id=chat_id,
+                asker=asker,
+                wave_quote=wave_quote,
+                msg_type="text",
+                content_str=json.dumps({"text": prefix}, ensure_ascii=False),
+            )
         except WaveAPIError as e:
-            log.warning("bot reply fallback send failed: %s", e)
+            log.warning("send prefix failed routing=%d: %s", routing_id, e)
+
+    # b) 原样透传对方原消息(空串就 wave_quote 走 send 而非 reply, 不重复 reply 原问题)
+    forwarded = False
+    if msg_type and content_str:
+        try:
+            _send_to_origin(
+                chat_id=chat_id,
+                asker=asker,
+                wave_quote="",
+                msg_type=msg_type,
+                content_str=content_str,
+            )
+            forwarded = True
+        except WaveAPIError as e:
+            log.warning(
+                "forward verbatim failed routing=%d msg_type=%s: %s",
+                routing_id, msg_type, e,
+            )
+
+    # c) 透传失败 / 拿不到原 content → 抽 text 兜底发一遍
+    if not forwarded:
+        fallback_text = _extract_reply_text(payload) or "(对方回了, 但内容抽不到, 请直接看会话)"
+        try:
+            _send_to_origin(
+                chat_id=chat_id,
+                asker=asker,
+                wave_quote="",
+                msg_type="text",
+                content_str=json.dumps({"text": fallback_text}, ensure_ascii=False),
+            )
+        except WaveAPIError as e:
+            log.warning("forward fallback text failed routing=%d: %s", routing_id, e)
 
     with session() as s:
         r = s.get(PendingRouting, routing_id)

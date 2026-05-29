@@ -70,7 +70,7 @@ git -C var/helper/git-repo log --oneline     # init + 后续策略变更
 ```
 
 **验收点**:
-- `helper raw-show <id>` 能看到 L1 五字段(scene/signals/tradeoffs/choice/rationale),且 model 显示 `claude-sonnet-4-6`(走 Athenai)
+- `helper raw-show <id>` 能看到 L1 抽出的原子;**注**:决策五字段(scene/signals/tradeoffs/choice/rationale)只是 `decision` 这一种 type 的 payload,L1 抽多原子(5 类 type),其他 type 各有自己的 payload 结构。Model 显示 `claude-sonnet-4-6`(走 Athenai)
 - Wave webhook 验签错误返 401,event_id 重复返 200 但不重复落库
 - Admin 端点不带 sk → 401,sk 错 → 401,sk 对 → 200
 - `meta/policies/llm_routing.yaml` 改 `l1_structure` 的 model,重启后 `raw-show` 看到 model 字段对应变化(策略可演进的物证)
@@ -101,8 +101,8 @@ git -C var/helper/git-repo log --oneline     # init + 后续策略变更
 | 新增 | 范围 | 状态 |
 |---|---|---|
 | 追问 Engine | 初始 20 条策略,每次追问命中率打标。追问通过 IM 推送 | ✅ |
-| Conflict Detector | LLM judge(decision vs spec)+ 结构判定(fact/case/relation 同 key 不同 value)— 5 类原子统一走 conflict_log,sink 自动挂载 | ✅ |
-| Surface 2 (Inbox) | 走 IM 周报形式 — 周一 push 一条卡片消息列出待办;owner 私聊「/inbox」主动触发当下 digest | ✅ |
+| Conflict Detector | **5 类原子全过 LLM judge + auto-resolve**(M6 commit f0ac08a/15ff894):权威/newest-wins/coexist 自动落定,judge 模型 sonnet | ✅ |
+| Surface 2 (Inbox) | 走 IM 周报形式 — 周一 push 一条卡片消息列出待办;owner 私聊「/inbox」主动触发当下 digest;**周报三段式编号**(1-N specs / 2-N conflicts / 3-N inquiries) | ✅ |
 | 信息修正统一路径 | 任意类型新输入和既有不一致都进 conflict_log,owner 用「采纳 / 保留 / 都留 2-N」三选项裁决;superseded 立刻 build_bundle | ✅ |
 | Ontology 周期体检 | 每周一次合并近似 entity / 标记孤儿 | ⏳ |
 
@@ -151,7 +151,7 @@ git -C var/helper/git-repo log --oneline     # init + 后续策略变更
 
 | 新增 | 范围 | 状态 |
 |---|---|---|
-| 群聊上下文 + 静默回填 | @bot 时拼最近 8 条 / 1 天 user+bot 双角色;群里非 @bot 走静默 L1 + 反查身份不发回复 | ✅ `helper/storage/raw_store.format_context_block` + `wave_webhook.schedule_l1(prefilter=True)` |
+| 群聊上下文 + 静默回填 | 长路径(ask / intent / L1 / memory_extract)默认拼最近 **16 条 / 1 天** user+bot 双角色;群里非 @bot 走 L1 mini 预筛(qwen flash)+ 反查身份不发回复 | ✅ `helper/storage/raw_store.format_context_block` + `wave_webhook.schedule_l1(prefilter=True)` |
 | 用户对话创建定时任务 | 自然语言 → cron → bot 复述确认 → 进程内 1min 扫;支持周报/月报/定期 ask/spec 时效提醒 | ✅ `helper/scheduler/`(parser/runner/handlers/tasks) |
 | webhook 异步队列化 | 落 raw 后立刻 return 200 ack;L1/intent/inquiry/conflict 全 fire-and-forget | ✅ `wave_webhook.wave_callback` 调度三类后台任务 |
 | 向量召回 + KM 文档导入 | bge-m3 embedding + sqlite-vec + Jaccard RRF 融合;KM 走 HTTP API → ProseMirror 渲染 → L1 | ✅ `storage/vector.py` + `im/km_ingest.py` + `im/prosemirror.py` |
@@ -172,27 +172,67 @@ git -C var/helper/git-repo log --oneline     # init + 后续策略变更
 
 ---
 
-## Month 5 — Procedural Memory 层(规划中)
+## Month 5 — Procedural Memory 层(2026-05 已落地)
 
 > 现有 5 类原子(decision/fact/case/concept/relation)全是描述客观世界的 semantic memory。dogfood 暴露:用户也想"教 bot 怎么答",这条通路缺失。
 
-### 要做
+### 已做
 
-| 新增 | 范围 |
-|---|---|
-| Procedural memory 表 | scope(挂哪个 entity/全局)+ directive(指令文本)+ owner + created_at + superseded_at;全公司共享 |
-| Memory 抽取管线 | 与 L1 解耦,LLM 按语义识别"是描述世界,还是约束 bot 行为/口径";不靠关键词 |
-| ask 拼接路径 | 命中 entity 的 directive 拼进 SYSTEM_PROMPT 的 `## 用户偏好` 段(不进检索结果区) |
-| 冲突走周报裁决 | 复用现有 5 类原子的 conflict_log + inbox 三段式裁决;后写不直接覆盖 |
+| 新增 | 范围 | 状态 |
+|---|---|---|
+| Procedural memory 表 | `memories` 表:scope_type(entity / global)+ scope_ref + directive + author_domain + created_at + superseded_at;全公司共享 | ✅ |
+| Memory 抽取管线 | `bot/helper/memory/extract.py` — 与 L1 解耦,LLM 按语义识别"是描述世界,还是约束 bot 行为/口径";不靠关键词 | ✅ |
+| **chat_context 注入**(2026-05-29 修) | memory_extract 默认拼最近 16 条 / 1 天历史对话(对齐 ask),解决"他/她/这事"代词 scope 解析缺失 | ✅ |
+| ask 拼接路径 | `bot/helper/memory/lookup.py` — 命中 entity 的活 directive 拼进 SYSTEM_PROMPT 末尾 `## 用户偏好` 段(不进检索结果区) | ✅ |
+| 冲突走周报裁决 | 复用 5 类原子的 conflict_log(target_type='memory')+ inbox 三段式裁决;后写不直接覆盖 | ✅ |
 
 ### 验收
 
-- 用户在 wave 说"答哥的问题别每次复述身份",下次问相关问题 bot 真简化
-- 撤销路径:用户说"取消刚才那条" → 周报里能看到失效记录
+- 用户在 wave 说"答哥的问题别每次复述身份",下次问相关问题 bot 真简化 ✅
+- 撤销路径:用户说"取消刚才那条" → 周报里能看到失效记录 ⏳ 还没 dogfood 过
 
 ### Kill 条件
 
 - 抽取误判率 > 30%(把日常话当指令存) → LLM 边界判断不行,这条路死
+
+---
+
+## Month 6 — Conflict 5 类全过 + Bot-routing(2026-05 已落地)
+
+### 已做
+
+| 新增 | 范围 | 状态 |
+|---|---|---|
+| 5 类原子统一过 LLM judge | 砍掉 fact/case/relation 的"结构判定"分支,5 类全过 sonnet judge,输出 contradicts / scope_diff / dup / orthogonal;支持 auto_superseded(权威/newest-wins)/ auto_rejected / auto_coexist | ✅ commit f0ac08a |
+| conflict_judge 模型降档 | opus → sonnet(任务实质是结构化二选一 + 短摘要,opus 性价比不再合理) | ✅ commit 15ff894 |
+| Bot-routing(helper 当分诊台) | 命中"X 类问题去问 @Y" directive → `dispatch_route()` 私聊外部 bot 代发 + `pending_routings` 表登记 + 5min 超时 → "你直接 @ 它再问" | ✅ commit 735f281 |
+| 卡片透传保真 | 收到外部 bot 回执后,**前缀** `@asker 已咨询 @Y:` + **原样透传** Y 的 msg_type+content(card / rich_text 视觉保真,失败抽 text 兜底) | ✅(2026-05-29 改的) |
+| bot-to-bot 入站不污染语料 | webhook 见 `sender.id_type=app_id` 且非己 → handle_bot_reply,**不落 raw_inputs** | ✅ |
+
+### 验收
+
+- 群里 @helper 问 app_id,helper 自动转给 tachi 并把 tachi 的 card 原样贴回 ✅
+- 5 类冲突 auto-resolve 在 dogfood 中无误判(权威/newest-wins 策略稳定) ⏳ 持续观察
+
+---
+
+## Month 7 — Retrieve 索引化(2026-05 已落地)
+
+> M4 之前 retrieve 走全表扫 + Jaccard 中文按整串 token 召回率低;1000 篇规模下肯定崩。
+
+### 已做
+
+| 新增 | 范围 | 状态 |
+|---|---|---|
+| FTS5 全文索引 + jieba 中文分词 | `fts_items` 系列表,启动加载 jieba 字典(~50M 常驻) | ✅ commit 90f55a3 |
+| 候选向量化 | 5 类候选(fact/case/concept/relation/spec)入向量索引,bge-m3 1024 维,sqlite-vec | ✅ |
+| Jaccard RRF 融合 | FTS5 + 向量 + Jaccard CJK bigram 三路 RRF 融合 | ✅ |
+| 候选差集过滤 | retrieve 输出剔除已 superseded 候选 | ✅ commit a77275c |
+
+### 验收
+
+- 1000 篇规模下 retrieve P50 < 200ms,P95 < 500ms ⏳ 待真实压测
+- KM 文档真"学进来",ask 答得出文档里写过的内容 ✅(2026-05-29 已验证)
 
 ---
 
@@ -215,8 +255,10 @@ owner 不必等周一才看到待办。两条触发路径并存:
 
 | # | 问题 | 当前状态 |
 |---|---|---|
-| OP-1 | Wave 回调端口 | **已解(2026-05-28)** — `:8001` 在服务器入向被中间网络层封掉(本地办公网 8001 通,服务器 IDC 入向 8001 没 SYN);切到 `:8009` 后 Wave 内网出口 `10.231.152.29` 直接握手成功,challenge 通过。生产端口固定 8009,回调 URL = `mhynetcn://10.234.81.212:8009/callback` |
-| OP-2 | 第二个领域专家是谁 | Month 2 末再找,Month 3 启动用 |
+| OP-1 | Wave 回调端口 | **已归档(2026-05-28)** — 端口 8009 已固化在 runtime.md §2.2 |
+| OP-2 | 第二个领域专家是谁 | Month 3 验收点,目前还未启动 |
+| OP-3 | Procedural memory 撤销路径 | M5 验收点中"取消刚才那条"还没 dogfood 过,需要真实场景验证一次 |
+| OP-4 | reply 父消息反查 | 用户在 IM 里 reply 某条消息再 @bot 时,bot 当前只存 `parent_message_id` 不反查内容;目前实测群里大家不用 reply 语义,优先级低 |
 
 ---
 

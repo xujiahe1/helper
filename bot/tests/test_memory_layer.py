@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from sqlalchemy import select
 
@@ -97,6 +98,81 @@ def test_extract_handles_bad_json(db, settings, llm_stub):
     raw_id = _seed_raw("随便一句")
     llm_stub.set("memory_extract", "not a json at all")
     assert extract_for_raw(raw_id) == 0
+
+
+def test_extract_injects_chat_context_for_pronoun_resolution(db, settings, llm_stub):
+    """memory_extract 在群聊场景下注入历史对话, LLM 能看到当前消息里"他"指代谁。
+
+    回归 bug: 之前 prompt 里只有当前消息, "他"无法解析成历史里出现过的实体。
+    """
+    from helper.memory import extract_for_raw
+    from helper.storage import session
+    from helper.storage.models import Memory, RawInput
+
+    chat_id = "oc_g1"
+    # 历史: 用户先问"哥是谁", bot 答介绍了"哥"
+    with session() as s:
+        s.add(RawInput(
+            source_type="im_wave:im.msg.group.sent_v2",
+            source_ref="hist-1", content_text="哥是谁",
+            author_domain="alice", chat_id=chat_id, is_at_bot=True,
+        ))
+        s.add(RawInput(
+            source_type="im_wave_bot",
+            source_ref="hist-2", content_text="哥特指刘佳翔, 米哈游信息化负责人。",
+            author_domain="alice", chat_id=chat_id,
+        ))
+
+    # 当前消息: 第三方在群里教 bot 一条规则, 里面用了代词"他"
+    raw_id = _seed_raw_in_chat(
+        "你继续学习: 一般他很快回复就是支持, 不回复就是不支持。",
+        author="ting.zhou02", chat_id=chat_id, is_at_bot=True,
+    )
+
+    captured: dict = {}
+
+    def _handler(*, system: str, user: str, **_: Any) -> str:
+        captured["user"] = user
+        return json.dumps({"directives": [{
+            "scope_type": "entity", "scope_ref": "哥",  # LLM 应当解出"他"=哥
+            "directive": "他快速回复=支持, 不回复=不支持; 不持续追问",
+        }]})
+
+    llm_stub.set("memory_extract", _handler)
+    n = extract_for_raw(raw_id)
+    assert n == 1
+
+    # 1) LLM 拿到的 user prompt 里能看到历史对话块和具体实体名"哥"
+    user_prompt = captured["user"]
+    assert "## 历史对话" in user_prompt
+    assert "哥是谁" in user_prompt
+    assert "刘佳翔" in user_prompt
+    assert "## 当前消息" in user_prompt
+
+    # 2) 落库后 scope_ref = 具体实体名, 不是代词
+    with session() as s:
+        rows = s.execute(select(Memory)).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].scope_ref == "哥"
+
+
+def _seed_raw_in_chat(content_text: str, *, author: str, chat_id: str, is_at_bot: bool) -> int:
+    """带群信息的种子 — chat_context 拼接需要 chat_id + im_wave 来源。"""
+    from helper.storage import session
+    from helper.storage.models import RawInput
+
+    with session() as s:
+        r = RawInput(
+            source_type="im_wave:im.msg.group.sent_v2",
+            source_ref=f"test-{content_text[:10]}",
+            content_text=content_text,
+            author_domain=author,
+            chat_id=chat_id,
+            is_at_bot=is_at_bot,
+        )
+        s.add(r)
+        s.flush()
+        return r.id
 
 
 # ---------- conflict ----------

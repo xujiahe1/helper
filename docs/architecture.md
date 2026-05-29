@@ -102,6 +102,10 @@ A: 倾向不走加急。依据:
 
 关键不是答案对,是**可审计 + 不确定性显式 + 会主动让位**。
 
+**Procedural memory 拼到 SYSTEM_PROMPT**: ask 在答题前会查命中 entity 的 `memories` 表(M5),把活的 directive 拼进 SYSTEM_PROMPT 末尾的 `## 用户偏好` 段(不进检索结果区)。这是"用户教 bot 答题口径"的注入点 — 详见 [`bot/helper/memory/lookup.py`](../bot/helper/memory/lookup.py) 与 §3.7。
+
+**Bot-routing 分支(M6)**: ask 答题前先 LLM judge 当前问题是否命中"涉及 X 去问外部 bot Y"这类 directive;命中则产出 `RouteRequest`(而非 `Answer`),走 [`bot/helper/im/bot_routing.py`](../bot/helper/im/bot_routing.py) 把问题代发给外部 bot,等回执后回贴并加 `@asker 已咨询 @via:` 前缀,原消息 card / rich_text 视觉保真透传。详见 §3.6。
+
 ### Surface 5 — Conflict(冲突解决)
 
 专家 A 提的判断和已有(任意类型)知识不一致 → 触发冲突流。3 类:
@@ -114,22 +118,23 @@ A: 倾向不走加急。依据:
 
 每次冲突解决产生 [[conflict-resolution-log]],本身高价值。
 
-### 信息修正统一路径(5 类原子全打)
+### 信息修正统一路径(5 类原子 + procedural memory 全打)
 
-> 所有修正都走同一条流水线 — **不区分 fact/case/concept/relation/decision**。
+> 所有修正都走同一条流水线 — **不区分 fact/case/concept/relation/decision/memory**。
 > 任意类型的"新输入和既有不一致"都是冲突,都进 inbox,都由 owner 在
 > 「采纳 / 保留 / 都留」三选项里裁决。
 
 ```
-新 raw → L1 五类抽取 → 落候选(fact / case / concept / relation / spec_candidate)
+新 raw → L1 五类抽取 + memory_extract(并行) → 落候选(fact / case / concept / relation / spec_candidate / memory)
                               ↓
             sink._run_consumers 自动跑 conflict.detector
                               ↓
         ┌─────────────────────┴─────────────────────┐
-        decision           fact            case        relation
-        ─────             ─────           ─────        ────────
-   LLM judge vs      同(s,p) 不同(o,    同 ref_spec     同(a,b) 不同
-   已晋升 spec       scope)结构判定     不同 outcome    relation 结构判定
+   decision  fact  case  concept  relation  memory
+   ─────    ─────  ────  ─────    ────────  ─────
+       全部统一走 LLM judge(M6 收口,commit f0ac08a)
+       judge 输出: contradicts / scope_diff / dup / orthogonal
+       支持 auto_superseded / auto_rejected / auto_coexist
         └─────────────────────┬─────────────────────┘
                               ↓
                       conflict_log 一张表
@@ -145,12 +150,34 @@ A: 倾向不走加急。依据:
 ```
 
 落地纪律:
-- **conflict_log 不分表** — `target_type ∈ {spec, fact, case, concept, relation}` 字段决定后续处置
+- **conflict_log 不分表** — `target_type ∈ {spec, fact, case, concept, relation, memory}` 字段决定后续处置
+- **5 类 + memory 全过 LLM judge**(M6,commit f0ac08a/15ff894):权威/newest-wins/coexist 可自动落定,judge 模型 sonnet
 - **superseded 走软删** — 候选行打 `superseded_at` + `superseded_by(raw_id)`,
   retrieve 自动过滤;旧候选审计仍可查
 - **bundle 重建是 resolve 的一部分** — 修正完立刻 build_bundle(),agent 下一秒
   看到的就是新版,不等周报 / 不等 cron
-- **手动节奏不变** — 自动只产「待裁决」,落地永远等 owner 点头
+- **手动节奏不变** — 自动只产「待裁决」(自动 resolve 也只对低风险冲突,owner 仍可回滚)
+
+### 3.6 Bot-routing(M6)— helper 当个分诊台
+
+helper 不必啥都自己答。命中 procedural memory 里"涉及 X 类问题去问 @Y"这类 directive 时,helper 自动:
+
+1. 私聊外部 bot Y 把问题代发过去(rich_text @ 它)
+2. 在原会话(群 / 私聊)发"思考中"卡片占位
+3. 收到 Y 的回执后,**前缀** `@asker 已咨询 @Y:` + **原样透传** Y 的卡片 / 富文本(视觉保真)
+4. 5 分钟没回 → 卡片更新为"@Y 5 分钟没回,你直接 @ 它再问一次"
+
+落到表 `pending_routings`(target_app_id / via_label / original_chat_id / original_wave_msg_id / tracker_card_msg_id / consumed_at / expired_at)。
+**关键边界**:外部 bot 私聊回 helper 的消息**不落 raw_inputs**(避免 cli_xxx 的回执变成"哥的语料")。
+
+### 3.7 Procedural Memory(M5)— 用户教 bot 答题口径
+
+- 现有 5 类原子(decision/fact/case/concept/relation)全是描述客观世界的 **semantic memory**。
+- M5 新增 `memories` 表 — **procedural memory**:用户对 bot 行为的指令,如"答哥相关的问题别每次复述身份"、"我喜欢简洁回答"。
+- 抽取与 L1 解耦:`bot/helper/memory/extract.py` 用 LLM 按语义判断"是描述世界,还是约束 bot 行为/口径";不靠关键词。
+- **chat_context 注入**(2026-05-29 修):memory_extract 在长路径默认拼最近 16 条 / 1 天历史对话(对齐 ask),解决"他/她/这事"等代词 scope 解析缺失。
+- 命中路径:ask 答题前查命中 entity 的活 directive,拼进 SYSTEM_PROMPT 末尾 `## 用户偏好` 段。
+- 全公司共享 — `memories` 表无 owner 维度,任何用户教的指令对全员的 ask 都生效(后续可按 scope 隔离)。
 
 ---
 
@@ -173,8 +200,13 @@ A: 倾向不走加急。依据:
 ├──────────────┼──────────────┼──────────────┼────────────────┤
 │ Spec Store   │ Compiler     │ Runtime      │ Replay/Eval     │
 │ (git repo)   │              │ Agent (Ask)  │                 │
+├──────────────┼──────────────┼──────────────┼────────────────┤
+│ Memory Layer │ Bot Routing  │ Scheduler    │ Inbox Weekly    │
+│ (M5 procedu- │ (M6 分诊)    │ (cron / 自然 │ (周报三段式)    │
+│  ral)        │              │  语言定时)   │                 │
 ├──────────────┼──────────────┼──────────────┴────────────────┤
-│ Code Sandbox │ Model Router │     (extensions/ 自迭代外挂层)  │
+│ ⏳ Sandbox   │ Model Router │   ⏳ extensions/ 自迭代外挂层  │
+│  (Q2)        │              │     (Q2,尚未实装)            │
 └──────────────┴──────────────┴────────────────────────────────┘
        ↓                                              ↑
 ┌──────────────────────────────────────────────────────────────┐
@@ -183,7 +215,8 @@ A: 倾向不走加急。依据:
 │ Raw Input Store (sqlite, append-only, 唯一权威源)              │
 │   ↓ derived                                                   │
 │ Ontology · Spec Store (git) · Vector Index (sqlite-vec) ·     │
-│ Reasoning Log · Citation Graph                                │
+│ FTS5 全文索引(jieba 中文分词) · Memories · PendingRoutings ·  │
+│ Ask Answers · Inquiry Log · Conflict Log                       │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -342,8 +375,9 @@ ELSE 不加急
 
 ### 8.5 实现要点
 
-- semantic search: 用 `text-embedding-3-large` + sqlite-vec,3072 维 cosine
-- 同义 judge: Sonnet 4.6 跑(确定性高、便宜)
+- semantic search: 用 `bge-m3` + sqlite-vec,**1024 维 cosine**(中文表现好,存储/计算比 3072 维 OpenAI 模型省 3 倍;走 OpenAI 兼容 /v1/embeddings)
+- 全文检索: FTS5 + jieba 中文分词(M7,1000 篇规模设计) — 与向量召回 Jaccard RRF 融合
+- 同义 judge / 冲突 judge: Sonnet 4.6 跑(确定性高、便宜)
 - 体检: 每周一次 batch job 走 Sonnet
 - Decay: SQL 定时任务,只改 frontmatter `archived: true`
 
@@ -427,11 +461,23 @@ helper policy evaluate --version=2026.05.25-v1 --dry-run
   │   │   └── relationships/
   │   ├── specs/
   │   ├── facts/
-  │   └── cases/
-  ├── helper.db                ← SQLite + sqlite-vec: raw input / reasoning log / identity 缓存 / embedding 索引,单库
-  └── extensions/              ← 自迭代沉淀(B-持久,只外挂层)
-       ├── daily_reminder.py
-       └── .attempts/          ← 失败的 sandbox 尝试,归档不删
+  │   ├── cases/
+  │   └── meta/policies/       ← knowledge_policy.yaml + llm_routing.yaml
+  ├── helper.db                ← SQLite + sqlite-vec + FTS5,单库;详见下表
+  └── (⏳ Q2) extensions/       ← 自迭代沉淀(尚未实装)
 ```
 
-**为什么 sqlite 不是 postgres**: 服务器内存只 3.6G,postgres baseline 太重。sqlite-vec 应付几万条 chunk 索引完全够。本地开发也不需要 docker。
+**helper.db 主要表**(单库不分表):
+
+| 域 | 表 |
+|---|---|
+| Raw 层 | `raw_inputs`(append-only,唯一权威源)/ `wave_event_dedup`(7.1h 去重窗) |
+| L1 派生 | `l1_results` / `l1_items`(5 类原子)/ `fact_candidates` / `case_candidates` / `relation_candidates` / `entity_candidates` / `spec_candidates` |
+| 推理 / 答题 | `ask_answers`(reasoning log)/ `inquiry_log`(追问)/ `inbox_digest`(周报快照) |
+| 冲突 | `conflict_log`(target_type ∈ {spec, fact, case, concept, relation, memory}) |
+| Memory(M5) | `memories`(scope_type / scope_ref / directive / superseded_at) |
+| Routing(M6) | `pending_routings`(target_app_id / via_label / tracker_card_msg_id / consumed_at) |
+| 检索索引 | `vec_items` 系列(向量,1024 维 bge-m3)/ `fts_items` 系列(FTS5 + jieba) |
+| Scheduler / 反馈 | `scheduled_tasks` / `schedule_confirm` / `reaction_log` / `identity_cache` |
+
+**为什么 sqlite 不是 postgres**: 服务器内存只 3.6G,postgres baseline 太重。sqlite-vec + FTS5 应付几千~万条索引完全够。本地开发也不需要 docker。

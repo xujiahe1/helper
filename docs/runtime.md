@@ -4,40 +4,42 @@
 
 | 档位 | 模型 | 上下文 | 用途 |
 |---|---|---|---|
-| **主路径(Pro)** | `claude-opus-4-7` | 1M | Ask 推理 / 追问 / 冲突 judge / 自写代码 planner / IM @bot 实时答 |
-| **次路径(Basic)** | `claude-sonnet-4-6` | 1M | 单条判断 L1 结构化 / 意图分类 / agent loop 常规步骤 |
-| **批量后台** | `qwen3.6-flash` 或 `gpt-5.4-mini` | - | 大批量文档 ingest / 候选事实抽取 |
-| **Embedding** | `text-embedding-3-large` | - | 检索索引(3072 维) |
+| **主路径(Pro)** | `claude-opus-4-7` | 1M | Ask 推理 / 追问(elicit)/ 自写代码 planner |
+| **次路径(Sonnet)** | `claude-sonnet-4-6` | 1M | L1 结构化 / 意图分类 / 同义 judge / 冲突 judge / 定时任务解析 / memory 抽取 |
+| **L1 预筛(mini)** | `qwen3.6-flash` | - | 群聊"听"路径关键词没命中时,让小模型快速判 yes/no(全量跑 Sonnet 太烧) |
+| **批量后台** | `qwen3.6-flash` | - | 文档批量 ingest 抽事实候选 / Replay judge / L2 候选 entity 批量抽取 |
+| **Embedding** | `bge-m3` | - | 检索索引(1024 维,中文表现好,走 OpenAI 兼容 /v1/embeddings) |
 | **Rerank** | `Qwen3 Rerank` | - | retrieve > 20 条时启用 |
 
-> **注**: Athenai 文档明确 Claude 系列**禁用大批量数据打标**,所以批量提取必须走 Qwen / GPT-mini。
+> **注**: Athenai 文档明确 Claude 系列**禁用大批量数据打标**,所以批量提取必须走 Qwen。
 
 ### 1.1 为什么不全用 Claude
 - L1 结构化是 deterministic 任务,Sonnet 准确率上限够,**速度 2-3 倍**对"扔进去多久能在 Inbox 看见"体感影响大
 - 大批量打标 Claude 政策禁用
 
 ### 1.2 为什么主路径不能降到 Sonnet
-追问/冲突 judge/Ask 推理 = 产品和"普通 RAG bot"的护城河。Opus 在 boundary reasoning / exception handling / self-uncertainty 上对 Sonnet 的优势可感知,这三件是品控生死线。
+追问 / Ask 推理 / code_plan = 产品和"普通 RAG bot"的护城河。Opus 在 boundary reasoning / exception handling / self-uncertainty 上对 Sonnet 的优势可感知,这三件是品控生死线。
+
+> **conflict_judge 从 Opus 降到 Sonnet**(2026-05,M6 commit 15ff894):5 类原子统一过 LLM judge 后,调用量上涨明显,而 conflict_judge 的实质是结构化二选一 + 短摘要,Sonnet 完全够。Opus 性价比不再合理。
 
 ### 1.3 实现 — model_router
 
-`bot/helper/llm/router.py` 按 task_type 路由,模型表外置在 spec git repo 的 `meta/policies/llm_routing.yaml`,改路由走 PR + git diff:
+`bot/helper/llm/router.py` 按 task 名路由,模型表外置在 spec git repo 的
+`meta/policies/llm_routing.yaml`(默认快照在 `bot/helper/policy/defaults/llm_routing.yaml`),
+改路由走 PR + git diff。当前生效的 task → 模型表(节选):
 
-```python
-TASK_MODEL = {
-    "ask":              "claude-opus-4-7",
-    "elicit":           "claude-opus-4-7",
-    "conflict_judge":   "claude-opus-4-7",
-    "code_plan":        "claude-opus-4-7",
-    "intent_classify":  "claude-sonnet-4-6",
-    "l1_structure":     "claude-sonnet-4-6",
-    "bulk_extract":     "qwen3.6-flash",
-    "embedding":        "text-embedding-3-large",
-    "rerank":           "qwen3-rerank",
-}
+```yaml
+ask, elicit, code_plan:                     claude-opus-4-7   (anthropic)
+intent_classify, l1_structure, synonym_judge,
+conflict_judge, schedule_parse, memory_extract:
+                                            claude-sonnet-4-6 (anthropic)
+l1_prefilter, bulk_extract:                 qwen3.6-flash     (openai 兼容)
+embed_index:                                bge-m3            (openai 兼容,1024 维)
+rerank:                                     qwen3-rerank      (openai 兼容)
 ```
 
-API: 走 Athenai `https://athenai.mihoyo.com/v1/messages`(Anthropic 原生兼容)+ `/v1/chat/completions`(OpenAI 兼容,跑 Qwen/GPT)。`Authorization: Bearer sk-xxx` header。
+API: 走 Athenai `https://athenai.mihoyo.com/v1/messages`(Anthropic 原生兼容)+
+`/v1/chat/completions`(OpenAI 兼容,跑 Qwen / bge-m3)。`Authorization: Bearer sk-xxx` header。
 
 ---
 
@@ -57,9 +59,12 @@ API: 走 Athenai `https://athenai.mihoyo.com/v1/messages`(Anthropic 原生兼容
 |---|---|---|
 | POST `/openapi/auth/v1/access_token/internal` | `get_access_token()` | 自建应用换 token,内部缓存自动续期 |
 | POST `/openapi/im/v1/message/send` | `send_message()` | 给用户 / 群发会话消息或通知 |
+| POST `/openapi/im/v1/message/reply` | `reply_message()` | 引用回复某条消息(quote) — ask / bot-routing 回贴用 |
+| POST `/openapi/im/v1/card/update_active` | `update_card_active()` | 主动更新已发的"思考中"卡片(ask 长路径 / bot-routing 收到回执时替换 thinking 卡片) |
 | POST `/openapi/contact/v1/user/id_convert` | `convert_user_ids()` / `open_id_to_domain_account()` | **身份映射: union_id ↔ 域账号** |
+| POST `/openapi/contact/v1/users/get` | `users_get()` | 拉用户域账号 + 姓名 + 邮箱(身份反查后回填 raw.author_domain) |
 
-后续要用到的(按需扒文档再加):回复消息 / 撤回 / 卡片更新 / reaction 列表 / 群信息 / 文件上传。
+后续要用到的(按需扒文档再加):撤回 / reaction 列表 / 群信息 / 文件上传。
 
 ### 2.2 入站(Wave 推回调到 bot)
 
@@ -87,13 +92,54 @@ API: 走 Athenai `https://athenai.mihoyo.com/v1/messages`(Anthropic 原生兼容
 
 **为什么不分 IM Adapter 独立进程**: bot core / webhook / Browser Web 跑同一个 FastAPI app(同进程不同 router),省内存。流量上来再拆。
 
-### 2.3 群 listen 边界
+**异步调度承重件**: `bot/helper/im/queue.py` 提供 `llm_slot()` 并发限速 + `spawn()` fire-and-forget 调度,所有后台 LLM 任务(L1 / intent / memory_extract / ask / inquiry / conflict)都从这里出。webhook 1s 回调窗口内只能落 raw + return 200,LLM 调用全走 queue。
+
+### 2.3 主流水线 — webhook 触发后做什么
+
+`wave_webhook.wave_callback` 收到一条 IM 消息事件后:
+
+```
+落 raw_inputs(同步,< 100ms)
+        ↓
+  ┌─────┴───────────────────────────────────────┐
+  │ A. 单聊 / 群里 @bot                          │
+  │    → schedule_memory_extract(raw_id)         │  抽 procedural memory(M5)
+  │    → schedule_ask_reply(raw_id, ...)         │  ask 答题 + 引用回复
+  │                                               │
+  │ B. 群里没 @bot 的消息                         │
+  │    → schedule_l1(raw_id, prefilter=True)     │  L1 mini 预筛 → 命中再跑 Sonnet L1
+  │    → schedule_post_message(send_ack=False)   │  反查身份回填,不发回复
+  └───────────────────────────────────────────────┘
+```
+
+A 和 B 都是 fire-and-forget,通过 `helper.im.queue.spawn` 起协程,1s 回调窗口外异步跑。
+
+**bot-to-bot 入站分流(M6)**: 当 `event.sender.id_type == "app_id"` 且 sender 不是自己 → 走
+`bot_routing.handle_bot_reply` 把外部 bot 的回执贴回 PendingRouting 关联的原会话,**不落 raw_inputs**(避免外部 bot 消息污染语料)。详见 §2.5。
+
+### 2.4 群 listen 边界
 
 - 默认开(因为 bot 不主动加群,**能进的群 = 应该听的群**)
-- 群消息 → 进 Raw Input Store 但**不调 LLM**(成本控制)
-- 触发 LLM 处理: @bot / 转发消息 / 显式开启某群的"主动处理"
+- 群消息 → 进 Raw Input Store 但**不调 LLM 主路径**(只跑 L1 mini 预筛,关键词命中或 mini 判 yes 才升级 Sonnet)
+- 触发 LLM 主路径: @bot / 转发消息 / 显式开启某群的"主动处理"
 
-### 2.4 身份映射
+### 2.5 bot-to-bot 路由(M6)
+
+helper 在 procedural memory 里命中"涉及 X 类问题去问外部 bot Y"指令时,会:
+
+1. `dispatch_route()` 私聊外部 bot(rich_text @ 它),DB 落 `pending_routings` 表(target_app_id + via_label + original_chat_id + original_wave_msg_id + tracker_card)
+2. 在原会话发一条"思考中"卡片占位
+3. 外部 bot 回到 helper 私聊 → webhook 检测 `sender.id_type=app_id` 且非己 → `handle_bot_reply()`:
+   - 找最近未消费、未过期的 PendingRouting
+   - **前缀**:替换 thinking 卡片为 markdown `@asker 已咨询 @via:`(私聊不 @ 自己)
+   - **原样透传**:把外部 bot 的原 `msg_type + content` 直接转发回原会话(card / rich_text / text 视觉保真)
+   - 失败 → 抽 text 兜底
+   - 标 routing.consumed_at
+4. 5 分钟没回 → `expire_old_routings()` 标 expired + 推"@via 5 分钟没回,你直接 @ 它再问"
+
+**关键边界**:外部 bot 私聊回 helper 的消息**不落 raw_inputs**(避免 cli_xxx 的回执变成"哥的语料")。
+
+### 2.6 身份映射
 
 **不对接 IAM**。Wave 开放平台 `users/get` 一把就给齐域账号 + 姓名 + 邮箱 + 状态:
 
@@ -125,11 +171,12 @@ Wave union_id / user_id
 | 组件 | 预算 | 备注 |
 |---|---|---|
 | 已有(nginx + openapi-mcp + monitor) | ~250M | 不动 — openapi-mcp 是徐叶佳侧装的,bot 不连它 |
-| Bot 主进程(core + IM webhook + Browser Web 同 FastAPI app) | 900M | 单进程 + asyncio,见 §2.2 |
-| Sandbox | **峰值 800M / 严格串行 1 个** | systemd-run + cgroup |
+| Bot 主进程(core + IM webhook + Browser Web 同 FastAPI app) | 900M | 单进程 + asyncio,含 apscheduler / cryptography(AES) |
+| jieba 字典(M7 FTS5 中文分词) | ~50M | 启动加载,常驻主进程 |
+| Sandbox(⏳ Q2) | **峰值 800M / 严格串行 1 个** | systemd-run + cgroup;尚未实装 |
 | SQLite + sqlite-vec | 200M | 嵌入主进程 |
 | Buffer | 500M | OOM 防护 |
-| **合计** | **~2.6G** | 紧但够 |
+| **合计** | **~2.7G** | 紧但够 |
 
 ### 3.2 妥协纪律(为不 OOM)
 
@@ -147,7 +194,10 @@ Wave union_id / user_id
 
 ---
 
-## 4. 自迭代边界(Q2 落地)
+## 4. 自迭代边界 ⏳ Q2 计划(尚未实装)
+
+> 本节是 Q2 设计意向,**仓库里目前没有 `extensions/` 目录,也没有 sandbox 调度逻辑**。
+> 真要做时,先确认是否仍是产品优先级,不要照抄下面的方案。
 
 bot 能自写代码,但只能改**外挂层**,不能改主 bot 源码。
 
