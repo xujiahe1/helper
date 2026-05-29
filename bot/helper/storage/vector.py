@@ -178,11 +178,21 @@ def search(
 
 # ---------- 高层入口:对应 raw / spec / entity 三种 kind 的 index ----------
 
+# bge-m3 max input ≈ 8192 tokens,中英混合 ~1.5 字符/token,留余量按 6000 字符
+# hard cap。索引宁可丢尾巴也不能让整条不进库。
+EMBED_INPUT_CHAR_CAP = 6000
+
+
 def index_raw(sess: Session, raw_id: int) -> int | None:
     """raw + L1 合并 index。L1 没跑 / 失败 / filtered 的不索引(信息含量太低,占位也无意义)。
 
     L1 内容来自 L1Item.payload_json — 把每条 atom 的 payload 值拍平拼进去,
     decision 的 scene/choice/rationale + fact 的 subject/predicate/object + ... 都进索引。
+
+    输入文本超过 EMBED_INPUT_CHAR_CAP 时按 L1 原子优先策略截断:
+      - 优先保留 L1 原子(已是结构化、信息密度高的"摘要")
+      - raw.content_text 只截前 ~1500 字符当背景,剩下 ~4500 字符给 L1 原子
+    bge-m3 上限 8192 tokens,256K 输入文档直接拼会被网关 400 拒掉。
     """
     import json as _json
 
@@ -196,7 +206,10 @@ def index_raw(sess: Session, raw_id: int) -> int | None:
         # 没成功跑过 L1 的 raw 不进向量库 — 包括 filtered:* 群聊噪音
         return None
 
-    parts: list[str] = [raw.content_text or ""]
+    raw_text = (raw.content_text or "").strip()
+    raw_head = raw_text[: EMBED_INPUT_CHAR_CAP // 4] if raw_text else ""
+
+    atom_parts: list[str] = []
     items = sess.execute(
         select(L1Item).where(L1Item.raw_id == raw_id).order_by(L1Item.idx)
     ).scalars().all()
@@ -205,17 +218,22 @@ def index_raw(sess: Session, raw_id: int) -> int | None:
             payload = _json.loads(it.payload_json or "{}")
         except _json.JSONDecodeError:
             continue
-        # payload 各字段值都喂进索引(忽略 source_raw_ids 这种 id 引用)
         for k, v in payload.items():
             if k.endswith("_raw_ids") or k.endswith("_speaker"):
                 continue
             if isinstance(v, str) and v.strip():
-                parts.append(v.strip())
+                atom_parts.append(v.strip())
             elif isinstance(v, list):
                 for el in v:
                     if isinstance(el, str) and el.strip():
-                        parts.append(el.strip())
+                        atom_parts.append(el.strip())
+
+    # 拼接 + 截断
+    parts = [raw_head] if raw_head else []
+    parts.extend(atom_parts)
     content = "\n".join(p for p in parts if p)
+    if len(content) > EMBED_INPUT_CHAR_CAP:
+        content = content[:EMBED_INPUT_CHAR_CAP]
     return upsert(sess, kind="raw", ref=str(raw_id), content=content)
 
 

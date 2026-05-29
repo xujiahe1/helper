@@ -48,11 +48,37 @@ class Hit:
     sources: list[str] = field(default_factory=list)  # ["jaccard", "vector"] — debug 用
 
 
-_TOKEN_RE = re.compile(r"[\w一-鿿]+", re.UNICODE)
+# 中文 / 英文混合分词:
+# - 英文/数字: 按非字母数字边界切单词(原行为保留,大于 1 字符才进集合)
+# - 中文: 字符 2-gram(连续 CJK 字符串切成相邻字对),让"账号关联""关联账号"
+#   能匹配"账号关联绑定"
+# 旧实现 [\w一-鿿]+ 把整段中文当一个 token,导致中文 query 在中文 doc 里几乎
+# 永远 Jaccard=0。
+_CJK_RE = re.compile(r"[㐀-鿿]+")
+_ASCII_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
+
+
+def _cjk_bigrams(s: str) -> list[str]:
+    """连续 CJK 串切 2-gram。长度 1 直接当 token。"""
+    if len(s) <= 1:
+        return [s]
+    return [s[i : i + 2] for i in range(len(s) - 1)]
 
 
 def _tokens(text: str) -> set[str]:
-    return {t.lower() for t in _TOKEN_RE.findall(text or "") if len(t) > 1}
+    if not text:
+        return set()
+    out: set[str] = set()
+    # ASCII 单词:小写化,长度 ≥2
+    for m in _ASCII_TOKEN_RE.findall(text):
+        if len(m) >= 2:
+            out.add(m.lower())
+    # CJK 串:2-gram
+    for m in _CJK_RE.findall(text):
+        for bg in _cjk_bigrams(m):
+            if bg.strip():
+                out.add(bg)
+    return out
 
 
 def _jaccard_score(query_toks: set[str], doc_text: str) -> float:
@@ -60,6 +86,11 @@ def _jaccard_score(query_toks: set[str], doc_text: str) -> float:
     if not doc_toks:
         return 0.0
     overlap = query_toks & doc_toks
+    if not overlap:
+        return 0.0
+    # 用 query 长度做分母:doc 长不该把 score 拉低(Jaccard 标准定义是
+    # |A∩B|/|A∪B|,但这里 doc 通常远长于 query,标准 Jaccard 会让短 query
+    # 在长 doc 里得分被稀释。换成 overlap/|query| 更贴召回直觉)
     return len(overlap) / max(len(query_toks), 1)
 
 
