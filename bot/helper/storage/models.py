@@ -160,9 +160,11 @@ class ConflictLog(Base):
     target_slug: Mapped[str] = mapped_column("spec_slug", String(255))
     summary: Mapped[str] = mapped_column(Text)           # LLM judge 给的冲突摘要
     severity: Mapped[str] = mapped_column(String(16), default="medium")  # low/medium/high
-    resolution: Mapped[str] = mapped_column(String(16), default="open")  # open/superseded/coexist/rejected
-    resolved_by: Mapped[str] = mapped_column(String(64), default="")     # 域账号
+    # open/superseded/coexist/rejected/auto_superseded/auto_rejected/auto_coexist
+    resolution: Mapped[str] = mapped_column(String(16), default="open")
+    resolved_by: Mapped[str] = mapped_column(String(64), default="")     # 域账号 / auto-judge
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    auto_reason: Mapped[str] = mapped_column(Text, default="")           # auto_* 时的裁决理由
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 

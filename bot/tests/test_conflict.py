@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+from sqlalchemy import select  # noqa: F401  # 老测试在函数体里又 import,这里给新测试用
+
 
 def _seed_decision(raw_id: int, scene: str = "S", choice: str = "C") -> None:
     from helper.storage import session
@@ -112,6 +114,211 @@ def test_idempotent_on_existing_open_conflict(db, settings, llm_stub, retrieve_s
             select(ConflictLog).where(ConflictLog.raw_id == rid)
         ).scalars())
     assert len(rows) == 1
+
+
+def test_verdict_none_does_not_write(db, settings, llm_stub, retrieve_stub, make_raw):
+    """verdict=none(paraphrase / 无关)→ 直接丢,不入 ConflictLog。新 detector 的核心收口。"""
+    from sqlalchemy import select
+
+    from helper.conflict import detect_for_raw
+    from helper.storage import session
+    from helper.storage.models import ConflictLog
+
+    rid = make_raw("x")
+    _seed_decision(rid)
+    retrieve_stub.set([retrieve_stub.hit("spec", "spec-a", body="...")])
+    llm_stub.set("conflict_judge", json.dumps({
+        "verdict": "none", "summary": "", "severity": "low",
+    }, ensure_ascii=False))
+
+    hits = detect_for_raw(rid)
+    assert hits == []
+    with session() as s:
+        rows = list(s.execute(select(ConflictLog).where(ConflictLog.raw_id == rid)).scalars())
+    assert rows == []
+
+
+def test_severity_high_keeps_open(db, settings, llm_stub, retrieve_stub, make_raw):
+    """severity=high 且 LLM 没给 auto_resolution → 留 open 等人裁。"""
+    from helper.conflict import detect_for_raw
+
+    rid = make_raw("x")
+    _seed_decision(rid)
+    retrieve_stub.set([retrieve_stub.hit("spec", "spec-a", body="...")])
+    llm_stub.set("conflict_judge", json.dumps({
+        "verdict": "contradicts", "summary": "颠覆性冲突",
+        "severity": "high", "auto_resolution": "", "auto_reason": "",
+    }, ensure_ascii=False))
+
+    hits = detect_for_raw(rid)
+    assert len(hits) == 1
+    assert hits[0].resolution == "open"
+    assert hits[0].severity == "high"
+
+
+def test_severity_medium_auto_supersedes(db, settings, llm_stub, retrieve_stub, make_raw):
+    """severity=medium 且无 auto_resolution → 代码兜底 newest-wins,auto_superseded 落库。"""
+    from datetime import datetime
+
+    from helper.conflict import detect_for_raw
+    from helper.storage import session
+    from helper.storage.models import ConflictLog, SpecCandidate
+
+    rid = make_raw("x")
+    _seed_decision(rid)
+    # 种一个 SpecCandidate,断言被打上 superseded_at
+    with session() as s:
+        s.add(SpecCandidate(slug="spec-a", title="t", statement="..."))
+    retrieve_stub.set([retrieve_stub.hit("spec", "spec-a", body="...")])
+    llm_stub.set("conflict_judge", json.dumps({
+        "verdict": "contradicts", "summary": "中等冲突",
+        "severity": "medium",
+    }, ensure_ascii=False))
+
+    hits = detect_for_raw(rid)
+    assert len(hits) == 1
+    assert hits[0].resolution == "auto_superseded"
+
+    with session() as s:
+        cl = s.execute(select(ConflictLog).where(ConflictLog.raw_id == rid)).scalar_one()
+        assert cl.resolution == "auto_superseded"
+        assert cl.resolved_by == "auto-judge"
+        assert isinstance(cl.resolved_at, datetime)
+        assert cl.auto_reason
+
+        sc = s.execute(select(SpecCandidate).where(SpecCandidate.slug == "spec-a")).scalar_one()
+        assert sc.superseded_at is not None
+        assert sc.superseded_by == rid
+
+
+def test_llm_auto_resolution_respected(db, settings, llm_stub, retrieve_stub, make_raw):
+    """LLM 给 auto_resolution=rejected(权威规则要求保留旧)→ 走 auto_rejected,不 supersede 旧。"""
+    from helper.conflict import detect_for_raw
+    from helper.storage import session
+    from helper.storage.models import ConflictLog, SpecCandidate
+
+    rid = make_raw("x")
+    _seed_decision(rid)
+    with session() as s:
+        s.add(SpecCandidate(slug="spec-a", title="t", statement="..."))
+    retrieve_stub.set([retrieve_stub.hit("spec", "spec-a", body="...")])
+    llm_stub.set("conflict_judge", json.dumps({
+        "verdict": "contradicts", "summary": "...",
+        "severity": "medium",
+        "auto_resolution": "rejected",
+        "auto_reason": "memory 里 IAM 领域以刘佳翔为准,新输入非他",
+    }, ensure_ascii=False))
+
+    hits = detect_for_raw(rid)
+    assert len(hits) == 1
+    assert hits[0].resolution == "auto_rejected"
+
+    with session() as s:
+        cl = s.execute(select(ConflictLog).where(ConflictLog.raw_id == rid)).scalar_one()
+        assert cl.resolution == "auto_rejected"
+        # auto_rejected 不 supersede 旧候选
+        sc = s.execute(select(SpecCandidate).where(SpecCandidate.slug == "spec-a")).scalar_one()
+        assert sc.superseded_at is None
+
+
+def test_memory_directives_passed_to_judge(db, settings, llm_stub, retrieve_stub, make_raw):
+    """命中 entity 的 alive memory 拼进 judge 的 user prompt,LLM 能看到权威规则。"""
+    from helper.conflict import detect_for_raw
+    from helper.storage import session
+    from helper.storage.models import Memory
+
+    with session() as s:
+        s.add(Memory(
+            scope_type="entity", scope_ref="发版前",
+            directive="发版相关以王一鸣说的为准",
+        ))
+
+    rid = make_raw("x")
+    _seed_decision(rid, scene="发版前", choice="周一发")
+    retrieve_stub.set([retrieve_stub.hit("spec", "spec-a", body="...")])
+    llm_stub.set("conflict_judge", json.dumps({
+        "verdict": "none", "summary": "", "severity": "low",
+    }, ensure_ascii=False))
+
+    detect_for_raw(rid)
+    judge_calls = [c for c in llm_stub.calls if c[0] == "conflict_judge"]
+    assert len(judge_calls) == 1
+    user_prompt = judge_calls[0][2]
+    assert "权威规则" in user_prompt
+    assert "发版相关以王一鸣说的为准" in user_prompt
+
+
+def test_fact_conflict_uses_llm_judge(db, settings, llm_stub, retrieve_stub, make_raw):
+    """fact 冲突也过 LLM judge — 不再是结构裸过的 auto-medium。"""
+    from helper.conflict import detect_for_raw
+    from helper.storage import session
+    from helper.storage.models import FactCandidate, L1Item
+
+    with session() as s:
+        s.add(FactCandidate(
+            slug="fact-existing", subject="lml账号", predicate="同步至",
+            object="米哈游账号", scope="", statement="...",
+        ))
+    rid = make_raw("新输入")
+    with session() as s:
+        s.add(L1Item(
+            raw_id=rid, idx=0, type="fact",
+            payload_json=json.dumps({
+                "subject": "lml账号", "predicate": "同步至",
+                "object": "米哈游账号", "scope": "lml→mhy",
+            }, ensure_ascii=False),
+        ))
+    # LLM 判 paraphrase / scope 不冲突
+    llm_stub.set("conflict_judge", json.dumps({
+        "verdict": "none", "summary": "", "severity": "low",
+    }, ensure_ascii=False))
+
+    hits = detect_for_raw(rid)
+    assert hits == []
+    judge_calls = [c for c in llm_stub.calls if c[0] == "conflict_judge"]
+    assert len(judge_calls) == 1
+
+
+# ---------- rejudge ----------
+
+def test_rejudge_closes_verdict_none(db, settings, llm_stub, make_raw):
+    """rejudge: 已 open 的 ConflictLog 重判 verdict=none → auto_rejected close。"""
+    from helper.conflict.rejudge import rejudge_open_conflicts
+    from helper.storage import session
+    from helper.storage.models import ConflictLog, FactCandidate, L1Item
+
+    # 准备一条假 fact 冲突(噪声场景)
+    with session() as s:
+        s.add(FactCandidate(
+            slug="fact-old", subject="X", predicate="同步至",
+            object="Y", scope="", statement="...",
+        ))
+    rid = make_raw("新输入")
+    with session() as s:
+        s.add(L1Item(
+            raw_id=rid, idx=0, type="fact",
+            payload_json=json.dumps({
+                "subject": "X", "predicate": "同步回", "object": "Y", "scope": "",
+            }, ensure_ascii=False),
+        ))
+        s.add(ConflictLog(
+            raw_id=rid, target_type="fact", target_slug="fact-old",
+            summary="同步至 vs 同步回(paraphrase)", severity="medium",
+            resolution="open",
+        ))
+
+    llm_stub.set("conflict_judge", json.dumps({
+        "verdict": "none", "summary": "", "severity": "low",
+    }, ensure_ascii=False))
+
+    stats = rejudge_open_conflicts()
+    assert stats["rejected_none"] == 1
+
+    with session() as s:
+        cl = s.execute(select(ConflictLog)).scalar_one()
+        assert cl.resolution == "auto_rejected"
+        assert cl.resolved_by == "auto-rejudge"
+        assert "verdict=none" in cl.auto_reason
 
 
 def test_resolve_marks_log(db, settings, make_raw):

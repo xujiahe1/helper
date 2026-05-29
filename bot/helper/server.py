@@ -187,6 +187,14 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=404, detail=f"spec candidate {slug} not found")
             return {"slug": slug, "git_path": path}
 
+        @admin.post("/conflicts/rejudge")
+        def post_rejudge(limit: int = 200) -> dict[str, Any]:
+            """对 resolution=open 的 ConflictLog 重判 — 用新 detector 清噪。"""
+            from helper.conflict.rejudge import rejudge_open_conflicts
+
+            limit = max(1, min(limit, 500))
+            return rejudge_open_conflicts(limit=limit)
+
         @admin.post("/conflicts/{log_id}/resolve")
         def post_resolve_conflict(log_id: int, resolution: str, resolver: str = "") -> dict[str, Any]:
             from helper.conflict import resolve
