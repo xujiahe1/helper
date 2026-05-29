@@ -136,8 +136,14 @@ def format_context_block(
     limit: int = CONTEXT_DEFAULT_LIMIT,
     since_minutes: int = CONTEXT_DEFAULT_MINUTES,
     max_chars_per_line: int = 200,
+    asker_domain: str = "",
 ) -> str:
     """拼一段「历史对话」标注块,供 intent classify / ask 共用。
+
+    asker_domain 非空时按 ACL 过滤: 非白名单 asker 看到的群历史里,
+    带 acl_topic_id 标的 raw 直接跳过(像那条消息没发生过)— 避免
+    白名单用户的敏感聊天被穿插进群的非白名单 asker 通过 chat_context 看到。
+    asker_domain 留空时不过滤(向后兼容,如 L1 抽取等内部使用场景)。
 
     返回示例:
         ## 历史对话(仅供你理解当前消息的指代/承接,不要被它带偏)
@@ -155,6 +161,21 @@ def format_context_block(
         exclude_raw_id=exclude_raw_id,
         fallback_author=fallback_author,
     )
+    if not rows:
+        return ""
+    if asker_domain:
+        try:
+            from helper.acl import current_acl
+            acl = current_acl()
+            if acl.topics:
+                rows = [
+                    r for r in rows
+                    if acl.is_allowed(asker_domain, getattr(r, "acl_topic_id", "") or "")
+                ]
+        except Exception:  # noqa: BLE001
+            # ACL 加载失败时不过滤(向 ask 主路径报告 LLM 决定 fail-open),
+            # 但 ask runtime 的 deny_for_question 仍是首道闸。
+            pass
     if not rows:
         return ""
     lines = ["## 历史对话(仅供你理解当前消息的指代/承接,不要被它带偏)"]

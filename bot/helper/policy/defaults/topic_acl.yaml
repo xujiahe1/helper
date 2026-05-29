@@ -39,3 +39,8 @@ topics:
       - ting.zhou02
       - xiao.yang
     deny_response: "这个话题我不知道。"
+    # 出口侧硬过滤: ask 主路径生成的 answer 文本里若出现这些词且 asker 不在
+    # allowed_domains, 整段答复替换为 deny_response。兜底防 LLM 凭参数知识/迂回
+    # 话术绕开入口闸自己脑补出敏感名字。
+    output_blocklist_terms:
+      - "刘佳翔"

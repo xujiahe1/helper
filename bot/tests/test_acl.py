@@ -234,6 +234,97 @@ def test_deny_for_question_no_block_for_public_question(
     assert ans.answer == "IAM"
 
 
+# ---------- 出口硬过滤 scrub_output ----------
+
+
+def test_scrub_output_replaces_when_blocklist_term_appears(db, settings, acl_reset):
+    """非白名单 asker, 答案里出现"刘佳翔" → 整段替换为 deny_response。"""
+    from helper.acl import scrub_output
+
+    out = scrub_output("outsider", "据信刘佳翔最近正在推 IAM 合规改造。")
+    assert out == "这个话题我不知道。"
+
+
+def test_scrub_output_passes_through_for_whitelist(db, settings, acl_reset):
+    """白名单 asker 看到包含"刘佳翔"的答案 → 不替换。"""
+    from helper.acl import scrub_output
+
+    out = scrub_output("jiahe.xu", "据信刘佳翔最近正在推 IAM 合规改造。")
+    assert out is None
+
+
+def test_scrub_output_no_op_when_no_term(db, settings, acl_reset):
+    """没命中黑词 → 返 None, 调用方保留原 text。"""
+    from helper.acl import scrub_output
+
+    assert scrub_output("outsider", "IAM 可见性配置在 admin 后台。") is None
+
+
+def test_ask_scrubs_answer_when_llm_leaks_blocked_name(
+    db, settings, llm_stub, retrieve_stub, acl_reset, stub_bundle, monkeypatch
+):
+    """LLM 凭参数知识自己说出"刘佳翔" → ask 末尾 scrub_output 整段替换。"""
+    from helper.ask import ask
+
+    monkeypatch.setattr("helper.ask.runtime.current_bundle_version", lambda: "test")
+    llm_stub.set("acl_tag", "")  # 入口闸不命中(模拟问题表述无敏感)
+    llm_stub.set("ask", "## 答复\n据我所知刘佳翔目前在主导 IAM 改造。\n\n## 置信度\nlow\n\n## 引用\n")
+
+    ans = ask("信息化负责人最近在干嘛", asker_domain="outsider")
+    assert ans.answer == "这个话题我不知道。"
+    assert ans.confidence == "low"
+    assert ans.citations == []
+
+
+# ---------- chat_context 按 asker 过滤 ----------
+
+
+def test_chat_context_filters_ge_history_for_outsider(db, settings, acl_reset):
+    """白名单用户连续聊 ge 后, 非白名单 asker 拿到的群历史里 ge raw 全跳过。"""
+    from helper.storage import session
+    from helper.storage import raw_store
+    from helper.storage.models import RawInput
+
+    with session() as s:
+        s.add(RawInput(
+            source_type="im_wave:im.msg.group.sent_v2",
+            content_text="哥最近喷谁了", author_domain="jiahe.xu",
+            chat_id="oc1", acl_topic_id="ge",
+        ))
+        s.add(RawInput(
+            source_type="im_wave_bot",
+            content_text="哥喷了周婷, 说她是螃蟹", author_domain="jiahe.xu",
+            chat_id="oc1", acl_topic_id="ge",
+        ))
+        s.add(RawInput(
+            source_type="im_wave:im.msg.group.sent_v2",
+            content_text="iam 怎么配置", author_domain="bob",
+            chat_id="oc1", acl_topic_id="",
+        ))
+
+    # outsider 看历史 — 只剩公开那条
+    with session() as s:
+        block = raw_store.format_context_block(
+            s, chat_id="oc1", asker_domain="outsider",
+        )
+    assert "螃蟹" not in block
+    assert "周婷" not in block
+    assert "iam 怎么配置" in block
+
+    # 白名单看历史 — 三条全在
+    with session() as s:
+        block2 = raw_store.format_context_block(
+            s, chat_id="oc1", asker_domain="jiahe.xu",
+        )
+    assert "螃蟹" in block2
+    assert "iam 怎么配置" in block2
+
+    # 不传 asker — 不过滤(向后兼容 L1 抽取等内部场景)
+    with session() as s:
+        block3 = raw_store.format_context_block(s, chat_id="oc1")
+    assert "螃蟹" in block3
+
+
 # ---------- backfill ----------
 
 

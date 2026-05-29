@@ -113,6 +113,35 @@ def _resolve_hit_topics(hits: list["Hit"]) -> dict[tuple[str, str], str]:
 # ────────────────────────────────────────────────────────────────
 
 
+def scrub_output(asker_domain: str, text: str) -> str | None:
+    """出口侧硬过滤。
+
+    遍历所有 topic, 若 asker 不在该 topic.allowed_domains 且 text 里出现任一
+    output_blocklist_terms → 返该 topic.deny_response(整段替换)。
+
+    返 None 表示无命中, 调用方应保留原 text。
+
+    设计: 兜底防 LLM 即便没拿到敏感原文, 仍凭参数知识 / 迂回话术自己脑补出敏感
+    名字。整段替换比"打码"更安全 — 上下文也可能透露身份。
+    """
+    if not text:
+        return None
+    acl = current_acl()
+    for entry in acl.topics:
+        if asker_domain in entry.allowed_domains:
+            continue
+        if not entry.output_blocklist_terms:
+            continue
+        for term in entry.output_blocklist_terms:
+            if term and term in text:
+                log.info(
+                    "scrub_output hit topic=%s term=%r asker=%s",
+                    entry.id, term, asker_domain,
+                )
+                return entry.deny_response
+    return None
+
+
 def deny_for_question(
     asker_domain: str, question: str, chat_context: str = ""
 ) -> str | None:

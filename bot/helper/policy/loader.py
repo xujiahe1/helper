@@ -144,6 +144,8 @@ class TopicAclEntry(BaseModel):
     owner_domain: str
     allowed_domains: list[str] = Field(default_factory=list)
     deny_response: str = "这个话题我不知道。"
+    # 出口侧硬过滤词: 答复正文出现任一个 + asker 不在白名单 → 整段替换为 deny_response。
+    output_blocklist_terms: list[str] = Field(default_factory=list)
 
 
 class TopicAcl(BaseModel):

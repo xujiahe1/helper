@@ -18,6 +18,7 @@ from helper.acl.policy import (
     filter_hits,
     is_allowed,
     reset_acl_cache,
+    scrub_output,
 )
 from helper.acl.tagger import backfill_all, tag_raw, tag_text
 
@@ -28,6 +29,7 @@ __all__ = [
     "filter_hits",
     "is_allowed",
     "reset_acl_cache",
+    "scrub_output",
     "tag_raw",
     "tag_text",
 ]

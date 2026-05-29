@@ -100,15 +100,21 @@ def _format_hits(hits: list[Hit]) -> str:
 
 
 def _format_chat_context(
-    chat_id: str, *, fallback_author: str = "", exclude_raw_id: int | None = None
+    chat_id: str,
+    *,
+    fallback_author: str = "",
+    exclude_raw_id: int | None = None,
+    asker_domain: str = "",
 ) -> str:
-    """统一走 raw_store.format_context_block(8 条 / 1 小时窗口,user/bot 双角色)。"""
+    """统一走 raw_store.format_context_block。asker_domain 触发 ACL 过滤,
+    防白名单用户的敏感聊天通过群历史穿透给非白名单 asker。"""
     with session() as s:
         return raw_store.format_context_block(
             s,
             chat_id=chat_id,
             fallback_author=fallback_author,
             exclude_raw_id=exclude_raw_id,
+            asker_domain=asker_domain,
         )
 
 
@@ -202,9 +208,12 @@ def ask(
     inline_context: 用户消息里附的 KM 文档(已 fetch 到正文),作为这次问答的额外素材。
         每项 {"title": str, "body": str, "source_url": str}。
     """
-    # 群聊用 chat_id, 单聊用 asker_domain 兜底, 默认都拼上下文
+    # 群聊用 chat_id, 单聊用 asker_domain 兜底, 默认都拼上下文。
+    # 透传 asker_domain → format_context_block 按 ACL 跳过敏感历史,
+    # 防白名单用户连续聊敏感话题后非白名单 asker 穿插提问时仍能拿到上下文。
     ctx = _format_chat_context(
         chat_id, fallback_author=asker_domain, exclude_raw_id=raw_id,
+        asker_domain=asker_domain,
     )
 
     # ACL 入口短路: 问题 + 历史命中受控 topic 且 asker 非白名单 → 直接拒, 不调主路径 LLM。
@@ -273,6 +282,20 @@ def ask(
     if confidence not in ("high", "medium", "low"):
         confidence = "unknown"
     citations: list[dict[str, Any]] = _parse_citations(sections.get("引用", ""))
+
+    # ACL 出口硬过滤: LLM 即便没拿到敏感原文 (retrieve 已过滤 + chat_context 已过滤),
+    # 仍可能凭参数知识 / 迂回话术自己脑补出敏感名字 → 整段替换为 deny_response。
+    try:
+        from helper.acl import scrub_output
+        scrubbed = scrub_output(asker_domain, answer_text)
+    except Exception:  # noqa: BLE001
+        log.exception("acl scrub_output failed; default to no scrub")
+        scrubbed = None
+    if scrubbed is not None:
+        log.info("acl scrubbed answer asker=%s", asker_domain)
+        answer_text = scrubbed
+        confidence = "low"
+        citations = []
 
     bundle_v = current_bundle_version()
     with session() as s:
