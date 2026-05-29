@@ -327,7 +327,7 @@ def test_ask_system_prompt_includes_directives(db, settings, llm_stub, stub_bund
 
     def fake_ask(system: str, user: str, **kw):
         captured["system"] = system
-        return json.dumps({"answer": "OK", "confidence": "low", "citations": []})
+        return "## 答复\nOK\n\n## 置信度\nlow\n\n## 引用\n"
 
     llm_stub.set("ask", fake_ask)
     ask("无所谓问什么", asker_domain="alice")
