@@ -156,15 +156,34 @@ def _superseded_raw_ids() -> set[int]:
 
 
 def _candidate_pass(qtoks: set[str]) -> list[Hit]:
-    """直接从 fact_candidates / case_candidates / relation_candidates 召回。
+    """直接从 entity/fact/case/relation_candidates 召回。
 
     问题:bundle 只编译已晋升 (mention_count >= MIN_MENTION_TO_PROMOTE) 的候选,
-    早期 / dogfood 阶段几乎所有 fact 都是 mention=1 进不了 bundle,ask 看不到。
+    早期 / dogfood 阶段几乎所有候选都是 mention=1 进不了 bundle,ask 看不到。
     所以平行从候选表召回,过滤 superseded_at IS NOT NULL,与 bundle 路径用
     (type, slug) 去重。
+
+    历史 bug:这里曾漏扫 EntityCandidate,导致单文档抽出的所有 concept 类原子
+    (如"加黑规则组"、"人见组织规则")在召回侧完全不可达 — concept 进 EntityCandidate
+    但 mention=1 不进 bundle,候选路径又不扫,两层叠加全废。
     """
     out: list[Hit] = []
     with session() as s:
+        # entity
+        for ec in s.execute(
+            select(EntityCandidate).where(EntityCandidate.superseded_at.is_(None))
+        ).scalars():
+            text = " ".join([ec.name or "", ec.description or ""])
+            sc = _jaccard_score(qtoks, text)
+            if sc > 0:
+                out.append(Hit(
+                    type="entity",
+                    ref=ec.slug,
+                    title=ec.name or ec.slug,
+                    body=ec.description or "",
+                    score=sc,
+                    sources=["jaccard"],
+                ))
         # fact
         for fc in s.execute(
             select(FactCandidate).where(FactCandidate.superseded_at.is_(None))

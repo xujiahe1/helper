@@ -113,6 +113,46 @@ def test_candidate_pass_skips_superseded_fact(db, settings):
     assert "f-stale" not in refs
 
 
+def _make_entity(slug: str, name: str, description: str, *, superseded: bool = False) -> None:
+    """造一个未晋升的 entity 候选。"""
+    from helper.storage import session
+    from helper.storage.models import EntityCandidate
+
+    with session() as s:
+        ec = EntityCandidate(
+            slug=slug,
+            name=name,
+            description=description,
+            mention_count=1,
+            superseded_at=datetime.now(timezone.utc) if superseded else None,
+        )
+        s.add(ec)
+
+
+def test_candidate_pass_picks_up_alive_entity(db, settings):
+    """回归:未晋升、未 superseded 的 entity(concept)也要能被 ask 召回。
+
+    历史 bug:_candidate_pass 漏扫 EntityCandidate,导致单文档抽出的 concept 类
+    原子(如"加黑规则组")mention=1 进不了 bundle、候选路径又不扫,完全不可达。
+    """
+    from helper.ask.retrieve import _candidate_pass
+
+    _make_entity("加黑规则组", "加黑规则组", "仅可配置主体不可见客体的规则组")
+    hits = _candidate_pass({"加黑", "黑规", "规则", "则组"})
+    refs = {(h.type, h.ref) for h in hits}
+    assert ("entity", "加黑规则组") in refs
+
+
+def test_candidate_pass_skips_superseded_entity(db, settings):
+    """superseded entity 不进 _candidate_pass。"""
+    from helper.ask.retrieve import _candidate_pass
+
+    _make_entity("e-stale", "废弃概念", "已被替换的旧概念", superseded=True)
+    hits = _candidate_pass({"废弃", "概念"})
+    refs = {h.ref for h in hits}
+    assert "e-stale" not in refs
+
+
 # ---------- 集成: retrieve_relevant 整体行为 ----------
 
 def test_retrieve_relevant_filters_old_value_after_supersede(db, settings, make_raw, tmp_path):
