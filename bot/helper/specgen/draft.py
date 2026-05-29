@@ -130,6 +130,13 @@ def draft_spec_from_cluster(cluster_keys: list[tuple[int, int]]) -> SpecCandidat
         )
         s.add(row)
         s.commit()
+        # spec candidate 也进 FTS — review 前 retrieve 也能召到草稿,不只是 git 落了的
+        try:
+            from helper.storage import fts
+            fts.index_spec(s, row.slug)
+        except Exception:  # noqa: BLE001
+            log.exception("fts.index_spec failed slug=%s", row.slug)
+        s.commit()
         return s.get(SpecCandidate, row.id)
 
 

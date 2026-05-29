@@ -50,6 +50,24 @@ def _ensure_vec_table(engine: Engine) -> None:
         )
 
 
+def _ensure_fts_table(engine: Engine) -> None:
+    """fts5 虚拟表 fts_items(text, kind UNINDEXED, ref UNINDEXED)。
+
+    词面召回:Jaccard 全表扫在 1000+ 篇 / 几万 raw 时秒级,换 fts5 + bm25。
+    分词在 Python 端用 jieba 做完(中文分词比 sqlite 内建 tokenizer 准),
+    入库写"jieba 切完空格拼"的字符串,fts5 用 unicode61 简单分词。
+    (kind, ref) 用 UNINDEXED 标记 — 不进倒排,只作为反查键 + DELETE 谓词。
+    业务侧 supersede / delete 走 `DELETE FROM fts_items WHERE kind=? AND ref=?`。
+    """
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS fts_items "
+                "USING fts5(text, kind UNINDEXED, ref UNINDEXED, tokenize = 'unicode61')"
+            )
+        )
+
+
 def init_engine(db_path: Path) -> Engine:
     """建库 + 建表 + 轻量补列。重复调用安全。
 
@@ -65,6 +83,7 @@ def init_engine(db_path: Path) -> Engine:
     _backfill_missing_columns(_engine)
     _backfill_missing_indexes(_engine)
     _ensure_vec_table(_engine)
+    _ensure_fts_table(_engine)
     _SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False, future=True)
     return _engine
 

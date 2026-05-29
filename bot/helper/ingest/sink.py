@@ -107,12 +107,17 @@ def process_raw(raw_id: int, *, force: bool = False) -> L1Result | None:
             raw = s.get(RawInput, raw_id)
             if raw is not None:
                 raw.processed = True
-            # 顺手把 raw 入向量索引(失败 log + 跳过,不阻塞主流程)
+            # 顺手把 raw 入向量索引 + FTS 词面索引(失败 log + 跳过,不阻塞主流程)
             try:
                 from helper.storage import vector as vec
                 vec.index_raw(s, raw_id)
             except Exception:  # noqa: BLE001
                 log.exception("index_raw failed raw_id=%s", raw_id)
+            try:
+                from helper.storage import fts
+                fts.index_raw(s, raw_id)
+            except Exception:  # noqa: BLE001
+                log.exception("fts.index_raw failed raw_id=%s", raw_id)
         s.commit()
 
     # L1 成功 → 串接 4 个候选 consumer(各自独立 session,失败互不影响)

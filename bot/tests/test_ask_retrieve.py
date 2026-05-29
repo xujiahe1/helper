@@ -91,24 +91,36 @@ def test_superseded_handles_spec_field_name(db, settings):
     assert 300 in skip
 
 
-# ---------- _candidate_pass:未晋升候选直接召回 ----------
+# ---------- _fts_pass:FTS5 + jieba 召回(M7 起替代 _candidate_pass) ----------
 
-def test_candidate_pass_picks_up_alive_fact(db, settings):
-    """未晋升、未 superseded 的 fact 也能被 ask 召回。"""
-    from helper.ask.retrieve import _candidate_pass
+def test_fts_pass_picks_up_alive_fact(db, settings):
+    """未晋升、未 superseded 的 fact 写完 fts 后能被 _fts_pass 召回。"""
+    from helper.ask.retrieve import _fts_pass
+    from helper.storage import fts, session
 
     _make_fact("f-port", "Helper", "生产端口", "8009", [[1, 0]], superseded=False)
-    hits = _candidate_pass({"helper", "生产端口"})
+    with session() as s:
+        fts.index_fact(s, "f-port")
+
+    hits = _fts_pass("Helper 生产端口", set())
     refs = {(h.type, h.ref) for h in hits}
     assert ("fact", "f-port") in refs
 
 
-def test_candidate_pass_skips_superseded_fact(db, settings):
-    """superseded fact 不进 _candidate_pass。"""
-    from helper.ask.retrieve import _candidate_pass
+def test_fts_pass_skips_superseded_fact(db, settings):
+    """fact superseded → _hydrate_fts_hits 反查时按 superseded_at 过滤掉。
+
+    注意:_supersede_target 走代码路径会清 fts;但本测直接造数据没走那条路,
+    所以模拟"fts 还有但候选已 superseded"的旧脏状态,验证反查侧仍能拦下。
+    """
+    from helper.ask.retrieve import _fts_pass
+    from helper.storage import fts, session
 
     _make_fact("f-stale", "Helper", "生产端口", "8001", [[1, 0]], superseded=True)
-    hits = _candidate_pass({"helper", "生产端口"})
+    with session() as s:
+        fts.index_fact(s, "f-stale")  # 故意写进 fts 模拟脏数据
+
+    hits = _fts_pass("Helper 生产端口", set())
     refs = {h.ref for h in hits}
     assert "f-stale" not in refs
 
@@ -129,26 +141,29 @@ def _make_entity(slug: str, name: str, description: str, *, superseded: bool = F
         s.add(ec)
 
 
-def test_candidate_pass_picks_up_alive_entity(db, settings):
-    """回归:未晋升、未 superseded 的 entity(concept)也要能被 ask 召回。
-
-    历史 bug:_candidate_pass 漏扫 EntityCandidate,导致单文档抽出的 concept 类
-    原子(如"加黑规则组")mention=1 进不了 bundle、候选路径又不扫,完全不可达。
-    """
-    from helper.ask.retrieve import _candidate_pass
+def test_fts_pass_picks_up_alive_entity(db, settings):
+    """回归:未晋升、未 superseded 的 entity 写完 fts 后也能被 ask 召回。"""
+    from helper.ask.retrieve import _fts_pass
+    from helper.storage import fts, session
 
     _make_entity("加黑规则组", "加黑规则组", "仅可配置主体不可见客体的规则组")
-    hits = _candidate_pass({"加黑", "黑规", "规则", "则组"})
+    with session() as s:
+        fts.index_entity(s, "加黑规则组")
+
+    hits = _fts_pass("加黑规则组 是什么", set())
     refs = {(h.type, h.ref) for h in hits}
     assert ("entity", "加黑规则组") in refs
 
 
-def test_candidate_pass_skips_superseded_entity(db, settings):
-    """superseded entity 不进 _candidate_pass。"""
-    from helper.ask.retrieve import _candidate_pass
+def test_fts_pass_skips_superseded_entity(db, settings):
+    from helper.ask.retrieve import _fts_pass
+    from helper.storage import fts, session
 
     _make_entity("e-stale", "废弃概念", "已被替换的旧概念", superseded=True)
-    hits = _candidate_pass({"废弃", "概念"})
+    with session() as s:
+        fts.index_entity(s, "e-stale")
+
+    hits = _fts_pass("废弃概念", set())
     refs = {h.ref for h in hits}
     assert "e-stale" not in refs
 
@@ -181,6 +196,13 @@ def test_retrieve_relevant_filters_old_value_after_supersede(db, settings, make_
                [[rid_old, 0]], superseded=True)
     _make_fact("helper-port-8009", "Helper", "生产端口", "8009",
                [[rid_new, 0]], superseded=False)
+    # M7 起 retrieve 走 FTS5,直接造数据没走 consumer 也没进 fts/vec,这里手工补
+    from helper.storage import fts as _fts
+    with session() as s:
+        _fts.index_fact(s, "helper-port-8001")
+        _fts.index_fact(s, "helper-port-8009")
+        _fts.index_raw(s, rid_old)
+        _fts.index_raw(s, rid_new)
 
     hits = retrieve_relevant("Helper 生产端口是多少", top_k=20)
     objects_seen = {(h.type, h.ref) for h in hits}

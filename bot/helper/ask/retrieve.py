@@ -1,11 +1,14 @@
-"""从 bundle + sqlite 向量索引检索相关 spec / entity / raw。
+"""从 bundle + sqlite FTS5 + 向量索引检索相关 spec / entity / raw / fact / case / relation。
 
-M4 起 hybrid:
-  - 路径 A:Jaccard 词重叠(关键词召回,对低频领域名词强)
-  - 路径 B:bge-m3 向量召回(语义召回,对同义改写强)
-  - 用 RRF (Reciprocal Rank Fusion, k=60) 融合两路 rank,出 top_k
+M7 起 hybrid:
+  - 路径 A:bundle 内存 Jaccard(几十~几百条 spec/entity 摘要,直接全扫便宜)
+  - 路径 B:FTS5 + jieba 词面召回(raw / 4 类候选表;替换原 Jaccard 全扫)
+  - 路径 C:bge-m3 向量召回(对同义改写强;raw + 已晋升 spec/entity/fact/case/relation)
+  - 用 RRF (Reciprocal Rank Fusion, k=60) 融合所有路 rank,出 top_k
 
-向量召回失败(Athenai 抖动 / embed_index 没配)→ 自动降级只走 Jaccard,不抛错。
+向量 / FTS 失败 → 各自路径降级返空,其余路仍正常工作。
+为啥 bundle 还走 Jaccard:bundle 是已编译的小集合(内存),走 FTS 反而要先 jieba 切词
+再 sqlite 一趟,得不偿失。
 """
 
 from __future__ import annotations
@@ -19,13 +22,11 @@ import json as _json_top
 from sqlalchemy import select
 
 from helper.compiler import load_bundle
-from helper.storage import session, vector
+from helper.storage import fts, session, vector
 from helper.storage.models import (
     CaseCandidate,
     EntityCandidate,
     FactCandidate,
-    L1Item,
-    L1Result,
     RawInput,
     RelationCandidate,
     SpecCandidate,
@@ -36,6 +37,7 @@ log = logging.getLogger(__name__)
 RRF_K = 60  # RRF 论文默认值,大于命中数即可
 JACCARD_TOP_K = 30
 VECTOR_TOP_K = 30
+FTS_TOP_K = 30
 
 
 @dataclass
@@ -152,197 +154,217 @@ def _superseded_raw_ids() -> set[int]:
     return superseded - alive
 
 
-# ---------- 候选表直接召回(未晋升的也能被 ask 用) ----------
+# ---------- FTS 路径(raw + 5 类候选,替代旧 Jaccard 全扫) ----------
 
 
-def _candidate_pass(qtoks: set[str]) -> list[Hit]:
-    """直接从 entity/fact/case/relation_candidates 召回。
+def _hydrate_fts_hits(
+    fts_hits: list[tuple[str, str, float]],
+    skip_raw_ids: set[int],
+) -> list[Hit]:
+    """fts.search 给的 (kind, ref, score) 反查正文,组成 Hit。
 
-    问题:bundle 只编译已晋升 (mention_count >= MIN_MENTION_TO_PROMOTE) 的候选,
-    早期 / dogfood 阶段几乎所有候选都是 mention=1 进不了 bundle,ask 看不到。
-    所以平行从候选表召回,过滤 superseded_at IS NOT NULL,与 bundle 路径用
-    (type, slug) 去重。
-
-    历史 bug:这里曾漏扫 EntityCandidate,导致单文档抽出的所有 concept 类原子
-    (如"加黑规则组"、"人见组织规则")在召回侧完全不可达 — concept 进 EntityCandidate
-    但 mention=1 不进 bundle,候选路径又不扫,两层叠加全废。
+    raw   → RawInput.content_text(过 skip)
+    spec  → 优先 bundle(已 review),没有再回 SpecCandidate
+    entity/fact/case/relation → 候选表(过滤 superseded_at)
+    bundle 命中的 spec / entity 这里也会被反查到,但 _bundle_jaccard_pass 也会出
+    同 (type, ref),由 RRF 融合层去重。
     """
+    if not fts_hits:
+        return []
+
+    # 按 kind 拆 ref 列表
+    by_kind: dict[str, list[str]] = {}
+    score_map: dict[tuple[str, str], float] = {}
+    for kind, ref, score in fts_hits:
+        if kind == "raw":
+            try:
+                if int(ref) in skip_raw_ids:
+                    continue
+            except ValueError:
+                continue
+        by_kind.setdefault(kind, []).append(ref)
+        score_map[(kind, ref)] = score
+
     out: list[Hit] = []
     with session() as s:
-        # entity
-        for ec in s.execute(
-            select(EntityCandidate).where(EntityCandidate.superseded_at.is_(None))
-        ).scalars():
-            text = " ".join([ec.name or "", ec.description or ""])
-            sc = _jaccard_score(qtoks, text)
-            if sc > 0:
+        if "raw" in by_kind:
+            ids = [int(r) for r in by_kind["raw"] if r.isdigit()]
+            if ids:
+                rows = {
+                    r.id: r for r in s.execute(
+                        select(RawInput).where(RawInput.id.in_(ids))
+                    ).scalars()
+                }
+                for ref in by_kind["raw"]:
+                    rid = int(ref) if ref.isdigit() else None
+                    if rid is None or rid not in rows:
+                        continue
+                    r = rows[rid]
+                    title = (r.content_text or "").replace("\n", " ")[:80] or f"raw#{rid}"
+                    out.append(Hit(
+                        type="raw", ref=ref, title=title,
+                        body=(r.content_text or "")[:600],
+                        score=score_map[("raw", ref)], sources=["fts"],
+                    ))
+        if "spec" in by_kind:
+            slugs = by_kind["spec"]
+            rows = {
+                sc.slug: sc for sc in s.execute(
+                    select(SpecCandidate)
+                    .where(SpecCandidate.slug.in_(slugs))
+                    .where(SpecCandidate.superseded_at.is_(None))
+                ).scalars()
+            }
+            for slug in slugs:
+                sc = rows.get(slug)
+                if sc is None:
+                    continue
                 out.append(Hit(
-                    type="entity",
-                    ref=ec.slug,
-                    title=ec.name or ec.slug,
-                    body=ec.description or "",
-                    score=sc,
-                    sources=["jaccard"],
+                    type="spec", ref=slug, title=sc.title or slug,
+                    body=(sc.statement or "") + ("\n" + sc.rationale if sc.rationale else ""),
+                    score=score_map[("spec", slug)], sources=["fts"],
                 ))
-        # fact
-        for fc in s.execute(
-            select(FactCandidate).where(FactCandidate.superseded_at.is_(None))
-        ).scalars():
-            text = " ".join([fc.subject, fc.predicate, fc.object, fc.scope or "", fc.statement or ""])
-            sc = _jaccard_score(qtoks, text)
-            if sc > 0:
+        if "entity" in by_kind:
+            slugs = by_kind["entity"]
+            rows = {
+                ec.slug: ec for ec in s.execute(
+                    select(EntityCandidate)
+                    .where(EntityCandidate.slug.in_(slugs))
+                    .where(EntityCandidate.superseded_at.is_(None))
+                ).scalars()
+            }
+            for slug in slugs:
+                ec = rows.get(slug)
+                if ec is None:
+                    continue
                 out.append(Hit(
-                    type="fact",
-                    ref=fc.slug,
+                    type="entity", ref=slug, title=ec.name or slug,
+                    body=ec.description or "",
+                    score=score_map[("entity", slug)], sources=["fts"],
+                ))
+        if "fact" in by_kind:
+            slugs = by_kind["fact"]
+            rows = {
+                fc.slug: fc for fc in s.execute(
+                    select(FactCandidate)
+                    .where(FactCandidate.slug.in_(slugs))
+                    .where(FactCandidate.superseded_at.is_(None))
+                ).scalars()
+            }
+            for slug in slugs:
+                fc = rows.get(slug)
+                if fc is None:
+                    continue
+                out.append(Hit(
+                    type="fact", ref=slug,
                     title=f"{fc.subject} {fc.predicate} {fc.object}".strip(),
                     body=fc.statement or "",
-                    score=sc,
-                    sources=["jaccard"],
+                    score=score_map[("fact", slug)], sources=["fts"],
                 ))
-        # case
-        for cc in s.execute(
-            select(CaseCandidate).where(CaseCandidate.superseded_at.is_(None))
-        ).scalars():
-            text = " ".join([cc.title or "", cc.scene or "", cc.what_happened or "", cc.outcome or ""])
-            sc = _jaccard_score(qtoks, text)
-            if sc > 0:
+        if "case" in by_kind:
+            slugs = by_kind["case"]
+            rows = {
+                cc.slug: cc for cc in s.execute(
+                    select(CaseCandidate)
+                    .where(CaseCandidate.slug.in_(slugs))
+                    .where(CaseCandidate.superseded_at.is_(None))
+                ).scalars()
+            }
+            for slug in slugs:
+                cc = rows.get(slug)
+                if cc is None:
+                    continue
                 out.append(Hit(
-                    type="case",
-                    ref=cc.slug,
-                    title=cc.title or cc.slug,
+                    type="case", ref=slug, title=cc.title or slug,
                     body=(cc.what_happened or "") + " | " + (cc.outcome or ""),
-                    score=sc,
-                    sources=["jaccard"],
+                    score=score_map[("case", slug)], sources=["fts"],
                 ))
-        # relation
-        for rc in s.execute(
-            select(RelationCandidate).where(RelationCandidate.superseded_at.is_(None))
-        ).scalars():
-            text = " ".join([rc.entity_a, rc.relation, rc.entity_b, rc.description or ""])
-            sc = _jaccard_score(qtoks, text)
-            if sc > 0:
+        if "relation" in by_kind:
+            slugs = by_kind["relation"]
+            rows = {
+                rc.slug: rc for rc in s.execute(
+                    select(RelationCandidate)
+                    .where(RelationCandidate.slug.in_(slugs))
+                    .where(RelationCandidate.superseded_at.is_(None))
+                ).scalars()
+            }
+            for slug in slugs:
+                rc = rows.get(slug)
+                if rc is None:
+                    continue
                 out.append(Hit(
-                    type="relation",
-                    ref=rc.slug,
+                    type="relation", ref=slug,
                     title=f"{rc.entity_a} —[{rc.relation}]→ {rc.entity_b}",
                     body=rc.description or "",
-                    score=sc,
-                    sources=["jaccard"],
+                    score=score_map[("relation", slug)], sources=["fts"],
                 ))
     return out
 
 
-# ---------- Jaccard 路径 ----------
+def _fts_pass(question: str, skip_raw_ids: set[int]) -> list[Hit]:
+    """FTS5 + jieba 词面召回,覆盖 raw + 5 类候选。"""
+    try:
+        with session() as s:
+            hits = fts.search(s, query=question, top_k=FTS_TOP_K)
+    except Exception as e:  # noqa: BLE001
+        log.warning("fts_pass failed err=%s", e)
+        return []
+    return _hydrate_fts_hits(hits, skip_raw_ids)
 
-def _jaccard_pass(question: str, qtoks: set[str], skip_raw_ids: set[int]) -> list[Hit]:
-    """从 bundle 找 spec/entity/fact/case 命中,从 l1_items + raw 找 raw 命中。
-    再从候选表(未晋升)直接捞 fact/case/relation,保证早期没晋升的也能召回。
-    bundle 与候选表同 (type, slug) 时去重(bundle 优先 — 已 review 过)。
+
+# ---------- bundle 内存 Jaccard 路径(只扫已编译的小集合) ----------
+
+def _bundle_jaccard_pass(qtoks: set[str]) -> list[Hit]:
+    """bundle 是已编译的 spec/entity/fact/case 摘要(几十~几百条),内存全扫便宜。
+
+    raw / 候选表的全扫由 _fts_pass 走 FTS5(几万行规模秒级 → 毫秒级)。
     """
-    import json as _json
-
     bundle = load_bundle()
     hits: list[Hit] = []
-    seen_keys: set[tuple[str, str]] = set()
 
     for spec in bundle.get("specs", []):
-        text = " ".join([str(spec.get("title", "")), str(spec.get("_body", ""))])
-        sc = _jaccard_score(qtoks, text)
+        text_ = " ".join([str(spec.get("title", "")), str(spec.get("_body", ""))])
+        sc = _jaccard_score(qtoks, text_)
         if sc > 0:
-            ref = str(spec.get("slug", ""))
-            seen_keys.add(("spec", ref))
             hits.append(Hit(
-                type="spec",
-                ref=ref,
+                type="spec", ref=str(spec.get("slug", "")),
                 title=str(spec.get("title", "")),
                 body=str(spec.get("_body", ""))[:1000],
-                score=sc,
-                sources=["jaccard"],
+                score=sc, sources=["jaccard"],
             ))
 
     for ent in bundle.get("entities", []):
-        text = " ".join([str(ent.get("name", "")), str(ent.get("_body", ""))])
-        sc = _jaccard_score(qtoks, text)
+        text_ = " ".join([str(ent.get("name", "")), str(ent.get("_body", ""))])
+        sc = _jaccard_score(qtoks, text_)
         if sc > 0:
-            ref = str(ent.get("slug", ""))
-            seen_keys.add(("entity", ref))
             hits.append(Hit(
-                type="entity",
-                ref=ref,
+                type="entity", ref=str(ent.get("slug", "")),
                 title=str(ent.get("name", "")),
                 body=str(ent.get("_body", ""))[:600],
-                score=sc,
-                sources=["jaccard"],
+                score=sc, sources=["jaccard"],
             ))
 
     for fact in bundle.get("facts", []):
-        text = " ".join([str(fact.get("subject", "")), str(fact.get("_body", ""))])
-        sc = _jaccard_score(qtoks, text)
+        text_ = " ".join([str(fact.get("subject", "")), str(fact.get("_body", ""))])
+        sc = _jaccard_score(qtoks, text_)
         if sc > 0:
-            ref = str(fact.get("slug", ""))
-            seen_keys.add(("fact", ref))
             hits.append(Hit(
-                type="fact",
-                ref=ref,
+                type="fact", ref=str(fact.get("slug", "")),
                 title=str(fact.get("subject", "")) or str(fact.get("slug", "")),
                 body=str(fact.get("_body", ""))[:600],
-                score=sc,
-                sources=["jaccard"],
+                score=sc, sources=["jaccard"],
             ))
 
     for case in bundle.get("cases", []):
-        text = " ".join([str(case.get("title", "")), str(case.get("_body", ""))])
-        sc = _jaccard_score(qtoks, text)
+        text_ = " ".join([str(case.get("title", "")), str(case.get("_body", ""))])
+        sc = _jaccard_score(qtoks, text_)
         if sc > 0:
-            ref = str(case.get("slug", ""))
-            seen_keys.add(("case", ref))
             hits.append(Hit(
-                type="case",
-                ref=ref,
+                type="case", ref=str(case.get("slug", "")),
                 title=str(case.get("title", "")) or str(case.get("slug", "")),
                 body=str(case.get("_body", ""))[:600],
-                score=sc,
-                sources=["jaccard"],
+                score=sc, sources=["jaccard"],
             ))
-
-    # 候选表直接召回(覆盖未晋升的 fact/case/relation)
-    for h in _candidate_pass(qtoks):
-        if (h.type, h.ref) in seen_keys:
-            continue
-        seen_keys.add((h.type, h.ref))
-        hits.append(h)
-
-    # raw 命中: content_text + 它的所有 L1Item payload 拼成检索文本
-    with session() as s:
-        ok_raw_ids = [
-            r for r in s.execute(
-                select(L1Result.raw_id).where(L1Result.error == "")
-            ).scalars().all()
-            if r not in skip_raw_ids
-        ]
-        if ok_raw_ids:
-            items_by_raw: dict[int, list[str]] = {}
-            for it in s.execute(
-                select(L1Item).where(L1Item.raw_id.in_(ok_raw_ids))
-            ).scalars():
-                items_by_raw.setdefault(it.raw_id, []).append(it.payload_json or "")
-            for rid in ok_raw_ids:
-                raw = s.get(RawInput, rid)
-                if raw is None:
-                    continue
-                payload_text = " ".join(items_by_raw.get(rid, []))
-                text = (raw.content_text or "") + " " + payload_text
-                sc = _jaccard_score(qtoks, text)
-                if sc > 0:
-                    title = (raw.content_text or "").replace("\n", " ")[:80] or f"raw#{rid}"
-                    hits.append(Hit(
-                        type="raw",
-                        ref=str(rid),
-                        title=title,
-                        body=(raw.content_text or "")[:600],
-                        score=sc,
-                        sources=["jaccard"],
-                    ))
 
     hits.sort(key=lambda h: -h.score)
     return hits[:JACCARD_TOP_K]
@@ -438,36 +460,27 @@ def _vector_pass(question: str, skip_raw_ids: set[int]) -> list[Hit]:
 
 # ---------- RRF 融合 ----------
 
-def _rrf_fuse(jaccard: list[Hit], vec: list[Hit], top_k: int) -> list[Hit]:
-    """对两路 rank list 做 Reciprocal Rank Fusion。
+def _rrf_fuse(lists: list[tuple[str, list[Hit]]], top_k: int) -> list[Hit]:
+    """对 N 路 rank list 做 Reciprocal Rank Fusion。
 
+    每路:(source_name, hits)。source_name 用于补全 Hit.sources。
     rrf_score(item) = Σ over lists [ 1 / (k + rank_in_that_list) ]
     rank 从 1 开始;不在某个 list 里就不贡献。
     """
     fused: dict[tuple[str, str], Hit] = {}
     score: dict[tuple[str, str], float] = {}
 
-    for rank, h in enumerate(jaccard, start=1):
-        key = (h.type, h.ref)
-        score[key] = score.get(key, 0.0) + 1.0 / (RRF_K + rank)
-        if key not in fused:
-            fused[key] = Hit(
-                type=h.type, ref=h.ref, title=h.title, body=h.body,
-                score=0.0, sources=list(h.sources),
-            )
-        elif "jaccard" not in fused[key].sources:
-            fused[key].sources.append("jaccard")
-
-    for rank, h in enumerate(vec, start=1):
-        key = (h.type, h.ref)
-        score[key] = score.get(key, 0.0) + 1.0 / (RRF_K + rank)
-        if key not in fused:
-            fused[key] = Hit(
-                type=h.type, ref=h.ref, title=h.title, body=h.body,
-                score=0.0, sources=list(h.sources),
-            )
-        elif "vector" not in fused[key].sources:
-            fused[key].sources.append("vector")
+    for source_name, hits in lists:
+        for rank, h in enumerate(hits, start=1):
+            key = (h.type, h.ref)
+            score[key] = score.get(key, 0.0) + 1.0 / (RRF_K + rank)
+            if key not in fused:
+                fused[key] = Hit(
+                    type=h.type, ref=h.ref, title=h.title, body=h.body,
+                    score=0.0, sources=list(h.sources),
+                )
+            if source_name not in fused[key].sources:
+                fused[key].sources.append(source_name)
 
     # spec 维持"权重高"语义,fact/case 与 entity 同档,raw 略低
     for key, h in fused.items():
@@ -503,7 +516,7 @@ def _apply_feedback_weights(hits: list[Hit]) -> None:
 def retrieve_relevant(question: str, *, top_k: int = 8) -> list[Hit]:
     """对 question 做检索,返 top_k Hit。
 
-    Hybrid:Jaccard + 向量,RRF 融合;向量失败自动降级只走 Jaccard。
+    Hybrid 三路:bundle Jaccard + FTS5 + 向量;任一路失败其它路仍正常。
     最后接用户反馈加权(ReactionLog → citations → spec/raw)。
     """
     qtoks = _tokens(question)
@@ -511,21 +524,18 @@ def retrieve_relevant(question: str, *, top_k: int = 8) -> list[Hit]:
         return []
 
     skip = _superseded_raw_ids()
-    jac = _jaccard_pass(question, qtoks, skip)
+    jac = _bundle_jaccard_pass(qtoks)
+    fts_hits = _fts_pass(question, skip)
     vec = _vector_pass(question, skip)
 
-    if not vec:
-        # 向量没出活:走纯 Jaccard 旧逻辑(spec 权重 * 1.5, raw 权重 * 0.6)
-        for h in jac:
-            if h.type == "spec":
-                h.score *= 1.5
-            elif h.type == "raw":
-                h.score *= 0.6
-        _apply_feedback_weights(jac)
-        jac.sort(key=lambda h: -h.score)
-        return jac[:top_k]
+    # 三路全空 → 没东西召回
+    if not jac and not fts_hits and not vec:
+        return []
 
-    fused = _rrf_fuse(jac, vec, top_k * 4)  # 多取一些再加权重排
+    fused = _rrf_fuse(
+        [("jaccard", jac), ("fts", fts_hits), ("vector", vec)],
+        top_k * 4,
+    )
     _apply_feedback_weights(fused)
     fused.sort(key=lambda h: -h.score)
     return fused[:top_k]

@@ -97,6 +97,14 @@ def consume_relation_items(raw_id: int) -> list[RelationCandidate]:
                     existing.description = description
                 out.append(existing)
         s.commit()
+        for row in out:
+            try:
+                from helper.storage import fts, vector as _vec
+                fts.index_relation(s, row.slug)
+                _vec.index_relation(s, row.slug)
+            except Exception:  # noqa: BLE001
+                log.exception("index relation failed slug=%s", row.slug)
+        s.commit()
         return [s.get(RelationCandidate, e.id) for e in out if e.id is not None]
 
 

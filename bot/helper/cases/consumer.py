@@ -88,4 +88,12 @@ def consume_case_items(raw_id: int) -> list[CaseCandidate]:
                     existing.referenced_spec = referenced_spec
                 out.append(existing)
         s.commit()
+        for row in out:
+            try:
+                from helper.storage import fts, vector as _vec
+                fts.index_case(s, row.slug)
+                _vec.index_case(s, row.slug)
+            except Exception:  # noqa: BLE001
+                log.exception("index case failed slug=%s", row.slug)
+        s.commit()
         return [s.get(CaseCandidate, e.id) for e in out if e.id is not None]

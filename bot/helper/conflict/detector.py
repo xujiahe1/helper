@@ -220,8 +220,16 @@ def _decide_resolution(judged: dict) -> tuple[str, str]:
 # ---------- 入库 + supersede ----------
 
 def _supersede_target(s, target_type: str, target_slug: str, raw_id: int) -> None:
-    """auto_superseded / superseded 都通过这里给候选打 superseded_at。"""
+    """auto_superseded / superseded 都通过这里给候选打 superseded_at。
+
+    打完同时把对应 fts/vector 索引清掉 — 否则 retrieve 仍能召回到已废弃候选。
+    fts/vec 失败仅 log,不阻塞 supersede 主流程(下次 rebuild 能补)。
+    """
     now = datetime.now(timezone.utc)
+    type_to_kind = {
+        "spec": "spec", "fact": "fact", "case": "case",
+        "concept": "entity", "relation": "relation",
+    }
     model_cls = {
         "spec": "SpecCandidate",
         "fact": "FactCandidate",
@@ -237,6 +245,14 @@ def _supersede_target(s, target_type: str, target_slug: str, raw_id: int) -> Non
     if cand is not None and cand.superseded_at is None:
         cand.superseded_at = now
         cand.superseded_by = raw_id
+        kind = type_to_kind.get(target_type)
+        if kind:
+            try:
+                from helper.storage import fts as _fts, vector as _vec
+                _fts.delete(s, kind=kind, ref=target_slug)
+                _vec.delete(s, kind=kind, ref=target_slug)
+            except Exception:  # noqa: BLE001
+                log.exception("supersede index cleanup failed kind=%s ref=%s", kind, target_slug)
 
 
 def _record_conflict(
@@ -611,6 +627,22 @@ def resolve(
                         cand.superseded_by = row.raw_id
                         if cand.git_path:
                             git_to_remove = cand.git_path
+                        # 同步清 fts/vec 索引(retrieve 才不会再召回)
+                        type_to_kind = {
+                            "spec": "spec", "fact": "fact", "case": "case",
+                            "concept": "entity", "relation": "relation",
+                        }
+                        kind = type_to_kind.get(target_type)
+                        if kind:
+                            try:
+                                from helper.storage import fts as _fts, vector as _vec
+                                _fts.delete(s, kind=kind, ref=target_slug)
+                                _vec.delete(s, kind=kind, ref=target_slug)
+                            except Exception:  # noqa: BLE001
+                                log.exception(
+                                    "resolve index cleanup failed kind=%s ref=%s",
+                                    kind, target_slug,
+                                )
         s.commit()
 
     if git_to_remove:

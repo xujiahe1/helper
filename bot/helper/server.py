@@ -195,6 +195,118 @@ def create_app() -> FastAPI:
             limit = max(1, min(limit, 500))
             return rejudge_open_conflicts(limit=limit)
 
+        @admin.post("/index/rebuild")
+        def post_index_rebuild(
+            kinds: str = "raw,spec,entity,fact,case,relation",
+            clear: bool = False,
+        ) -> dict[str, Any]:
+            """全量重建 FTS + 向量索引 — 部署 / 升级 / 排障后的"清+重灌"。
+
+            FTS:fts_items 全清后按 kind 过的活候选逐条 jieba 切词重塞。
+            向量:vector.upsert 自带 hash 比对,clear=False 时只补未索引的;
+            clear=True 时先 clear_all 再全重 embed(慢,且烧 embed quota,慎用)。
+
+            kinds 默认全跑;调用方可只指定 fact/case/relation 三个新加的。
+            """
+            from sqlalchemy import select as _select
+
+            from helper.storage import fts, session as _sess, vector as _vec
+            from helper.storage.models import (
+                CaseCandidate,
+                EntityCandidate,
+                FactCandidate,
+                L1Result,
+                RawInput,
+                RelationCandidate,
+                SpecCandidate,
+            )
+
+            wanted = {k.strip() for k in kinds.split(",") if k.strip()}
+            counts: dict[str, int] = {k: 0 for k in wanted}
+
+            with _sess() as s:
+                if clear:
+                    fts.clear_all(s)
+                    if "raw" in wanted or any(
+                        k in wanted for k in ("spec", "entity", "fact", "case", "relation")
+                    ):
+                        _vec.clear_all(s)
+
+            if "raw" in wanted:
+                with _sess() as s:
+                    raw_ids = s.execute(
+                        _select(RawInput.id)
+                        .join(L1Result, L1Result.raw_id == RawInput.id)
+                        .where(L1Result.error == "")
+                    ).scalars().all()
+                for rid in raw_ids:
+                    with _sess() as s:
+                        fts.index_raw(s, rid)
+                        _vec.index_raw(s, rid)
+                    counts["raw"] += 1
+
+            if "spec" in wanted:
+                with _sess() as s:
+                    slugs = s.execute(
+                        _select(SpecCandidate.slug)
+                        .where(SpecCandidate.superseded_at.is_(None))
+                    ).scalars().all()
+                for slug in slugs:
+                    with _sess() as s:
+                        fts.index_spec(s, slug)
+                        _vec.index_spec(s, slug)
+                    counts["spec"] += 1
+
+            if "entity" in wanted:
+                with _sess() as s:
+                    slugs = s.execute(
+                        _select(EntityCandidate.slug)
+                        .where(EntityCandidate.superseded_at.is_(None))
+                    ).scalars().all()
+                for slug in slugs:
+                    with _sess() as s:
+                        fts.index_entity(s, slug)
+                        # entity 向量只在 promoted 后才进 — 这里跳过,跟 promoter 行为一致
+                    counts["entity"] += 1
+
+            if "fact" in wanted:
+                with _sess() as s:
+                    slugs = s.execute(
+                        _select(FactCandidate.slug)
+                        .where(FactCandidate.superseded_at.is_(None))
+                    ).scalars().all()
+                for slug in slugs:
+                    with _sess() as s:
+                        fts.index_fact(s, slug)
+                        _vec.index_fact(s, slug)
+                    counts["fact"] += 1
+
+            if "case" in wanted:
+                with _sess() as s:
+                    slugs = s.execute(
+                        _select(CaseCandidate.slug)
+                        .where(CaseCandidate.superseded_at.is_(None))
+                    ).scalars().all()
+                for slug in slugs:
+                    with _sess() as s:
+                        fts.index_case(s, slug)
+                        _vec.index_case(s, slug)
+                    counts["case"] += 1
+
+            if "relation" in wanted:
+                with _sess() as s:
+                    slugs = s.execute(
+                        _select(RelationCandidate.slug)
+                        .where(RelationCandidate.superseded_at.is_(None))
+                    ).scalars().all()
+                for slug in slugs:
+                    with _sess() as s:
+                        fts.index_relation(s, slug)
+                        _vec.index_relation(s, slug)
+                    counts["relation"] += 1
+
+            return {"clear": clear, "counts": counts}
+
         @admin.post("/conflicts/{log_id}/resolve")
         def post_resolve_conflict(log_id: int, resolution: str, resolver: str = "") -> dict[str, Any]:
             from helper.conflict import resolve

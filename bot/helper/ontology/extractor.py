@@ -87,4 +87,11 @@ def consume_concept_items(raw_id: int) -> list[EntityCandidate]:
                     existing.description = desc
                 out.append(existing)
         s.commit()
+        for row in out:
+            try:
+                from helper.storage import fts
+                fts.index_entity(s, row.slug)
+            except Exception:  # noqa: BLE001
+                log.exception("fts.index_entity failed slug=%s", row.slug)
+        s.commit()
         return [s.get(EntityCandidate, e.id) for e in out if e.id is not None]

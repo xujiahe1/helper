@@ -93,4 +93,12 @@ def consume_fact_items(raw_id: int) -> list[FactCandidate]:
                     existing.scope = scope
                 out.append(existing)
         s.commit()
+        for row in out:
+            try:
+                from helper.storage import fts, vector as _vec
+                fts.index_fact(s, row.slug)
+                _vec.index_fact(s, row.slug)
+            except Exception:  # noqa: BLE001
+                log.exception("index fact failed slug=%s", row.slug)
+        s.commit()
         return [s.get(FactCandidate, e.id) for e in out if e.id is not None]
