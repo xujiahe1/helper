@@ -446,24 +446,37 @@ def resolve(
         if resolution == "superseded":
             target_type = row.target_type or "spec"
             target_slug = row.target_slug
-            model_cls = {
-                "spec": "SpecCandidate",
-                "fact": "FactCandidate",
-                "case": "CaseCandidate",
-                "concept": "EntityCandidate",
-                "relation": "RelationCandidate",
-            }.get(target_type)
-            if model_cls is not None:
-                from helper.storage import models as _m
-                cls = getattr(_m, model_cls)
-                cand = s.execute(
-                    select(cls).where(cls.slug == target_slug)
-                ).scalar_one_or_none()
-                if cand is not None and cand.superseded_at is None:
-                    cand.superseded_at = now
-                    cand.superseded_by = row.raw_id
-                    if cand.git_path:
-                        git_to_remove = cand.git_path
+            if target_type == "memory":
+                # memory 没有 slug,target_slug 存的是 memory.id
+                from helper.storage.models import Memory
+                try:
+                    mem_id = int(target_slug)
+                except (ValueError, TypeError):
+                    mem_id = 0
+                if mem_id:
+                    mem = s.get(Memory, mem_id)
+                    if mem is not None and mem.superseded_at is None:
+                        mem.superseded_at = now
+                        mem.superseded_by = row.raw_id
+            else:
+                model_cls = {
+                    "spec": "SpecCandidate",
+                    "fact": "FactCandidate",
+                    "case": "CaseCandidate",
+                    "concept": "EntityCandidate",
+                    "relation": "RelationCandidate",
+                }.get(target_type)
+                if model_cls is not None:
+                    from helper.storage import models as _m
+                    cls = getattr(_m, model_cls)
+                    cand = s.execute(
+                        select(cls).where(cls.slug == target_slug)
+                    ).scalar_one_or_none()
+                    if cand is not None and cand.superseded_at is None:
+                        cand.superseded_at = now
+                        cand.superseded_by = row.raw_id
+                        if cand.git_path:
+                            git_to_remove = cand.git_path
         s.commit()
 
     if git_to_remove:

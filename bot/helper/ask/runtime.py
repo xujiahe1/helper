@@ -142,11 +142,17 @@ def ask(
     parts.append(_format_hits(hits))
     user_msg = "\n\n".join(parts)
 
+    # 用户偏好(procedural memory)— 命中 entity 的 + global 的拼进 system prompt 末尾
+    from helper.memory import directives_for_ask
+    entity_refs = [h.ref for h in hits if h.type == "entity"]
+    prefs = directives_for_ask(entity_refs=entity_refs)
+    system_prompt = SYSTEM_PROMPT + ("\n\n" + prefs if prefs else "")
+
     routing = current_routing()
     model = routing.tasks["ask"].model
 
     try:
-        reply = run("ask", system=SYSTEM_PROMPT, user=user_msg, temperature=0.2)
+        reply = run("ask", system=system_prompt, user=user_msg, temperature=0.2)
     except Exception as e:  # noqa: BLE001
         log.warning("ask LLM failed: %s", e)
         return Answer(

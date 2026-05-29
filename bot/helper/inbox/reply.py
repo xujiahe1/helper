@@ -79,7 +79,7 @@ def _humanize_target(s, target_type: str, slug: str) -> str:
     """把 target_type+slug 转成给用户看的人话标签。失败回落 slug。"""
     type_label = {
         "spec": "规约", "fact": "事实", "case": "案例",
-        "concept": "概念", "relation": "关系",
+        "concept": "概念", "relation": "关系", "memory": "偏好",
     }.get(target_type, target_type)
     try:
         if target_type == "fact":
@@ -102,6 +102,17 @@ def _humanize_target(s, target_type: str, slug: str) -> str:
             row = s.execute(select(EntityCandidate).where(EntityCandidate.slug == slug)).scalar_one_or_none()
             if row is not None:
                 return f"{type_label} · {row.name}"
+        elif target_type == "memory":
+            from helper.storage.models import Memory
+            try:
+                mem_id = int(slug)
+            except (ValueError, TypeError):
+                mem_id = 0
+            if mem_id:
+                row = s.get(Memory, mem_id)
+                if row is not None:
+                    scope = f"{row.scope_ref}" if row.scope_type == "entity" else "全局"
+                    return f"{type_label} · [{scope}] {row.directive[:60]}"
     except Exception:  # noqa: BLE001
         pass
     return f"{type_label}"

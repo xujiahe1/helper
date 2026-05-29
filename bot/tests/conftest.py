@@ -93,6 +93,7 @@ def llm_stub(monkeypatch: pytest.MonkeyPatch):
         "helper.batch.ingest.run",
         "helper.im.intent.run",
         "helper.eval.replay.run",
+        "helper.memory.extract.run",
     ]
     for site in sites:
         try:

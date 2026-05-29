@@ -24,6 +24,7 @@ tasks:
   l1_structure:    { model: claude-sonnet-4-6, provider: anthropic, max_tokens: 16384 }
   synonym_judge:   { model: claude-sonnet-4-6, provider: anthropic }
   schedule_parse:  { model: claude-sonnet-4-6, provider: anthropic }
+  memory_extract:  { model: claude-sonnet-4-6, provider: anthropic }
 
   # ── L1 预筛(mini): 群聊"听"路径上,关键词没命中时让小模型快速判 yes/no ──
   # 群消息无差别全量跑 Sonnet L1 太烧;关键词预筛覆盖大头,边缘 case 让 mini 兜底。

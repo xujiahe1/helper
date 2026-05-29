@@ -357,6 +357,10 @@ async def wave_callback(
     is_message_event = extracted is not None
     is_active_target = is_at_bot or not chat_id  # 单聊 chat_id 空也视为主动目标
     if is_message_event and is_active_target:
+        # 用户正在跟 bot 说话,可能是问题也可能是指令(如"答哥别复述身份");
+        # ask 与 memory 抽取并行 — ask 答这次问题,memory 抽下次起生效。
+        from helper.memory import schedule_memory_extract
+        schedule_memory_extract(raw_id)
         schedule_ask_reply(
             raw_id=raw_id,
             text=extracted or "",

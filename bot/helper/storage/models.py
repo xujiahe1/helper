@@ -441,3 +441,29 @@ class RelationCandidate(Base):
     git_path: Mapped[str] = mapped_column(String(255), default="")
     superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class Memory(Base):
+    """Procedural memory — 用户对 bot 行为的指令(M5)。
+
+    与 5 类 semantic 原子(decision/fact/case/concept/relation)正交:
+    - 那些是"描述世界",进 retrieve 给 LLM 当素材
+    - 这个是"约束 bot 行为",进 ask 的 SYSTEM_PROMPT 当指令
+
+    全公司共享(任何人能写,后写覆盖,撤销显式触发);冲突复用 ConflictLog
+    target_type='memory' 走 inbox 周报三段式裁决,不另起机制。
+    """
+
+    __tablename__ = "memories"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scope_type: Mapped[str] = mapped_column(String(16), default="global")  # entity/global
+    scope_ref: Mapped[str] = mapped_column(String(128), default="")        # entity slug;global 时空
+    directive: Mapped[str] = mapped_column(Text)                           # 指令文本
+    source_raw_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("raw_inputs.id", ondelete="SET NULL"), nullable=True
+    )
+    author_domain: Mapped[str] = mapped_column(String(64), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 取代它的 memory id
