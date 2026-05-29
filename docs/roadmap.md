@@ -143,6 +143,59 @@ git -C var/helper/git-repo log --oneline     # init + 后续策略变更
 
 ---
 
+## Month 4 — Dogfood 打磨期(2026-05 已完成)
+
+> M1-M3 骨架交付后,2026-05-26 与用户对齐了 4 件"上线前必修"的真实问题。代码全部落地,持续在 dogfood 中修 bug。
+
+### 做
+
+| 新增 | 范围 | 状态 |
+|---|---|---|
+| 群聊上下文 + 静默回填 | @bot 时拼最近 8 条 / 1 天 user+bot 双角色;群里非 @bot 走静默 L1 + 反查身份不发回复 | ✅ `helper/storage/raw_store.format_context_block` + `wave_webhook.schedule_l1(prefilter=True)` |
+| 用户对话创建定时任务 | 自然语言 → cron → bot 复述确认 → 进程内 1min 扫;支持周报/月报/定期 ask/spec 时效提醒 | ✅ `helper/scheduler/`(parser/runner/handlers/tasks) |
+| webhook 异步队列化 | 落 raw 后立刻 return 200 ack;L1/intent/inquiry/conflict 全 fire-and-forget | ✅ `wave_webhook.wave_callback` 调度三类后台任务 |
+| 向量召回 + KM 文档导入 | bge-m3 embedding + sqlite-vec + Jaccard RRF 融合;KM 走 HTTP API → ProseMirror 渲染 → L1 | ✅ `storage/vector.py` + `im/km_ingest.py` + `im/prosemirror.py` |
+
+### Dogfood 暴露并修掉的具体问题(2026-05)
+
+- ProseMirror JSON 而非 markdown 让 L1 抽 0 atoms → 加渲染 + 长文档按 H2 切片 + JSON salvage 容错
+- max_tokens=4K 截断 LLM 输出 → 16K + 广抽取 prompt
+- Jaccard 中文按整串 token 永远 0 召回 → CJK bigram 分词
+- bge-m3 8192 token 上限被 416K JSON 顶爆 → 输入截断到 6000 字符
+- ask LLM 长回答里真实 \n 让 json.loads 失败 → strict=False
+- `_candidate_pass` 漏扫 EntityCandidate 让 concept 类原子全不可达 → 补扫
+
+### 验收
+
+- KM 文档真"学进来",ask 答得出文档里写过的内容(2026-05-29 已验证)
+- 群里被 listen 的判断进 raw_inputs,周报里能被 review
+
+---
+
+## Month 5 — Procedural Memory 层(规划中)
+
+> 现有 5 类原子(decision/fact/case/concept/relation)全是描述客观世界的 semantic memory。dogfood 暴露:用户也想"教 bot 怎么答",这条通路缺失。
+
+### 要做
+
+| 新增 | 范围 |
+|---|---|
+| Procedural memory 表 | scope(挂哪个 entity/全局)+ directive(指令文本)+ owner + created_at + superseded_at;全公司共享 |
+| Memory 抽取管线 | 与 L1 解耦,LLM 按语义识别"是描述世界,还是约束 bot 行为/口径";不靠关键词 |
+| ask 拼接路径 | 命中 entity 的 directive 拼进 SYSTEM_PROMPT 的 `## 用户偏好` 段(不进检索结果区) |
+| 冲突走周报裁决 | 复用现有 5 类原子的 conflict_log + inbox 三段式裁决;后写不直接覆盖 |
+
+### 验收
+
+- 用户在 wave 说"答哥的问题别每次复述身份",下次问相关问题 bot 真简化
+- 撤销路径:用户说"取消刚才那条" → 周报里能看到失效记录
+
+### Kill 条件
+
+- 抽取误判率 > 30%(把日常话当指令存) → LLM 边界判断不行,这条路死
+
+---
+
 ## Inbox 节奏 — 周报 vs 主动触发
 
 owner 不必等周一才看到待办。两条触发路径并存:
