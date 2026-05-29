@@ -762,5 +762,63 @@ def reindex(clear: bool, kinds: str) -> None:
         )
 
 
+@main.command("acl-backfill")
+@click.option("--max-id", type=int, default=None, help="只处理 id ≤ max_id 的 raw, 调试用")
+def acl_backfill(max_id: int | None) -> None:
+    """对所有现存 raw 跑 ACL 打标 (M8)。
+
+    新 raw 入库会自动打标; 这条命令负责对已存在的存量数据补打。
+    幂等: 重跑会覆盖上次结果。
+    """
+    from helper.acl import backfill_all
+    from helper.config import get_settings
+    from helper.storage.db import init_engine
+
+    s = get_settings()
+    init_engine(s.helper_data_dir / "helper.sqlite")
+
+    n = backfill_all(max_id=max_id)
+    click.echo(f"acl-backfill: scanned {n} raw rows")
+
+
+@main.command("acl-status")
+def acl_status() -> None:
+    """查 ACL 打标分布(每个 topic 多少 raw / atom 命中)。"""
+    from sqlalchemy import func, select
+
+    from helper.acl import current_acl
+    from helper.config import get_settings
+    from helper.storage import session
+    from helper.storage.db import init_engine
+    from helper.storage.models import (
+        CaseCandidate, EntityCandidate, FactCandidate, L1Item,
+        RawInput, RelationCandidate,
+    )
+
+    s = get_settings()
+    init_engine(s.helper_data_dir / "helper.sqlite")
+
+    acl = current_acl()
+    click.echo(f"ACL yaml version: {acl.version}")
+    click.echo(f"  default_on_uncertain: {acl.default_on_uncertain!r}")
+    click.echo(f"  topics: {[t.id for t in acl.topics]}")
+
+    with session() as sess:
+        for label, model in (
+            ("raw_inputs", RawInput),
+            ("l1_items", L1Item),
+            ("entity_candidates", EntityCandidate),
+            ("fact_candidates", FactCandidate),
+            ("case_candidates", CaseCandidate),
+            ("relation_candidates", RelationCandidate),
+        ):
+            rows = sess.execute(
+                select(model.acl_topic_id, func.count())
+                .group_by(model.acl_topic_id)
+            ).all()
+            dist = {tid or "(public)": cnt for tid, cnt in rows}
+            click.echo(f"{label}: {dist}")
+
+
 if __name__ == "__main__":
     main()

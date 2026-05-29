@@ -321,7 +321,7 @@ def test_ask_system_prompt_includes_directives(db, settings, llm_stub, stub_bund
         s.add(Memory(scope_type="global", scope_ref="", directive="回答尽量简洁"))
 
     # stub retrieve 返空 + ask 模型返简单 JSON
-    monkeypatch.setattr("helper.ask.runtime.retrieve_relevant", lambda q, top_k=8: [])
+    monkeypatch.setattr("helper.ask.runtime.retrieve_relevant", lambda q, top_k=8, asker_domain="": [])
     monkeypatch.setattr("helper.ask.runtime.current_bundle_version", lambda: "test")
     captured = {}
 

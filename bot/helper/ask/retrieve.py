@@ -513,11 +513,16 @@ def _apply_feedback_weights(hits: list[Hit]) -> None:
             h.score += delta
 
 
-def retrieve_relevant(question: str, *, top_k: int = 8) -> list[Hit]:
+def retrieve_relevant(
+    question: str, *, top_k: int = 8, asker_domain: str = ""
+) -> list[Hit]:
     """对 question 做检索,返 top_k Hit。
 
     Hybrid 三路:bundle Jaccard + FTS5 + 向量;任一路失败其它路仍正常。
     最后接用户反馈加权(ReactionLog → citations → spec/raw)。
+
+    asker_domain 非空时, 出口跑 ACL 过滤:命中 topic_acl.yaml 但 asker 不在
+    allowed_domains 的 hit 直接丢弃, LLM 看不到敏感原文。
     """
     qtoks = _tokens(question)
     if not qtoks:
@@ -538,4 +543,16 @@ def retrieve_relevant(question: str, *, top_k: int = 8) -> list[Hit]:
     )
     _apply_feedback_weights(fused)
     fused.sort(key=lambda h: -h.score)
+
+    # ACL 出口过滤:asker 看不到的 topic 全过滤,然后再切 top_k
+    if asker_domain:
+        try:
+            from helper.acl import filter_hits
+            allowed, blocked = filter_hits(asker_domain, fused)
+            if blocked:
+                log.info("acl blocked %d/%d hits for asker=%s", len(blocked), len(fused), asker_domain)
+            fused = allowed
+        except Exception:  # noqa: BLE001
+            log.exception("acl filter failed; default to allow all (caller still has deny_for_question gate)")
+
     return fused[:top_k]

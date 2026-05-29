@@ -94,6 +94,7 @@ def llm_stub(monkeypatch: pytest.MonkeyPatch):
         "helper.im.intent.run",
         "helper.eval.replay.run",
         "helper.memory.extract.run",
+        "helper.acl.tagger.run",
     ]
     for site in sites:
         try:
@@ -129,10 +130,11 @@ def retrieve_stub(monkeypatch: pytest.MonkeyPatch):
 
     hits_for_query: list[Hit] = []
 
-    def _fake_retrieve(question: str, *, top_k: int = 8) -> list[Hit]:
+    def _fake_retrieve(question: str, *, top_k: int = 8, asker_domain: str = "") -> list[Hit]:
         return list(hits_for_query)[:top_k]
 
     monkeypatch.setattr("helper.ask.retrieve.retrieve_relevant", _fake_retrieve)
+    monkeypatch.setattr("helper.ask.runtime.retrieve_relevant", _fake_retrieve)
     monkeypatch.setattr("helper.conflict.detector.retrieve_relevant", _fake_retrieve)
 
     class _Ctrl:

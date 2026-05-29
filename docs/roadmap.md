@@ -236,6 +236,57 @@ git -C var/helper/git-repo log --oneline     # init + 后续策略变更
 
 ---
 
+## Month 8 — Topic ACL 强管控层(2026-05 已落地)
+
+> 背景:M5 procedural memory 把"答哥别复述身份"这类指令做成 prompt 附加规则,
+> 但 LLM 可以被反诘 / 换皮关键词("螃蟹是哥对周婷的称谓")绕过 — 实测两次 dogfood
+> 都被同事破壁。memory 层是软约束,不能做访问控制。
+
+### 设计
+
+- **不靠关键词穷举**(用户原话:"螃蟹"就是反例,任何隐喻都漏)。
+- 改成**内容入库时 LLM 语义判定 topic** → `RawInput.acl_topic_id` 落值;5 类 atom 候选表
+  (`l1_items` / `entity_candidates` / `fact_candidates` / `case_candidates` / `relation_candidates`)
+  都加列冗余继承,retrieve 出口纯列过滤 + 不 join。
+- **两道闸**:
+  1. retrieve 出口:asker 不在 topic.allowed_domains → 带该 topic 标的 hit 全过滤
+  2. ask 入口:对 question + chat_context 也跑一次 acl_tag,命中且非白名单 → 短路返
+     deny_response(`这个话题我不知道。`),**不调主路径 LLM**
+
+### yaml 格式 — `meta/policies/topic_acl.yaml`
+
+```yaml
+version: 2026-05-29-v1
+default_on_uncertain: ""   # LLM 判不出 → 留空(对所有人可见,不强制安全侧)
+topics:
+  - id: ge
+    description: "..."     # LLM 直接吃描述判语义,不靠关键词列表
+    owner_domain: jiahe.xu
+    allowed_domains: [jiahe.xu, ting.zhou02, xiao.yang]
+    deny_response: "这个话题我不知道。"
+```
+
+owner-only 修改:走 git PR + jiahe.xu merge,鉴权天然依赖仓库权限。
+
+### 已做
+
+| 项 | 状态 |
+|---|---|
+| 6 张表加 `acl_topic_id` 列 + auto-migrate | ✅ |
+| `helper.acl` 模块(loader cache + tagger + 出口过滤 + 入口短路) | ✅ |
+| acl_tag 任务进 `llm_routing.yaml`(sonnet,1 次重试) | ✅ |
+| ingest sink hook:新 raw + 派生 atom 同步打标 | ✅ |
+| `helper acl-backfill` / `helper acl-status` CLI | ✅ |
+| memory 层"哥别复述身份"保留(白名单内的人问起仍按这条走) | ✅ |
+
+### 验收
+
+- 非白名单用户问"谁是螃蟹"→ bot 答"这个话题我不知道。",**LLM 看不到敏感原文** ⏳ 待 dogfood 二次验证
+- 白名单用户问同样问题 → 正常回答
+- 工作问题(可见性 / IAM 配置)即便提到哥的名字 → 不被 ACL 拦截
+
+---
+
 ## Inbox 节奏 — 周报 vs 主动触发
 
 owner 不必等周一才看到待办。两条触发路径并存:

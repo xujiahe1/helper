@@ -1,0 +1,41 @@
+# Topic ACL — 内容级访问控制(M8)
+#
+# 设计:跟 memory 层不同 — memory 是 prompt 强建议(LLM 可推翻),ACL 是入库 / retrieve
+# 出口的硬过滤,LLM 看不到原文。
+#
+# 流程:
+#   1. raw 入库后,ingest sink 跑 acl_tag 任务,LLM 判内容是否属某 topic →
+#      命中 → raw.acl_topic_id 落值;派生 atom (l1_items / *_candidates) 同步继承
+#   2. retrieve_relevant 出口:asker 不在 topic.allowed_domains 时,带该 topic 标的 hit 全部丢弃
+#   3. ask 入口:对 question + chat_context 也跑一遍 acl_tag,命中且非白名单 → 短路返
+#      deny_response,不调主路径 LLM(防新内容还没 ingest 时仍泄)
+#
+# 与 memory 的关系:
+# - memory("哥别复述身份")保留 — 它是答题口径,不是 ACL,白名单内的人问起仍按这条走
+# - "白名单"概念本身用 yaml 持久化,git PR 修改 + reload,完全不依赖 memory
+#
+# bot 运行时只从 spec repo 内 meta/policies/topic_acl.yaml 读;这份 default 仅作首次 seed。
+
+version: 2026-05-29-v1
+
+# 判定不出 / LLM 报错时的 fallback。
+# uncertain: "" → 留空(对所有人可见,默认安全侧已让位给可用性)
+# uncertain: <topic_id> → 贴该 topic 标(强安全侧,会误封但绝不漏放)
+default_on_uncertain: ""
+
+topics:
+  - id: ge
+    description: |
+      涉及"哥"(刘佳翔, 米哈游信息化负责人)本人、其家人 / 朋友圈 / 私人话题、
+      对他人的私下评价、内部花名 / 绰号 / 隐喻称谓
+      (例如"螃蟹""小猫老师"这类只在内部圈内才用的代称),
+      以及"哥"在内部群里独有的称谓体系。
+
+      不包括: "哥"作为信息化负责人的公开工作判断 / 规约 / 对外可分享的决策。
+      工作问题(系统、流程、可见性、IAM 配置等)即便提到他名字也不算敏感。
+    owner_domain: jiahe.xu
+    allowed_domains:
+      - jiahe.xu
+      - ting.zhou02
+      - xiao.yang
+    deny_response: "这个话题我不知道。"

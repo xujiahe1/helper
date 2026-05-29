@@ -99,10 +99,12 @@ _DEFAULTS_PACKAGE = "helper.policy.defaults"
 
 KNOWLEDGE_POLICY_FILENAME = "knowledge_policy.yaml"
 LLM_ROUTING_FILENAME = "llm_routing.yaml"
+TOPIC_ACL_FILENAME = "topic_acl.yaml"
 
 # Spec repo 内的相对路径
 KNOWLEDGE_POLICY_RELPATH = Path("meta") / "policies" / KNOWLEDGE_POLICY_FILENAME
 LLM_ROUTING_RELPATH = Path("meta") / "policies" / LLM_ROUTING_FILENAME
+TOPIC_ACL_RELPATH = Path("meta") / "policies" / TOPIC_ACL_FILENAME
 
 
 def default_policy_text(filename: str) -> str:
@@ -127,3 +129,48 @@ def load_llm_routing(spec_repo_dir: Path) -> LlmRouting:
     f = spec_repo_dir / LLM_ROUTING_RELPATH
     text = f.read_text(encoding="utf-8") if f.exists() else default_policy_text(LLM_ROUTING_FILENAME)
     return LlmRouting.model_validate(yaml.safe_load(text))
+
+
+# ────────────────────────────────────────────────────────────────
+# Topic ACL — 内容级访问控制(M8)
+# ────────────────────────────────────────────────────────────────
+
+
+class TopicAclEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    description: str
+    owner_domain: str
+    allowed_domains: list[str] = Field(default_factory=list)
+    deny_response: str = "这个话题我不知道。"
+
+
+class TopicAcl(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: str
+    default_on_uncertain: str = ""  # 空串 = 不打标(对所有人可见);非空 = topic_id
+    topics: list[TopicAclEntry] = Field(default_factory=list)
+
+    def by_id(self, topic_id: str) -> TopicAclEntry | None:
+        for t in self.topics:
+            if t.id == topic_id:
+                return t
+        return None
+
+    def is_allowed(self, asker_domain: str, topic_id: str) -> bool:
+        """asker 是否被允许看到带 topic_id 标的内容。空 topic = 公开 = 允许。"""
+        if not topic_id:
+            return True
+        entry = self.by_id(topic_id)
+        if entry is None:
+            # 标了但 yaml 里没这条 topic — 保守起见拒(yaml 改名 / 删 topic 后存量数据兜底)
+            return False
+        return asker_domain in entry.allowed_domains
+
+
+def load_topic_acl(spec_repo_dir: Path) -> TopicAcl:
+    f = spec_repo_dir / TOPIC_ACL_RELPATH
+    text = f.read_text(encoding="utf-8") if f.exists() else default_policy_text(TOPIC_ACL_FILENAME)
+    return TopicAcl.model_validate(yaml.safe_load(text))

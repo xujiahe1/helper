@@ -202,12 +202,28 @@ def ask(
     inline_context: 用户消息里附的 KM 文档(已 fetch 到正文),作为这次问答的额外素材。
         每项 {"title": str, "body": str, "source_url": str}。
     """
-    hits = retrieve_relevant(question, top_k=8)
-    parts = [f"# 用户问题\n{question}"]
-    # 群聊用 chat_id,单聊用 asker_domain 兜底,默认都拼上下文
+    # 群聊用 chat_id, 单聊用 asker_domain 兜底, 默认都拼上下文
     ctx = _format_chat_context(
         chat_id, fallback_author=asker_domain, exclude_raw_id=raw_id,
     )
+
+    # ACL 入口短路: 问题 + 历史命中受控 topic 且 asker 非白名单 → 直接拒, 不调主路径 LLM。
+    # 防"新内容还没 ingest 时仍泄"或"问题敏感但检索没召回"两种漏点。
+    try:
+        from helper.acl import deny_for_question
+        deny = deny_for_question(asker_domain, question, chat_context=ctx)
+    except Exception:  # noqa: BLE001
+        log.exception("acl deny_for_question failed; default to not deny")
+        deny = None
+    if deny is not None:
+        log.info("acl denied ask asker=%s question=%r", asker_domain, question[:80])
+        return Answer(
+            answer=deny, confidence="low",
+            bundle_version=current_bundle_version(),
+        )
+
+    hits = retrieve_relevant(question, top_k=8, asker_domain=asker_domain)
+    parts = [f"# 用户问题\n{question}"]
     if ctx:
         parts.append(ctx)
     inline = _format_inline_docs(inline_context)

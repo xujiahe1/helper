@@ -54,6 +54,12 @@ class RawInput(Base):
     # Wave 自己的会话消息 ID(om_xxx),34 字符,与回调 header.event_id 不是一回事
     wave_message_id: Mapped[str] = mapped_column(String(64), default="")
 
+    # ---- Topic ACL(M8): 内容打标, 非白名单用户问到带标的内容直接装作不知道。
+    # 空串 = 公开可见; 非空 = 命中 topic_acl.yaml 里某个 topic.id, 仅 allowed_domains 可见。
+    # 派生层(L1Item / EntityCandidate / FactCandidate / CaseCandidate / RelationCandidate)
+    # 在各自表上也冗余这一列, retrieve 阶段直接列过滤, 不 join。
+    acl_topic_id: Mapped[str] = mapped_column(String(32), default="")
+
     # 业务层去重: (chat_id, wave_message_id) 唯一。
     # 部分索引避开 web/cli 来源(wave_message_id 为空串),只对 IM 行生效。
     # 私聊 chat_id 也是空串,但 Wave msg_id 全平台唯一,(chat_id="", wave_message_id) 仍唯一。
@@ -115,6 +121,7 @@ class EntityCandidate(Base):
     git_path: Mapped[str] = mapped_column(String(255), default="")  # ontology/entities/<slug>.md
     superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 取代它的 raw_id
+    acl_topic_id: Mapped[str] = mapped_column(String(32), default="")  # 见 RawInput.acl_topic_id
 
 
 class SpecCandidate(Base):
@@ -362,6 +369,7 @@ class L1Item(Base):
     type: Mapped[str] = mapped_column(String(16))
     payload_json: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    acl_topic_id: Mapped[str] = mapped_column(String(32), default="")  # 见 RawInput.acl_topic_id
 
     __table_args__ = (
         Index("ix_l1_items_type", "type"),
@@ -392,6 +400,7 @@ class FactCandidate(Base):
     git_path: Mapped[str] = mapped_column(String(255), default="")
     superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    acl_topic_id: Mapped[str] = mapped_column(String(32), default="")  # 见 RawInput.acl_topic_id
 
 
 class CaseCandidate(Base):
@@ -418,6 +427,7 @@ class CaseCandidate(Base):
     git_path: Mapped[str] = mapped_column(String(255), default="")
     superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    acl_topic_id: Mapped[str] = mapped_column(String(32), default="")  # 见 RawInput.acl_topic_id
 
 
 class RelationCandidate(Base):
@@ -443,6 +453,7 @@ class RelationCandidate(Base):
     git_path: Mapped[str] = mapped_column(String(255), default="")
     superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    acl_topic_id: Mapped[str] = mapped_column(String(32), default="")  # 见 RawInput.acl_topic_id
 
 
 class Memory(Base):
