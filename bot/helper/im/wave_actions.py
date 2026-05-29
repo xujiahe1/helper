@@ -477,13 +477,6 @@ def _route_message_sync(
             )
             return
 
-        # unknown 兜底
-        unknown_body = "🤔 没明白你的意图,可以换个说法"
-        tracker.finish(unknown_body)
-        _persist_bot_reply(
-            text=unknown_body, receiver_domain=domain, chat_id=chat_id,
-            parent_message_id=wave_msg_id, bot_msg_id=tracker.msg_id,
-        )
     except Exception:  # noqa: BLE001
         log.exception("route message failed raw#%d", raw_id)
         tracker.fail()
