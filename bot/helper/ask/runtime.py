@@ -90,7 +90,7 @@ def _parse_json(text: str) -> dict | None:
     if start == -1 or end <= start:
         return None
     try:
-        result = json.loads(text[start : end + 1])
+        result = json.loads(text[start : end + 1], strict=False)
     except json.JSONDecodeError:
         return None
     return result if isinstance(result, dict) else None
