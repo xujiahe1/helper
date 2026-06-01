@@ -39,6 +39,9 @@ topics:
     allowed_domains:
       - ting.zhou02
       - xiao.yang
+      - yejia.xu
+      - jiahe.xu
+      - yanpeng.zhao
     deny_response: "这个话题我不知道。"
     # 出口侧硬过滤: ask 主路径生成的 answer 文本里若出现这些词且 asker 不在
     # allowed_domains, 整段答复替换为 deny_response。兜底防 LLM 凭参数知识/迂回
