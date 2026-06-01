@@ -131,7 +131,10 @@ def tag_raw(raw_id: int) -> str:
 
 def _propagate_to_candidates(raw_id: int, topic_id: str) -> None:
     """raw 命中 topic_id → 它出现在 raw_refs_json 里的所有 entity / fact / case / relation
-    候选都继承该标。raw_refs_json 是字符串,用 LIKE 模糊匹配(里面是 [1, 2] 或 [[1,0],[2,1]])。"""
+    候选都继承该标。raw_refs_json 是字符串,用 LIKE 模糊匹配(里面是 [1, 2] 或 [[1,0],[2,1]])。
+
+    标取 max: 任一 raw 命中 → 候选必标。多 raw 引用同一 entity 时, 只要有一条
+    命中 ge, 这个 entity 就归 ge — 宁可严, 不能漏。"""
     import re
 
     rid_pat = re.compile(rf"\b{raw_id}\b")
@@ -143,9 +146,7 @@ def _propagate_to_candidates(raw_id: int, topic_id: str) -> None:
             for r in rows:
                 if not rid_pat.search(r.raw_refs_json or ""):
                     continue  # LIKE 命中但不是数字边界(e.g. raw_id=1, 匹配到 12)
-                # 已有更"严格"的标(非空)就不覆盖 — 避免 1 个公开 raw 把已标的候选刷成空
-                if not r.acl_topic_id:
-                    r.acl_topic_id = topic_id
+                r.acl_topic_id = topic_id
         s.commit()
 
 
