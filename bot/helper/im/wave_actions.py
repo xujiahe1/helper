@@ -227,18 +227,21 @@ def _build_inline_context(fetched: list) -> list[dict] | None:
     return out or None
 
 
-def _run_l1_and_count(raw_id: int, *, force: bool = False) -> int:
+def _run_l1_and_count(
+    raw_id: int, *, force: bool = False, user_instruction: str = "",
+) -> int:
     """同步跑 process_raw,然后查 l1_items 统计该 raw 抽到几条原子。失败返 0。
 
     force=True: 重学路径用,强制重抽 L1(否则 sink.process_raw 会因
     L1Result.error="" 直接复用旧结果)。
+    user_instruction: 用户随文档发的取舍指令(如"只读 xxx 部分"),透传给 L1。
     """
     from helper.ingest import process_raw
     from helper.storage.models import L1Item
     from sqlalchemy import select, func
 
     try:
-        process_raw(raw_id, force=force)
+        process_raw(raw_id, force=force, user_instruction=user_instruction)
     except Exception:  # noqa: BLE001
         log.exception("process_raw failed raw#%d force=%s", raw_id, force)
         return 0
@@ -493,9 +496,19 @@ def _route_message_sync(
                     for r in fetched
                     if r.status in ("ok", "relearned") and r.raw_id
                 ]
+            # 把消息里的 KM 链接抠掉, 剩下的当 user_instruction 透给 L1
+            # (用户写"只读 xxx 部分: <link>" → 指令仅作用于本次抽取, 不入库)
+            instr = text or ""
+            for u in km_urls:
+                instr = instr.replace(u, "")
+            instr = instr.strip()
             if not targets:
                 targets = [(raw_id, False)]
-            total = sum(_run_l1_and_count(rid, force=force) for rid, force in targets)
+                instr = ""  # 普通用户消息 raw 不需要 instruction
+            total = sum(
+                _run_l1_and_count(rid, force=force, user_instruction=instr)
+                for rid, force in targets
+            )
             if total > 0:
                 judgment_body = _format_judgment_ack(fetched, total)
             else:

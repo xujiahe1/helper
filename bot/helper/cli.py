@@ -360,7 +360,11 @@ def wave_simulate(text: str, mode: str, author: str, chat_id: str, reply_to: str
     type=click.Choice(["v1", "v2"]),
     help="L1 prompt 版本。v2=section+decision,v1=旧 5 类",
 )
-def l1_dryrun(raw_id: int, version: str) -> None:
+@click.option(
+    "--instruction", "-i", default="",
+    help="模拟用户随文档发的取舍指令(如『只读 xxx 部分』),作为 ## 用户附加说明 拼到 prompt 末尾",
+)
+def l1_dryrun(raw_id: int, version: str, instruction: str) -> None:
     """对指定 raw 用指定 prompt 版本跑 L1,**只打印,不写库**。
 
     用于在切换 prompt 前对比新老抽取结果。不动 l1_items / l1_results 表。
@@ -382,9 +386,11 @@ def l1_dryrun(raw_id: int, version: str) -> None:
         title = (raw.source_ref or "")[:40]
 
     click.echo(f"raw#{raw_id} ({title}) — {len(text)} chars, prompt={version}")
+    if instruction.strip():
+        click.echo(f"用户附加说明: {instruction.strip()}")
     click.echo("=" * 60)
 
-    out = structure(text, prompt_version=version)
+    out = structure(text, prompt_version=version, user_instruction=instruction)
     if out.error:
         click.echo(f"ERROR: {out.error}")
         raise SystemExit(1)

@@ -28,7 +28,12 @@ from helper.storage.models import L1Item, L1Result, RawInput
 log = logging.getLogger(__name__)
 
 
-def process_raw(raw_id: int, *, force: bool = False) -> L1Result | None:
+def process_raw(
+    raw_id: int,
+    *,
+    force: bool = False,
+    user_instruction: str = "",
+) -> L1Result | None:
     """跑 L1 → 写 L1Result(raw 级)+ 0..N 条 L1Item(原子级)。
 
     幂等: 已有 error="" 的 L1Result 直接返回,不重跑。force=True 强制重跑。
@@ -36,6 +41,9 @@ def process_raw(raw_id: int, *, force: bool = False) -> L1Result | None:
 
     群聊 @bot 路径会拉同 chat_id 30 分钟内 ≤20 条上下文 raw 一并喂 L1,
     让 LLM 把"被 @bot 那条很短"导致的 scene/signals/rationale 缺失从上下文补齐。
+
+    user_instruction: 用户随同文档/链接发来的取舍指令(如"只读 xxx 部分")。
+    只对当次抽取生效,不入库 — 同一篇 raw 下次重抽如果用户没再说,就按全文抽。
     """
     from helper.storage import raw_store
 
@@ -78,6 +86,7 @@ def process_raw(raw_id: int, *, force: bool = False) -> L1Result | None:
         context=context_payload,
         primary_raw_id=raw_id,
         primary_speaker=primary_speaker,
+        user_instruction=user_instruction,
     )
     routing = current_routing()
     model = routing.tasks["l1_structure"].model
