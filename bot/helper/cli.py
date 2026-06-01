@@ -218,7 +218,8 @@ def raw_show(raw_id: int) -> None:
 
 @main.command("l1-backfill")
 @click.option("--limit", default=50, show_default=True, type=int, help="单次最多处理多少条")
-def l1_backfill(limit: int) -> None:
+@click.option("--force-all", is_flag=True, default=False, help="所有非 filtered 的 raw 全部用当前 prompt 版本重抽 (会跑 LLM 调用)")
+def l1_backfill(limit: int, force_all: bool) -> None:
     """对缺 L1 / L1 失败的 raw_inputs 重跑 L1。"""
     from helper.config import get_settings
     from helper.ingest import backfill_pending
@@ -226,7 +227,7 @@ def l1_backfill(limit: int) -> None:
 
     s = get_settings()
     init_engine(s.helper_data_dir / "helper.db")
-    done = backfill_pending(limit=limit)
+    done = backfill_pending(limit=limit, force_all=force_all)
     if not done:
         click.echo("nothing to backfill")
         return

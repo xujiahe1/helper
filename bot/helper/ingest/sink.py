@@ -240,23 +240,40 @@ def schedule_l1(raw_id: int, *, prefilter: bool = False) -> None:
             process_raw(raw_id)
 
 
-def backfill_pending(*, limit: int = 50) -> list[int]:
-    """扫缺 L1 / L1 失败的 raw_input,重跑。返回处理过的 raw_id 列表。"""
+def backfill_pending(*, limit: int = 50, force_all: bool = False) -> list[int]:
+    """扫缺 L1 / L1 失败的 raw_input,重跑。返回处理过的 raw_id 列表。
+
+    force_all=True: 把所有非 filtered 的 raw 全部用当前 prompt 版本重抽
+    (用于 prompt 版本翻车后批量迁移; 注意会跑 LLM 调用)。
+    """
     with session() as s:
-        missing = s.execute(
-            select(RawInput.id)
-            .outerjoin(L1Result, L1Result.raw_id == RawInput.id)
-            .where(L1Result.raw_id.is_(None))
-            .order_by(RawInput.id.desc())
-            .limit(limit)
-        ).scalars().all()
-        errored = s.execute(
-            select(L1Result.raw_id)
-            .where(L1Result.error != "")
-            .where(~L1Result.error.like("filtered:%"))
-            .limit(limit)
-        ).scalars().all()
-    todo = list(missing) + [r for r in errored if r not in missing]
+        if force_all:
+            todo = s.execute(
+                select(RawInput.id)
+                .outerjoin(L1Result, L1Result.raw_id == RawInput.id)
+                .where(
+                    (L1Result.raw_id.is_(None))
+                    | (~L1Result.error.like("filtered:%"))
+                )
+                .order_by(RawInput.id.desc())
+                .limit(limit)
+            ).scalars().all()
+            todo = list(todo)
+        else:
+            missing = s.execute(
+                select(RawInput.id)
+                .outerjoin(L1Result, L1Result.raw_id == RawInput.id)
+                .where(L1Result.raw_id.is_(None))
+                .order_by(RawInput.id.desc())
+                .limit(limit)
+            ).scalars().all()
+            errored = s.execute(
+                select(L1Result.raw_id)
+                .where(L1Result.error != "")
+                .where(~L1Result.error.like("filtered:%"))
+                .limit(limit)
+            ).scalars().all()
+            todo = list(missing) + [r for r in errored if r not in missing]
     for rid in todo:
         process_raw(rid, force=True)
     return todo
