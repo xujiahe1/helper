@@ -1,13 +1,21 @@
 """L1 抽取 — 把毛坯输入(聊天 / 文档 / 任意文本)抽成 0..N 条**知识原子**。
 
-知识原子 5 类(全平等,不预设哪类多 / 哪类必须有):
-- decision: 一次决策判断。{scene, signals[], tradeoffs[], choice, rationale}
-- fact:    决策性事实(主谓宾)。{subject, predicate, object, scope}
-- case:    具体案例 / 反例(发生过什么)。{scene, what_happened, outcome, referenced_spec?}
-- concept: 核心概念 / 实体定义。{name, entity_type, description}
-- relation: 实体间关系。{entity_a, relation, entity_b, description?}
+支持两套 prompt(v1 / v2),由 helper.config.get_settings().l1_prompt_version 决定:
 
-走 `claude-sonnet-4-6`(由 spec_repo/meta/policies/llm_routing.yaml 决定)。
+v1(legacy)— 5 类细分原子,LLM 自己判类型:
+- decision: {scene, signals[], tradeoffs[], choice, rationale}
+- fact:     {subject, predicate, object, scope}
+- case:     {scene, what_happened, outcome, referenced_spec?}
+- concept:  {name, entity_type, description}
+- relation: {entity_a, relation, entity_b, description?}
+
+v2(default)— 二分:section 主力 + decision 兜叙事:
+- section:  {title, body, topics[], entities[], scope?}  ← 语义独立单元,原文保留
+- decision: 同 v1
+v2 设计动机:实测发现 fact / concept / relation 边界对 LLM 不稳定,
+            把成体系的内容(表格 / 清单 / 映射)拆碎反而丢集合性。
+
+两套 prompt 共存,SECTION 与 5 类合法值并行接受。新 raw 默认走 v2。
 """
 
 from __future__ import annotations
@@ -22,7 +30,7 @@ from helper.llm import run
 
 log = logging.getLogger(__name__)
 
-ALLOWED_TYPES = {"decision", "fact", "case", "concept", "relation"}
+ALLOWED_TYPES = {"decision", "fact", "case", "concept", "relation", "section"}
 
 
 @dataclass
@@ -44,6 +52,55 @@ class L1Output:
     @property
     def ok(self) -> bool:
         return not self.error
+
+
+SYSTEM_PROMPT_V2 = """你是知识切片器。把输入文本切成「语义独立单元」,每条归到 section 或 decision。
+
+【独立单元怎么判 — 核心原则】
+- 单独拿出来能自洽表达一件完整的事
+- 删掉它,其他段的理解不受影响 — 互相独立
+- 表格、清单、映射、对照 — 作为整体单元保留,**绝不拆**
+  (集合性是语义的一部分,把"9 类员工属性"拆成 9 条会彻底丢失"这是一份完整清单"的事实)
+- 连贯的论证、推导、举例链 — 作为整体单元保留,不拆
+
+【两类原子】
+1. section(主力)— 普通的语义段落
+   字段:
+     title:    一句话概括这段在讲什么(原文有小标题就用原文标题)
+     body:     **原文完整保留**,不改写、不总结、不拆条、不省略
+     topics:   3-5 个关键词,用于检索召回(如 ["员工属性", "LML", "回流"])
+     entities: 段内出现的关键实体名(术语 / 系统 / 人 / 公司),0-N 个
+     scope:    上一级章节标题(可空)
+
+2. decision — 仅当一段明确是「为什么这么做」(场景→选项→选择→理由)时
+   字段(同传统 decision):
+     scene:      决策场景
+     signals:    支撑判断的信号(数组)
+     tradeoffs:  考虑过的取舍(数组)
+     choice:     最终选择
+     rationale:  理由
+     source_raw_ids / primary_raw_id / decision_speaker / rationale_speaker(群聊场景填,否则可空)
+   注意:decision 不替代 section — 同一段如果既包含决策又包含其他陈述内容,
+   decision 抽出来的同时,**原段落仍以 section 形式保留**(让"是什么"和"为什么"都在)。
+
+【参考值,不是硬约束】
+- 一段 ~1000 字是常态。超过时回头看一下是不是合并了两件事
+- 但语义上确属一件事(大表 / 长清单 / 完整论证)就保留整体,不强切
+- 文档的章节结构是「线索」(作者认为这里是边界),通常跟语义边界重合 —
+  但不要为了「切在章节边界」而把一件事拆成两段,
+  也不要为了「不切章节」而把两件事合一段
+
+【输入形态】
+A) 一段独立文本(文档 / 长消息) — 直接切。
+B) 群聊 @bot 触发,带 ## 上下文 + ## 主消息 两块 —
+   主消息很短,需要从上下文补齐 scene/signals/rationale。
+   群聊场景下 decision 必填 source_raw_ids(主 + 上下文)+ primary_raw_id + decision_speaker。
+
+【硬性要求】
+- 只切文本里直接出现的内容,不编造
+- body 必须从原文逐字抄录(可省略明显的格式噪音如多余空行,但不允许改写或概括)
+- 输出 JSON 数组。每元素 {"type": "section" | "decision", ...该 type 字段}
+- 直接输出 JSON,不要解释、不要代码块。空文本 → []"""
 
 
 SYSTEM_PROMPT = """你是知识原子抽取器。给你一段任意文本(可能是聊天片段,也可能是规章文档),
@@ -215,12 +272,30 @@ def _chunk_by_size(text: str, max_chars: int) -> list[str]:
     return out
 
 
+def _resolve_system_prompt(version: str | None) -> str:
+    """version=None 时读 settings.l1_prompt_version。未知值回落 v1 + warning。"""
+    if version is None:
+        try:
+            from helper.config import get_settings
+            version = get_settings().l1_prompt_version
+        except Exception:  # noqa: BLE001
+            version = "v1"
+    if version == "v2":
+        return SYSTEM_PROMPT_V2
+    if version != "v1":
+        log.warning("unknown l1_prompt_version=%r, falling back to v1", version)
+    return SYSTEM_PROMPT
+
+
 def _structure_one_chunk(
     user_prompt: str,
+    *,
+    prompt_version: str | None = None,
 ) -> tuple[list[L1Item], str]:
     """单次 LLM 调用 — 返回 (items, error)。"""
+    system = _resolve_system_prompt(prompt_version)
     try:
-        reply = run("l1_structure", system=SYSTEM_PROMPT, user=user_prompt, temperature=0)
+        reply = run("l1_structure", system=system, user=user_prompt, temperature=0)
     except Exception as e:  # noqa: BLE001
         return [], f"LLM call failed: {type(e).__name__}: {e}"
 
@@ -247,6 +322,7 @@ def structure(
     context: list[dict] | None = None,
     primary_raw_id: int | None = None,
     primary_speaker: str = "",
+    prompt_version: str | None = None,
 ) -> L1Output:
     """L1 入口。LLM/解析失败时返回 error 字段非空,不抛。
 
@@ -267,7 +343,7 @@ def structure(
             primary_raw_id=primary_raw_id,
             primary_speaker=primary_speaker,
         )
-        items, err = _structure_one_chunk(user_prompt)
+        items, err = _structure_one_chunk(user_prompt, prompt_version=prompt_version)
         if err and not items:
             return L1Output(raw_text=raw_text, error=err)
         return L1Output(items=items, raw_text=raw_text)
@@ -281,7 +357,7 @@ def structure(
     all_items: list[L1Item] = []
     errors: list[str] = []
     for i, chunk in enumerate(chunks):
-        items, err = _structure_one_chunk(chunk)
+        items, err = _structure_one_chunk(chunk, prompt_version=prompt_version)
         log.info("l1 chunk %d/%d: %d items, err=%s", i + 1, len(chunks), len(items), err or "ok")
         all_items.extend(items)
         if err:

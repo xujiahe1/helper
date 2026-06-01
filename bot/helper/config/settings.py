@@ -44,6 +44,10 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
+    # L1 抽取 prompt 版本。v1=5 类细分(decision/fact/case/concept/relation),
+    # v2=二分(section + decision)。dogfood 期默认 v1,v2 通过 dryrun CLI 验证后切。
+    l1_prompt_version: str = "v1"
+
     @field_validator("helper_data_dir", "helper_spec_git_dir", mode="after")
     @classmethod
     def _resolve_path(cls, v: Path) -> Path:

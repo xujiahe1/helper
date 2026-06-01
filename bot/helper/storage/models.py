@@ -349,13 +349,18 @@ class L1Result(Base):
 class L1Item(Base):
     """L1 抽取出的单条知识原子。一条 raw 出 0..N 条 L1Item。
 
-    type ∈ {decision, fact, case, concept, relation}。
-    payload_json 是 type-specific 字段:
+    type 取决于抽取所用的 prompt 版本(helper.config.l1_prompt_version):
+
+    v1(legacy)— 5 类细分:
       decision: {scene, signals[], tradeoffs[], choice, rationale}
       fact:     {subject, predicate, object, scope}
       case:     {scene, what_happened, outcome, referenced_spec?}
       concept:  {name, entity_type, description}
       relation: {entity_a, relation, entity_b}
+
+    v2(default)— 二分:
+      section:  {title, body, topics[], entities[], scope?}  ← 语义独立单元,原文保留
+      decision: 同 v1
 
     复合主键 (raw_id, idx) — 重跑 raw 时 sink 先 DELETE 同 raw_id 全部行再写,保证幂等。
     """

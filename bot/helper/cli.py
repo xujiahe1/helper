@@ -353,6 +353,56 @@ def wave_simulate(text: str, mode: str, author: str, chat_id: str, reply_to: str
     click.echo(f"\n看完整落库: helper raw-show {raw_id}")
 
 
+@main.command("l1-dryrun")
+@click.argument("raw_id", type=int)
+@click.option(
+    "--version", "-v", default="v2", show_default=True,
+    type=click.Choice(["v1", "v2"]),
+    help="L1 prompt 版本。v2=section+decision,v1=旧 5 类",
+)
+def l1_dryrun(raw_id: int, version: str) -> None:
+    """对指定 raw 用指定 prompt 版本跑 L1,**只打印,不写库**。
+
+    用于在切换 prompt 前对比新老抽取结果。不动 l1_items / l1_results 表。
+    """
+    from helper.config import get_settings
+    from helper.ingest.l1_structure import structure
+    from helper.storage import init_engine, session
+    from helper.storage.models import RawInput
+
+    s = get_settings()
+    init_engine(s.helper_data_dir / "helper.db")
+
+    with session() as sess:
+        raw = sess.get(RawInput, raw_id)
+        if raw is None:
+            click.echo(f"raw#{raw_id} 不存在")
+            raise SystemExit(1)
+        text = raw.content_text or ""
+        title = (raw.source_ref or "")[:40]
+
+    click.echo(f"raw#{raw_id} ({title}) — {len(text)} chars, prompt={version}")
+    click.echo("=" * 60)
+
+    out = structure(text, prompt_version=version)
+    if out.error:
+        click.echo(f"ERROR: {out.error}")
+        raise SystemExit(1)
+
+    by_type: dict[str, int] = {}
+    for it in out.items:
+        by_type[it.type] = by_type.get(it.type, 0) + 1
+    click.echo(f"抽出 {len(out.items)} 条: {by_type}")
+    click.echo("-" * 60)
+
+    for idx, it in enumerate(out.items):
+        click.echo(f"\n[#{idx}] {it.type}")
+        click.echo(
+            "  "
+            + json.dumps(it.payload, ensure_ascii=False, indent=2).replace("\n", "\n  ")
+        )
+
+
 @main.command("consume-l1")
 @click.argument("raw_id", type=int)
 def consume_l1(raw_id: int) -> None:
