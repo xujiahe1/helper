@@ -488,16 +488,86 @@ def _salvage_objects(text: str, array_start: int) -> list:
             log.info("l1: trailing object unclosed at offset %d, dropped", i)
             break
         chunk = text[i : j + 1]
-        try:
-            obj = json.loads(chunk)
-            if isinstance(obj, dict):
+        obj = _try_load_object(chunk)
+        if obj is not None:
+            items.append(obj)
+        else:
+            # 尝试 1 失败 → 修复字符串值里的裸双引号再试一次
+            repaired = _fix_unescaped_quotes(chunk)
+            obj = _try_load_object(repaired)
+            if obj is not None:
+                log.info("l1: object at offset %d salvaged after quote fix", i)
                 items.append(obj)
             else:
-                log.info("l1: object at offset %d not a dict (%s), skipped", i, type(obj).__name__)
-        except json.JSONDecodeError as e:
-            log.warning(
-                "l1: bad object at offset %d (%s), skipped: %.120s",
-                i, e.msg, chunk.replace("\n", " "),
-            )
+                log.warning(
+                    "l1: bad object at offset %d, even after quote fix, skipped: %.120s",
+                    i, chunk.replace("\n", " "),
+                )
         i = j + 1
     return items
+
+
+def _try_load_object(chunk: str) -> dict | None:
+    """parse 一个 {...} chunk,成功返 dict,失败返 None。"""
+    try:
+        obj = json.loads(chunk)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+    return None
+
+
+def _fix_unescaped_quotes(chunk: str) -> str:
+    """修复 LLM 在字符串值内忘记转义的裸双引号。
+
+    JSON 字符串值的边界规则: 进入字符串后(在某个 `"` 之后),下一个未转义的 `"`
+    才是结束符 — 但 LLM 经常把 body 里原文的 `"加白"` 直接写出来。
+    本函数用启发式: 在字符串内时, 如果遇到一个 `"`, 看它后面跳过空白后是否是
+    `,` / `}` / `]` 或 `:` — 如果不是,认为它是字符串内的字面量,转义成 `\\"`。
+
+    精度足够覆盖 v2 prompt 产出的对象(扁平结构, body 是字符串值, 没有嵌套对象在
+    string 之外); 复杂嵌套场景这个启发式可能误伤, 容忍度内可接受。
+    """
+    out: list[str] = []
+    n = len(chunk)
+    i = 0
+    in_str = False
+    esc = False
+    while i < n:
+        c = chunk[i]
+        if not in_str:
+            out.append(c)
+            if c == '"':
+                in_str = True
+            i += 1
+            continue
+        # 在字符串内
+        if esc:
+            out.append(c)
+            esc = False
+            i += 1
+            continue
+        if c == "\\":
+            out.append(c)
+            esc = True
+            i += 1
+            continue
+        if c != '"':
+            out.append(c)
+            i += 1
+            continue
+        # c == '"' 且非转义 — 是不是真终止符?
+        k = i + 1
+        while k < n and chunk[k] in " \t\r\n":
+            k += 1
+        if k < n and chunk[k] in ",}]:":
+            # 真终止
+            out.append('"')
+            in_str = False
+            i += 1
+        else:
+            # 假终止(字符串内的字面引号)— 转义
+            out.append('\\"')
+            i += 1
+    return "".join(out)
