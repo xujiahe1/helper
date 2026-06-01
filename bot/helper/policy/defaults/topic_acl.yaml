@@ -12,9 +12,10 @@
 #
 # 与 memory 的关系:
 # - memory("哥别复述身份")保留 — 它是答题口径,不是 ACL,白名单内的人问起仍按这条走
-# - "白名单"概念本身用 yaml 持久化,git PR 修改 + reload,完全不依赖 memory
+# - "白名单"概念本身用 yaml 持久化,完全不依赖 memory
 #
-# bot 运行时只从 spec repo 内 meta/policies/topic_acl.yaml 读;这份 default 仅作首次 seed。
+# 这份就是正式版 — ACL 是系统策略不是业务知识,不进 spec repo。
+# 改 ACL = 改这个文件 + helper 仓库 commit + 重启,跟改 SYSTEM_PROMPT 同等待遇。
 
 version: 2026-05-29-v1
 
@@ -35,7 +36,6 @@ topics:
       - "哥"作为信息化负责人的公开工作判断 / 规约 / 对外可分享的决策
       - 工作问题(系统、流程、可见性、IAM 配置等)即便提到他名字也不算敏感
       - 与"哥"无关的他人花名 / 绰号(例如"小猫老师"本身不涉及哥时不算)
-    owner_domain: jiahe.xu
     allowed_domains:
       - ting.zhou02
       - xiao.yang

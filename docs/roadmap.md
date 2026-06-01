@@ -95,9 +95,7 @@
 - `helper.acl` 模块 + acl_tag 任务接 `llm_routing.yaml`
 - 4 道闸 + 1 道兜底(详见 `runtime.md` §2.7)
 - ingest sink 同步打标 + `helper acl-backfill` / `acl-status` CLI
-- 白名单 yaml 外置 — `meta/policies/topic_acl.yaml`(spec repo,defaults 兜底);owner 改 + 重启 helper
-
-**Open**:spec repo 内的 `topic_acl.yaml` 当前缺,bot 走 defaults 兜底。要把 owner 修改流程跑通需要先把这份 yaml 提交进 spec repo。
+- 白名单 yaml 在 `bot/helper/policy/defaults/topic_acl.yaml` — **ACL 是系统策略不是业务知识,不进 spec repo**;改 yaml = 改 helper 仓库 + 重启,跟改 SYSTEM_PROMPT 同等待遇
 
 ---
 
@@ -121,7 +119,6 @@ owner 不必等周一才看到待办。两条触发并存:
 | OP-2 | 第二个领域专家是谁 — Month 3 核心验收,未启动 |
 | OP-3 | M5 撤销路径(`取消刚才那条`)还没 dogfood 验证 |
 | OP-4 | reply 父消息反查 — 当前只存 `parent_message_id` 不反查内容,实测群里大家不用 reply 语义,优先级低 |
-| OP-5 | spec repo 缺 `meta/policies/topic_acl.yaml`(M8),走 defaults 兜底 |
 
 ---
 

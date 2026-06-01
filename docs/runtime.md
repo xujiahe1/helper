@@ -171,7 +171,7 @@ Wave union_id / user_id
 | 4 | ask 入口短路(数据流) | `ask/runtime.py::deny_for_question` | 对 (question + chat_context) 跑 acl_tag,命中且非白名单 → 返 `deny_response`,**不调主路径 LLM** |
 | 5 | 出口 scrub(模型幻觉兜底) | `ask/runtime.py::scrub_output` | 主路径 answer 文本含 yaml `output_blocklist_terms` 且 asker 非白名单 → 整段替换 deny_response,兜底防 LLM 凭参数知识脑补 |
 
-代码: `bot/helper/acl/`(policy + tagger)+ `bot/helper/policy/loader.py::TopicAcl`。yaml 生效路径在 spec git repo `meta/policies/topic_acl.yaml`,缺失时 fallback 到 `bot/helper/policy/defaults/topic_acl.yaml`。owner 改 yaml + 重启 helper(进程内 cache,无热加载)。
+代码: `bot/helper/acl/`(policy + tagger)+ `bot/helper/policy/loader.py::TopicAcl`。yaml 在 `bot/helper/policy/defaults/topic_acl.yaml` — **ACL 是系统策略不是业务知识,不进 spec repo**。改 yaml = 改 helper 仓库 commit + 重启(进程内 cache,无热加载),跟改 SYSTEM_PROMPT 同等待遇。
 
 CLI: `helper acl-backfill`(批量给存量 raw 打标)/ `helper acl-status`(看白名单 / topic 分布)。
 

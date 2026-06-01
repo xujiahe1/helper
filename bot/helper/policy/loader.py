@@ -104,7 +104,7 @@ TOPIC_ACL_FILENAME = "topic_acl.yaml"
 # Spec repo 内的相对路径
 KNOWLEDGE_POLICY_RELPATH = Path("meta") / "policies" / KNOWLEDGE_POLICY_FILENAME
 LLM_ROUTING_RELPATH = Path("meta") / "policies" / LLM_ROUTING_FILENAME
-TOPIC_ACL_RELPATH = Path("meta") / "policies" / TOPIC_ACL_FILENAME
+# 注: TOPIC_ACL 不走 spec repo — 它是系统策略, 只从 defaults/ 读。
 
 
 def default_policy_text(filename: str) -> str:
@@ -141,7 +141,6 @@ class TopicAclEntry(BaseModel):
 
     id: str
     description: str
-    owner_domain: str
     allowed_domains: list[str] = Field(default_factory=list)
     deny_response: str = "这个话题我不知道。"
     # 出口侧硬过滤词: 答复正文出现任一个 + asker 不在白名单 → 整段替换为 deny_response。
@@ -172,7 +171,8 @@ class TopicAcl(BaseModel):
         return asker_domain in entry.allowed_domains
 
 
-def load_topic_acl(spec_repo_dir: Path) -> TopicAcl:
-    f = spec_repo_dir / TOPIC_ACL_RELPATH
-    text = f.read_text(encoding="utf-8") if f.exists() else default_policy_text(TOPIC_ACL_FILENAME)
-    return TopicAcl.model_validate(yaml.safe_load(text))
+def load_topic_acl(_spec_repo_dir: Path | None = None) -> TopicAcl:
+    """ACL 是系统策略不是业务知识 — 永远只读 defaults/topic_acl.yaml,
+    不走 spec repo。改 ACL = 改代码 = 走 helper 仓库 commit + 重启,跟改
+    SYSTEM_PROMPT 同等待遇。spec_repo_dir 参数保留只为向后兼容,忽略。"""
+    return TopicAcl.model_validate(yaml.safe_load(default_policy_text(TOPIC_ACL_FILENAME)))

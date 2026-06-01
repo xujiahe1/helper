@@ -6,7 +6,6 @@ import logging
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
-from helper.config import get_settings
 from helper.policy import TopicAcl, load_topic_acl
 
 if TYPE_CHECKING:
@@ -17,9 +16,8 @@ log = logging.getLogger(__name__)
 
 @lru_cache
 def current_acl() -> TopicAcl:
-    """从 spec repo 读 topic_acl.yaml,进程内 cache。"""
-    s = get_settings()
-    return load_topic_acl(s.helper_spec_git_dir)
+    """从 defaults 读 topic_acl.yaml — ACL 是系统策略,不进 spec repo。进程内 cache。"""
+    return load_topic_acl()
 
 
 def reset_acl_cache() -> None:

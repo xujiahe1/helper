@@ -17,3 +17,4 @@ bot/.env
 # 本地数据(运行时产物)
 var/
 bot/var/
+.claude/

@@ -4,7 +4,6 @@ from helper.policy.knowledge import should_decay, should_merge, should_promote
 from helper.policy.loader import (
     KNOWLEDGE_POLICY_RELPATH,
     LLM_ROUTING_RELPATH,
-    TOPIC_ACL_RELPATH,
     KnowledgePolicy,
     LlmRouting,
     TaskRouting,
@@ -20,7 +19,6 @@ from helper.policy.loader import (
 __all__ = [
     "KNOWLEDGE_POLICY_RELPATH",
     "LLM_ROUTING_RELPATH",
-    "TOPIC_ACL_RELPATH",
     "KnowledgePolicy",
     "LlmRouting",
     "TaskRouting",
