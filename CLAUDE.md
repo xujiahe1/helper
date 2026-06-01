@@ -35,7 +35,7 @@
 
 | 项 | 值 |
 |---|---|
-| 服务器 | `10.234.81.212` Ubuntu 22.04 / **2C 3.6G 40G(不可升配)** / SSH: `ssh root@10.234.81.212`(直连 root) |
+| 服务器 | `10.234.81.212` Ubuntu 22.04 / **2C 15G 40G** / SSH: `ssh root@10.234.81.212`(直连 root) |
 | Wave bot APP_ID | `cli_d172001413a848689fa9dbe1cf03eafa`(secret/aes/token 在服务器 `/etc/helper/wave.env`,root only,**不入仓库**) |
 | Wave 回调 URL | `mhynetcn://10.234.81.212:8009/callback` |
 | Wave / KM 开放平台 API | `https://open.hoyowave.com`(出站走这,服务端 app_id+app_secret 自换 access_token;KM 同 host,token 独立缓存) |

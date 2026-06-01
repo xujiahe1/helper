@@ -502,4 +502,4 @@ helper policy evaluate --version=2026.05.25-v1 --dry-run
 | 检索索引 | `vec_items` 系列(向量,1024 维 bge-m3)/ `fts_items` 系列(FTS5 + jieba) |
 | Scheduler / 反馈 | `scheduled_tasks` / `schedule_confirm` / `reaction_log` / `identity_cache` |
 
-**为什么 sqlite 不是 postgres**: 服务器内存只 3.6G,postgres baseline 太重。sqlite-vec + FTS5 应付几千~万条索引完全够。本地开发也不需要 docker。
+**为什么 sqlite 不是 postgres**: dogfood 期数据规模(几千~万条索引)用 sqlite-vec + FTS5 完全够,无需独立 DB 进程。本地开发也不需要 docker。规模上来再考虑迁移。
