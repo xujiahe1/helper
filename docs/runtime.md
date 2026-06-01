@@ -31,14 +31,12 @@
 ```yaml
 ask, elicit, code_plan:                     claude-opus-4-7   (anthropic)
 intent_classify, l1_structure, synonym_judge,
-conflict_judge, schedule_parse, memory_extract,
-acl_tag:                                    claude-sonnet-4-6 (anthropic, max_tokens=64 + 1 retry)
+conflict_judge, schedule_parse, memory_extract: claude-sonnet-4-6 (anthropic)
+acl_tag:                                    claude-sonnet-4-6 (anthropic, max_tokens=64, 1 retry, fallback default_on_uncertain)
 l1_prefilter, bulk_extract:                 qwen3.6-flash     (openai 兼容)
 embed_index:                                bge-m3            (openai 兼容,1024 维)
 rerank:                                     qwen3-rerank      (openai 兼容)
 ```
-
-> `acl_tag`(M8)频次:每条新 raw 入库 1 次 + 每次 ask 1 次。max_tokens=64 因为输出只是 topic_id(`ge` / 空串 / `UNCERTAIN`)。失败重试 1 次,仍失败 fallback 走 yaml `default_on_uncertain`(默认空,不强制安全侧)。
 
 API: 走 Athenai `https://athenai.mihoyo.com/v1/messages`(Anthropic 原生兼容)+
 `/v1/chat/completions`(OpenAI 兼容,跑 Qwen / bge-m3)。`Authorization: Bearer sk-xxx` header。
@@ -54,8 +52,7 @@ API: 走 Athenai `https://athenai.mihoyo.com/v1/messages`(Anthropic 原生兼容
 
 ### 2.1 出站(bot 调 Wave)
 
-`bot/helper/im/wave_client.py` 直连 `https://open.hoyowave.com`。`access_token` 在剩余有效期
-< 30 分钟时自动续期(KM 文档允许双 token 共存)。
+`bot/helper/im/wave_client.py` 直连 `https://open.hoyowave.com`。`access_token` 在剩余有效期 < 30 分钟时自动续期。
 
 | HTTP 接口 | 客户端方法 | 用途 |
 |---|---|---|
@@ -74,7 +71,7 @@ API: 走 Athenai `https://athenai.mihoyo.com/v1/messages`(Anthropic 原生兼容
 
 **部署形态**: bot 在 `10.234.81.212:8009` 监听 `/callback`。Wave 后台回调 URL 配 `mhynetcn://10.234.81.212:8009/callback`(`mhynetcn` = mihoyo 办公网 http scheme,我们的服务器在办公网内,**协议层合法,不需要 https / 不需要走网关反代**)。
 
-> **端口为啥是 8009 不是 8001**:`:8001` 在这台 IDC 服务器的入向被中间网络层封了(本地办公网 8001 通,服务器 IDC 8001 收不到 SYN),换 8009 后 Wave 内网出口直接握手成功(2026-05-28 验证)。新部署直接用 8009,不要再去试 8001。
+> **端口固化 8009**:服务器 IDC 入向封了 8001(收不到 SYN),8009 通,新部署直接用 8009,不要再试 8001。
 
 > 协议参考: [事件订阅概述](https://km.mihoyo.com/doc/mheo000ok1zs) · [事件办公网推送](https://km.mihoyo.com/doc/mh041f0mt47k)
 
@@ -164,47 +161,19 @@ Wave union_id / user_id
 
 ### 2.7 Topic ACL 数据流(M8)
 
-四道闸,从入库到出口逐级过滤:
+按数据流顺序 4 道闸,任一命中即生效:
 
-```
-[1. 入库打标]  raw 落 raw_inputs (acl_topic_id="")
-                    ↓ ingest sink._run_consumers
-                acl.tag_raw(raw_id) ── acl_tag LLM 判 topic_id
-                    ↓ 同步派生
-              l1_items / *_candidates 全部冗余继承同 topic_id
-                    ↓
-              落库后 retrieve 出口 / chat_context 拼装时 O(1) 列过滤
+| # | 闸 | 位置 | 行为 |
+|---|---|---|---|
+| 1 | 入库打标(数据流) | ingest sink → `acl/tagger.py::tag_raw` | LLM 判 topic_id 落 `raw_inputs.acl_topic_id`,同步派生 l1_items / 5 类候选冗余继承 |
+| 2 | retrieve 出口(数据流) | `ask/retrieve.py::filter_hits` | asker 不在 `topic.allowed_domains` → 带该 topic 标的 hit 全过滤 |
+| 3 | chat_context 过滤(数据流) | `storage/raw_store.py::format_context_block` | 拼群历史按 asker 过滤 — 防白名单连续聊后 outsider 穿插提问拿到敏感上下文 |
+| 4 | ask 入口短路(数据流) | `ask/runtime.py::deny_for_question` | 对 (question + chat_context) 跑 acl_tag,命中且非白名单 → 返 `deny_response`,**不调主路径 LLM** |
+| 5 | 出口 scrub(模型幻觉兜底) | `ask/runtime.py::scrub_output` | 主路径 answer 文本含 yaml `output_blocklist_terms` 且 asker 非白名单 → 整段替换 deny_response,兜底防 LLM 凭参数知识脑补 |
 
-[2. retrieve 出口] retrieve_relevant(question, asker_domain="alice")
-                    ↓ 三路融合后
-                filter_hits(asker_domain, hits) ── 反查每条 hit 对应表的
-                    ↓                              acl_topic_id, asker 不在
-                allowed only                       allowed_domains 整条丢
+代码: `bot/helper/acl/`(policy + tagger)+ `bot/helper/policy/loader.py::TopicAcl`。yaml 生效路径在 spec git repo `meta/policies/topic_acl.yaml`,缺失时 fallback 到 `bot/helper/policy/defaults/topic_acl.yaml`。owner 改 yaml + 重启 helper(进程内 cache,无热加载)。
 
-[3. ask 入口短路] ask(question, asker_domain="alice", chat_id="oc1")
-                    ↓ 拼 chat_context (此时已第 4 道过滤)
-                deny_for_question(asker, question, chat_context)
-                    ↓ acl_tag 跑 (question + chat_context)
-                命中且非白名单 → 返 deny_response, 不调主路径 LLM
-
-[4. chat_context 过滤] format_context_block(chat_id, asker_domain="alice")
-                    ↓ list_chat_history 拉同 chat_id 最近 16 条
-                按 asker_domain 过滤 ── 跳过 acl_topic_id != "" 且 asker 不在
-                    ↓                    allowed_domains 的 raw
-                outsider 看到的群历史 = 被 ACL 裁剪过的世界
-
-[5. 出口 scrub_output] ask 主路径生成 answer 后
-                    ↓
-                scrub_output(asker, answer_text) ── 文本含 yaml output_blocklist_terms
-                    ↓                                的词且 asker 非白名单
-                整段替换为 deny_response, 兜底防 LLM 凭参数知识脑补
-```
-
-任何一道命中即生效,后续闸不再触发。前 4 道是数据流防漏,第 5 道是模型幻觉兜底。
-
-代码: `bot/helper/acl/`(policy.py + tagger.py)+ `bot/helper/policy/loader.py::TopicAcl` + `bot/helper/policy/defaults/topic_acl.yaml`(seed)。yaml 真实生效路径在 spec git repo `meta/policies/topic_acl.yaml`,owner-only 修改靠 git PR + repo 权限。
-
-CLI: `helper acl-backfill`(批量给存量 raw 打标)/ `helper acl-status`(看当前白名单 / topic 列表)。
+CLI: `helper acl-backfill`(批量给存量 raw 打标)/ `helper acl-status`(看白名单 / topic 分布)。
 
 ---
 

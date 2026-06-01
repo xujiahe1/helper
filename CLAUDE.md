@@ -36,19 +36,12 @@
 | 项 | 值 |
 |---|---|
 | 服务器 | `10.234.81.212` Ubuntu 22.04 / **2C 3.6G 40G(不可升配)** / SSH: `ssh root@10.234.81.212`(直连 root) |
-| 域名 | `xueyuhelper.mihoyo.com` |
-| IAM SDK clientId | `9vl37yktgp0ltsk4` |
-| IAM 网关注册 | `xueyuhelper` 应用(@徐叶佳 配置),路径前缀 `/mcp-api/`,上游 `http://10.234.81.212` |
-| 应用 app_code | `APP_17764200606379741` |
 | Wave bot APP_ID | `cli_d172001413a848689fa9dbe1cf03eafa`(secret/aes/token 在服务器 `/etc/helper/wave.env`,root only,**不入仓库**) |
-| Wave 回调 URL(部署时配) | `mhynetcn://10.234.81.212:8009/callback` |
-| Wave 开放平台 API | `https://open.hoyowave.com`(出站走这,服务端 app_id+app_secret 自换 access_token) |
-| KM 开放平台 API | `https://open.hoyowave.com`(同 host,文档拉取 / 表格读取走这,凭据复用 wave 但 token 独立缓存) |
+| Wave 回调 URL | `mhynetcn://10.234.81.212:8009/callback` |
+| Wave / KM 开放平台 API | `https://open.hoyowave.com`(出站走这,服务端 app_id+app_secret 自换 access_token;KM 同 host,token 独立缓存) |
 | Athenai API | `https://athenai.mihoyo.com`(兼容 Anthropic `/v1/messages`) |
 
-> **关于 openapi-mcp**: 服务器或开发者桌面装的 `openapi-mcp` 仅供**登录用户身份**使用(给 Claude Code 之类的 desktop agent 用),**不支持服务端身份**。bot 出站发消息 / 反查域账号一律走 Wave 开放平台 HTTP API,不经 MCP。
-
-> 网关注册、IAM SDK 等上游基建不动,徐叶佳侧不需要任何处理。
+> bot 全链路 0 MCP — Wave/KM 全部走 HTTP API。服务器上的 openapi-mcp 是给登录用户身份的 desktop agent 用的,bot 不连。
 
 ---
 
