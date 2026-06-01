@@ -202,17 +202,16 @@ def _is_inbox_trigger(text: str) -> bool:
 
 
 def _build_inline_context(fetched: list) -> list[dict] | None:
-    """把 km_ingest 拉到的文档(ok 的)拼成 ask 的 inline_context。
+    """把 km_ingest 拉到的文档(ok / relearned 的)拼成 ask 的 inline_context。
 
     从 raw_inputs 取 content_text(_fetch_doc_text 已在 ingest 时存好)。
-    skipped 状态(已学过)也算进来,从 DB 重读正文。
     """
     if not fetched:
         return None
     out: list[dict] = []
     with session() as s:
         for r in fetched:
-            if r.status not in ("ok", "skipped") or not r.raw_id:
+            if r.status not in ("ok", "relearned") or not r.raw_id:
                 continue
             raw = s.get(RawInput, r.raw_id)
             if raw is None:
@@ -228,16 +227,20 @@ def _build_inline_context(fetched: list) -> list[dict] | None:
     return out or None
 
 
-def _run_l1_and_count(raw_id: int) -> int:
-    """同步跑 process_raw,然后查 l1_items 统计该 raw 抽到几条原子。失败返 0。"""
+def _run_l1_and_count(raw_id: int, *, force: bool = False) -> int:
+    """同步跑 process_raw,然后查 l1_items 统计该 raw 抽到几条原子。失败返 0。
+
+    force=True: 重学路径用,强制重抽 L1(否则 sink.process_raw 会因
+    L1Result.error="" 直接复用旧结果)。
+    """
     from helper.ingest import process_raw
     from helper.storage.models import L1Item
     from sqlalchemy import select, func
 
     try:
-        process_raw(raw_id)
+        process_raw(raw_id, force=force)
     except Exception:  # noqa: BLE001
-        log.exception("process_raw failed raw#%d", raw_id)
+        log.exception("process_raw failed raw#%d force=%s", raw_id, force)
         return 0
     with session() as s:
         return s.execute(
@@ -481,17 +484,18 @@ def _route_message_sync(
             return
 
         if intent == "judgment":
-            targets: list[int] = []
+            # ok = 新文档, relearned = 用户重发同一链接(已覆盖 content_text)→ 必须 force 重抽。
+            # 普通 raw(用户消息) raw_id 默认非 force, 走 sink 幂等。
+            targets: list[tuple[int, bool]] = []
             if fetched:
-                # ok = 这次新拉到的;skipped = 同一篇之前已经入库(raw_id 指向旧的 km_doc)。
-                # 两种都能作为 L1 抽取的对象 — 文档已经在 raw_inputs 里。
                 targets = [
-                    r.raw_id for r in fetched
-                    if r.status in ("ok", "skipped") and r.raw_id
+                    (r.raw_id, r.status == "relearned")
+                    for r in fetched
+                    if r.status in ("ok", "relearned") and r.raw_id
                 ]
             if not targets:
-                targets = [raw_id]
-            total = sum(_run_l1_and_count(rid) for rid in targets)
+                targets = [(raw_id, False)]
+            total = sum(_run_l1_and_count(rid, force=force) for rid, force in targets)
             if total > 0:
                 judgment_body = _format_judgment_ack(fetched, total)
             else:

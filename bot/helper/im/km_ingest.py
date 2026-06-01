@@ -3,7 +3,9 @@
 设计要点:
 - 整篇文档不分块,让 L1 LLM 自己从全文里抽 0..N 条多 type 知识原子
 - 仅支持 document(协同)/ markdown / spreadsheet 三类,其它类型回告"不支持"
-- 幂等: (source_type='km_doc', source_ref=enc_id[#sheet_id]) 已存在就跳过(不重新拉)
+- 重学语义: 用户重发同一 KM 链接 = 想让 bot 重新学。命中已存在 raw 时
+  重新拉文档、覆盖 content_text、返回 status='relearned',让上层 force=True
+  跑 process_raw 重抽 L1。不做内容比对 — 一次 LLM 调用成本可接受。
 - 拉文档失败 / 不支持类型 — 不入 raw,但返回结果让上层回告用户
 
 不在这里调 schedule_l1: 调度由 caller 决定(webhook 路径要排队走 llm_slot)。
@@ -42,8 +44,8 @@ class KMIngestResult:
     """单个 KM 链接的处理结果。
 
     status:
-      - ok           : 成功拉取并写入 raw_input(可能是新行,也可能是已存在的旧行)
-      - skipped      : 已经在 raw_inputs 里,跳过重新拉
+      - ok           : 新文档,首次入库
+      - relearned    : 已存在 raw, 用户重发链接 → 已覆盖 content_text, 上层走 force 重抽
       - no_permission: 应用对该文档没有可见性(retcode=10401305) — 让用户授权后重发
       - unsupported  : 文档类型不支持(spreadsheet 没传 sheetId / smart_spreadsheet / 文件 / 视频 等)
       - error        : 其它拉取失败(限流 / 网络 / KM 内部错),message 里有原因
@@ -187,26 +189,7 @@ def ingest_one(
             status="error", message="无法解析 enc_id",
         )
 
-    # 幂等检查:已经入过库就直接复用旧行
     existing = _existing_raw(enc_id, sheet_id)
-    if existing is not None:
-        # 解析旧行 attachments 里的 doc_type / title 给上层回显
-        title = ""
-        doc_type = ""
-        try:
-            atts = json.loads(existing.attachments_json or "[]")
-            if atts and isinstance(atts, list):
-                meta = atts[0]
-                if isinstance(meta, dict):
-                    title = meta.get("title") or ""
-                    doc_type = meta.get("doc_type") or ""
-        except (ValueError, TypeError):
-            pass
-        return KMIngestResult(
-            url=url, enc_id=enc_id, sheet_id=sheet_id,
-            status="skipped", raw_id=existing.id,
-            title=title, doc_type=doc_type,
-        )
 
     status, doc_type, title, text = _fetch_doc_text(enc_id, sheet_id)
     if status == "no_permission":
@@ -227,7 +210,7 @@ def ingest_one(
             message=text,
         )
 
-    # ok → 写 raw_input。attachments_json 存元信息(title / doc_type / source_url / sheet_id)
+    # 元信息(title / doc_type / source_url / sheet_id) — 新建/重学共用
     meta = {
         "source": "km",
         "source_url": url,
@@ -236,6 +219,27 @@ def ingest_one(
         "title": title,
         "doc_type": doc_type,
     }
+
+    # 重学路径: 已存在 raw → 覆盖 content_text + attachments_json,沿用旧 raw_id。
+    # 不动 created_at / chat_id / parent_message_id(那是首次发链接时的会话上下文)。
+    if existing is not None:
+        with session() as s:
+            row = s.get(RawInput, existing.id)
+            if row is not None:
+                row.content_text = text
+                row.attachments_json = json.dumps([meta], ensure_ascii=False)
+                row.media_type = doc_type
+                s.commit()
+        log.info(
+            "km_ingest relearn raw#%d enc=%s type=%s title=%r len=%d",
+            existing.id, enc_id, doc_type, title[:40], len(text),
+        )
+        return KMIngestResult(
+            url=url, enc_id=enc_id, sheet_id=sheet_id,
+            status="relearned", raw_id=existing.id, title=title, doc_type=doc_type,
+        )
+
+    # 新建路径
     with session() as s:
         row = raw_append(
             s,
@@ -302,8 +306,8 @@ def _format_one(r: KMIngestResult) -> str:
     label = (r.title or r.enc_id or "未知文档")[:60]
     if r.status == "ok":
         return f"📄 已学习《{label}》({r.doc_type}, raw#{r.raw_id})"
-    if r.status == "skipped":
-        return f"⏭️ 《{label}》已学过 (raw#{r.raw_id}),跳过"
+    if r.status == "relearned":
+        return f"🔄 《{label}》已重新学习 (raw#{r.raw_id})"
     if r.status == "no_permission":
         # 没拉到正文,title 也是空的 — 文案不带《》
         return "❌ 我没权限读这篇文档,你需要先进行授权"
