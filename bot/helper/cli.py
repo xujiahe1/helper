@@ -320,6 +320,88 @@ def l1_purge_questions(dry_run: bool, limit: int) -> None:
     click.echo(f"purged {purged} raws")
 
 
+@main.command("l1-purge-bot-replies")
+@click.option("--dry-run", is_flag=True, default=False, help="只列出要清的 raw, 不真改 DB")
+@click.option("--limit", default=500, show_default=True, type=int)
+def l1_purge_bot_replies(dry_run: bool, limit: int) -> None:
+    """一次性清 "bot 自答被 L1 抽成 section / 进 fts/vector 召回池" 的污染。
+
+    扫: source_type LIKE 'im_wave_bot%' AND (有 L1Items OR fts/vector 有 raw 索引)。
+    动作:
+      - 删 L1Item
+      - fts/vector 清 raw kind + l1 atom kind 索引
+      - L1Result.error 改成 "purged:bot_reply" (没有就建一条占位)
+      - raw 本身保留 (上下文 / 引用反查仍要用)
+
+    日常路径靠 _persist_bot_reply 写 skipped:bot_reply + 召回侧 retrieve 硬隔离
+    (im_wave_bot* 整类不进 hits) 双重保险, 这条 CLI 只针对历史脏数据。
+    """
+    from helper.config import get_settings
+    from helper.storage import fts as fts_idx
+    from helper.storage import init_engine, session
+    from helper.storage import vector as vec_idx
+    from helper.storage.models import L1Item, L1Result, RawInput
+
+    s = get_settings()
+    init_engine(s.helper_data_dir / "helper.db")
+
+    from sqlalchemy import select
+
+    with session() as sess:
+        rows = sess.execute(
+            select(RawInput.id, RawInput.content_text)
+            .where(RawInput.source_type.like("im_wave_bot%"))
+            .order_by(RawInput.id.desc())
+            .limit(limit)
+        ).all()
+
+    if not rows:
+        click.echo("no im_wave_bot raws found")
+        return
+
+    click.echo(f"found {len(rows)} im_wave_bot raws to clean indices:")
+    for rid, text in rows[:10]:
+        snip = (text or "").strip()[:60].replace("\n", " ")
+        click.echo(f"  raw#{rid}: {snip}")
+    if len(rows) > 10:
+        click.echo(f"  ... and {len(rows) - 10} more")
+
+    if dry_run:
+        click.echo("(dry-run, no changes)")
+        return
+
+    from sqlalchemy import delete as _delete
+    purged = 0
+    for rid, _text in rows:
+        with session() as sess:
+            try:
+                fts_idx.delete_l1_atoms_for_raw(sess, rid)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                vec_idx.delete_l1_atoms_for_raw(sess, rid)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                fts_idx.delete(sess, kind="raw", ref=str(rid))
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                vec_idx.delete(sess, kind="raw", ref=str(rid))
+            except Exception:  # noqa: BLE001
+                pass
+            sess.execute(_delete(L1Item).where(L1Item.raw_id == rid))
+            lr = sess.get(L1Result, rid)
+            if lr is None:
+                sess.add(L1Result(raw_id=rid, error="purged:bot_reply", model="purge"))
+            else:
+                lr.error = "purged:bot_reply"
+                lr.model = "purge"
+            sess.commit()
+        purged += 1
+    click.echo(f"purged {purged} bot reply raws")
+
+
 @main.command("wave-simulate")
 @click.argument("text")
 @click.option(

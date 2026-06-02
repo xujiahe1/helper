@@ -172,6 +172,20 @@ def _parse_l1_atom_ref(ref: str) -> tuple[int, int] | None:
     return int(parts[0]), int(parts[1])
 
 
+def _bot_reply_raw_ids(sess, raw_ids: set[int]) -> set[int]:
+    """从 raw_ids 中筛出 source_type='im_wave_bot*' 的 raw —
+    召回侧硬隔离: bot 自己的回复永远不该作为知识被引用。"""
+    if not raw_ids:
+        return set()
+    rows = sess.execute(
+        select(RawInput.id).where(
+            RawInput.id.in_(raw_ids),
+            RawInput.source_type.like("im_wave_bot%"),
+        )
+    ).scalars().all()
+    return set(rows)
+
+
 def _hydrate_l1_atoms(
     sess,
     kind: str,
@@ -185,6 +199,7 @@ def _hydrate_l1_atoms(
     section: title 当 Hit.title,body 进 Hit.body(SECTION_BODY_CAP cap)。
     decision: 拼 "scene → choice" 当 title,rationale + signals + tradeoffs 拼 body。
     raw 已在 skip 集合的全部丢弃(superseded)。
+    bot 自答抽出的 atom (源 raw 是 im_wave_bot*) 整类丢弃 — 召回硬隔离。
     """
     parsed: list[tuple[str, int, int]] = []  # (orig_ref, raw_id, idx)
     for ref in refs:
@@ -195,6 +210,13 @@ def _hydrate_l1_atoms(
         if raw_id in skip_raw_ids:
             continue
         parsed.append((ref, raw_id, idx))
+    if not parsed:
+        return []
+
+    # 反查 raw_id 的 source_type, 整类丢弃 im_wave_bot
+    bot_ids = _bot_reply_raw_ids(sess, {rid for _, rid, _ in parsed})
+    if bot_ids:
+        parsed = [(ref, rid, idx) for ref, rid, idx in parsed if rid not in bot_ids]
     if not parsed:
         return []
 
@@ -286,9 +308,13 @@ def _hydrate_fts_hits(
         if "raw" in by_kind:
             ids = [int(r) for r in by_kind["raw"] if r.isdigit()]
             if ids:
+                # 召回硬隔离: bot 自答的 raw 整类不进检索结果
                 rows = {
                     r.id: r for r in s.execute(
-                        select(RawInput).where(RawInput.id.in_(ids))
+                        select(RawInput).where(
+                            RawInput.id.in_(ids),
+                            ~RawInput.source_type.like("im_wave_bot%"),
+                        )
                     ).scalars()
                 }
                 for ref in by_kind["raw"]:
@@ -496,9 +522,13 @@ def _hydrate_vector_hits(
     raw_refs_to_fetch = [int(h.ref) for h in vec_hits if h.kind == "raw" and h.ref.isdigit()]
     raw_map: dict[int, RawInput] = {}
     if raw_refs_to_fetch:
+        # 召回硬隔离: bot 自答的 raw 整类不进检索结果
         with session() as s:
             for r in s.execute(
-                select(RawInput).where(RawInput.id.in_(raw_refs_to_fetch))
+                select(RawInput).where(
+                    RawInput.id.in_(raw_refs_to_fetch),
+                    ~RawInput.source_type.like("im_wave_bot%"),
+                )
             ).scalars():
                 raw_map[r.id] = r
 

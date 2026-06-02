@@ -273,7 +273,8 @@ def _persist_bot_reply(
     try:
         with session() as s:
             from helper.storage import raw_store
-            raw_store.append(
+            from helper.storage.models import L1Result
+            row = raw_store.append(
                 s,
                 source_type="im_wave_bot",
                 content_text=text,
@@ -282,6 +283,14 @@ def _persist_bot_reply(
                 parent_message_id=parent_message_id or "",
                 wave_message_id=bot_msg_id or "",
             )
+            # bot 自答永不该走 L1 — 落 L1Result(error=skipped:bot_reply) 占位,
+            # 防 l1-backfill --force-all 见 NULL 当成漏抽重抽 (历史污染原因)。
+            if row.id is not None and s.get(L1Result, row.id) is None:
+                s.add(L1Result(
+                    raw_id=row.id,
+                    error="skipped:bot_reply",
+                    model="bot_route",
+                ))
             s.commit()
     except Exception:  # noqa: BLE001
         log.exception("persist bot reply failed bot_msg=%s", bot_msg_id)
