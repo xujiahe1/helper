@@ -68,6 +68,7 @@ def _resolve_hit_topics(hits: list["Hit"]) -> dict[tuple[str, str], str]:
         CaseCandidate,
         EntityCandidate,
         FactCandidate,
+        L1Item,
         RawInput,
         RelationCandidate,
     )
@@ -100,6 +101,27 @@ def _resolve_hit_topics(hits: list["Hit"]) -> dict[tuple[str, str], str]:
             ).all()
             for slug, tid in rows:
                 out[(kind, slug)] = tid or ""
+
+        # section/decision: ref 形如 "raw_id:idx",用 (raw_id, idx) 复合键反查 l1_items.acl_topic_id
+        for kind in ("section", "decision"):
+            if kind not in by_type:
+                continue
+            pairs: list[tuple[int, int]] = []
+            for ref in by_type[kind]:
+                parts = ref.split(":")
+                if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                    pairs.append((int(parts[0]), int(parts[1])))
+            if not pairs:
+                continue
+            from sqlalchemy import or_, and_
+            rows = s.execute(
+                select(L1Item.raw_id, L1Item.idx, L1Item.acl_topic_id).where(
+                    L1Item.type == kind,
+                    or_(*[and_(L1Item.raw_id == rid, L1Item.idx == ix) for rid, ix in pairs]),
+                )
+            ).all()
+            for rid, ix, tid in rows:
+                out[(kind, f"{rid}:{ix}")] = tid or ""
         # spec 暂不打 ACL — bundle 里的 spec 是已晋升的"公开决策规约",不应在 ACL 范围内。
         # 如果未来需要给 spec 打标,在这里加 SpecCandidate 反查即可。
 

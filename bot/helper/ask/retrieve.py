@@ -27,6 +27,7 @@ from helper.storage.models import (
     CaseCandidate,
     EntityCandidate,
     FactCandidate,
+    L1Item,
     RawInput,
     RelationCandidate,
     SpecCandidate,
@@ -38,6 +39,10 @@ RRF_K = 60  # RRF 论文默认值,大于命中数即可
 JACCARD_TOP_K = 30
 VECTOR_TOP_K = 30
 FTS_TOP_K = 30
+
+# section/decision 是细粒度召回主力,body 直接进 LLM 上下文,放宽 cap;
+# raw 是粗粒度兜底,body 仍按 600 字 head 处理(避免长 KM 文档塞爆窗口)。
+SECTION_BODY_CAP = 1500
 
 
 @dataclass
@@ -157,6 +162,93 @@ def _superseded_raw_ids() -> set[int]:
 # ---------- FTS 路径(raw + 5 类候选,替代旧 Jaccard 全扫) ----------
 
 
+def _parse_l1_atom_ref(ref: str) -> tuple[int, int] | None:
+    """ref 形如 "215:1" → (215, 1);非法格式返 None。"""
+    parts = ref.split(":")
+    if len(parts) != 2:
+        return None
+    if not parts[0].isdigit() or not parts[1].isdigit():
+        return None
+    return int(parts[0]), int(parts[1])
+
+
+def _hydrate_l1_atoms(
+    sess,
+    kind: str,
+    refs: list[str],
+    skip_raw_ids: set[int],
+    score_map: dict[tuple[str, str], float],
+    source_name: str,
+) -> list[Hit]:
+    """从 l1_items 反查 section/decision 内容。
+
+    section: title 当 Hit.title,body 进 Hit.body(SECTION_BODY_CAP cap)。
+    decision: 拼 "scene → choice" 当 title,rationale + signals + tradeoffs 拼 body。
+    raw 已在 skip 集合的全部丢弃(superseded)。
+    """
+    parsed: list[tuple[str, int, int]] = []  # (orig_ref, raw_id, idx)
+    for ref in refs:
+        p = _parse_l1_atom_ref(ref)
+        if p is None:
+            continue
+        raw_id, idx = p
+        if raw_id in skip_raw_ids:
+            continue
+        parsed.append((ref, raw_id, idx))
+    if not parsed:
+        return []
+
+    pairs = [(rid, idx) for _, rid, idx in parsed]
+    from sqlalchemy import or_, and_
+
+    items = sess.execute(
+        select(L1Item).where(
+            L1Item.type == kind,
+            or_(*[and_(L1Item.raw_id == rid, L1Item.idx == ix) for rid, ix in pairs]),
+        )
+    ).scalars().all()
+    item_by_key = {(it.raw_id, it.idx): it for it in items}
+
+    out: list[Hit] = []
+    import json as _json
+    for ref, raw_id, idx in parsed:
+        it = item_by_key.get((raw_id, idx))
+        if it is None:
+            continue
+        try:
+            payload = _json.loads(it.payload_json or "{}")
+        except _json.JSONDecodeError:
+            continue
+        if kind == "section":
+            title = (payload.get("title") or "").strip() or f"section#{ref}"
+            body = (payload.get("body") or "").strip()
+            if len(body) > SECTION_BODY_CAP:
+                body = body[:SECTION_BODY_CAP] + "…"
+        else:  # decision
+            scene = (payload.get("scene") or "").strip()
+            choice = (payload.get("choice") or "").strip()
+            title = f"{scene} → {choice}".strip(" →") or f"decision#{ref}"
+            body_parts = []
+            if payload.get("rationale"):
+                body_parts.append(f"理由: {payload['rationale']}")
+            if payload.get("signals"):
+                sigs = payload["signals"]
+                if isinstance(sigs, list):
+                    body_parts.append("信号: " + " / ".join(str(x) for x in sigs))
+            if payload.get("tradeoffs"):
+                tos = payload["tradeoffs"]
+                if isinstance(tos, list):
+                    body_parts.append("取舍: " + " / ".join(str(x) for x in tos))
+            body = "\n".join(body_parts)
+            if len(body) > SECTION_BODY_CAP:
+                body = body[:SECTION_BODY_CAP] + "…"
+        out.append(Hit(
+            type=kind, ref=ref, title=title, body=body,
+            score=score_map[(kind, ref)], sources=[source_name],
+        ))
+    return out
+
+
 def _hydrate_fts_hits(
     fts_hits: list[tuple[str, str, float]],
     skip_raw_ids: set[int],
@@ -181,6 +273,10 @@ def _hydrate_fts_hits(
                 if int(ref) in skip_raw_ids:
                     continue
             except ValueError:
+                continue
+        elif kind in ("section", "decision"):
+            p = _parse_l1_atom_ref(ref)
+            if p is None or p[0] in skip_raw_ids:
                 continue
         by_kind.setdefault(kind, []).append(ref)
         score_map[(kind, ref)] = score
@@ -298,6 +394,14 @@ def _hydrate_fts_hits(
                     body=rc.description or "",
                     score=score_map[("relation", slug)], sources=["fts"],
                 ))
+        if "section" in by_kind:
+            out.extend(_hydrate_l1_atoms(
+                s, "section", by_kind["section"], skip_raw_ids, score_map, "fts",
+            ))
+        if "decision" in by_kind:
+            out.extend(_hydrate_l1_atoms(
+                s, "decision", by_kind["decision"], skip_raw_ids, score_map, "fts",
+            ))
     return out
 
 
@@ -372,10 +476,14 @@ def _bundle_jaccard_pass(qtoks: set[str]) -> list[Hit]:
 
 # ---------- 向量路径 ----------
 
-def _hydrate_vector_hits(vec_hits: list[vector.VectorHit]) -> list[Hit]:
-    """vec0 KNN 给的是 (kind, ref, distance);需要把对应 spec / entity / raw 的标题 + 正文取出来。
+def _hydrate_vector_hits(
+    vec_hits: list[vector.VectorHit], skip_raw_ids: set[int]
+) -> list[Hit]:
+    """vec0 KNN 给的是 (kind, ref, distance);需要把对应 spec / entity / raw / section / decision
+    的标题 + 正文取出来。
 
-    spec / entity 走 bundle(已编译好,正文可读);raw 走 sqlite 直查。
+    spec / entity 走 bundle(已编译好,正文可读);raw 走 sqlite 直查;
+    section/decision 走 l1_items 反查,与 fts 路径共用 _hydrate_l1_atoms。
     """
     if not vec_hits:
         return []
@@ -394,9 +502,17 @@ def _hydrate_vector_hits(vec_hits: list[vector.VectorHit]) -> list[Hit]:
             ).scalars():
                 raw_map[r.id] = r
 
+    # 收集 section/decision refs + 它们的 score(用于 _hydrate_l1_atoms 复用)
+    atom_refs_by_kind: dict[str, list[str]] = {"section": [], "decision": []}
+    atom_score_map: dict[tuple[str, str], float] = {}
+
     # vector 路径距离越小越相关。融合用的是 rank,score 这里只为可读性留 1/(1+dist)
     for h in vec_hits:
         readable = 1.0 / (1.0 + h.distance)
+        if h.kind in ("section", "decision"):
+            atom_refs_by_kind[h.kind].append(h.ref)
+            atom_score_map[(h.kind, h.ref)] = readable
+            continue
         if h.kind == "spec":
             sp = spec_by_slug.get(h.ref)
             if sp is None:
@@ -437,6 +553,17 @@ def _hydrate_vector_hits(vec_hits: list[vector.VectorHit]) -> list[Hit]:
                 score=readable,
                 sources=["vector"],
             ))
+
+    # section / decision 复用 _hydrate_l1_atoms(同一份 l1_items 反查 + body cap 逻辑)
+    if atom_refs_by_kind["section"] or atom_refs_by_kind["decision"]:
+        with session() as s:
+            for kind in ("section", "decision"):
+                refs = atom_refs_by_kind[kind]
+                if not refs:
+                    continue
+                out.extend(_hydrate_l1_atoms(
+                    s, kind, refs, skip_raw_ids, atom_score_map, "vector",
+                ))
     return out
 
 
@@ -447,7 +574,9 @@ def _vector_pass(question: str, skip_raw_ids: set[int]) -> list[Hit]:
     except Exception as e:  # noqa: BLE001
         log.warning("vector_pass failed err=%s", e)
         return []
-    hydrated = _hydrate_vector_hits(vec_hits)
+    # _hydrate_vector_hits 内部已对 section/decision 应用 skip 过滤;
+    # raw 命中在这里再过一道(保留原行为)。
+    hydrated = _hydrate_vector_hits(vec_hits, skip_raw_ids)
     if not skip_raw_ids:
         return hydrated
     out = []

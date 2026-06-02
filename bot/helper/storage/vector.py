@@ -237,6 +237,61 @@ def index_raw(sess: Session, raw_id: int) -> int | None:
     return upsert(sess, kind="raw", ref=str(raw_id), content=content)
 
 
+def index_l1_atom(sess: Session, raw_id: int, idx: int) -> int | None:
+    """L1Item(section / decision)进向量库。ref="{raw_id}:{idx}"。
+
+    section: title + body + topics 拼起来 embed(body 已是原文片段,语义完整)。
+    decision: scene + signals + tradeoffs + choice + rationale 拼起来 embed。
+    超过 EMBED_INPUT_CHAR_CAP 截尾。
+    """
+    import json as _json
+
+    from helper.storage.models import L1Item
+
+    item = sess.execute(
+        select(L1Item).where(L1Item.raw_id == raw_id, L1Item.idx == idx)
+    ).scalar_one_or_none()
+    if item is None or item.type not in ("section", "decision"):
+        return None
+    try:
+        payload = _json.loads(item.payload_json or "{}")
+    except _json.JSONDecodeError:
+        return None
+
+    parts: list[str] = []
+    for k, v in payload.items():
+        if k.endswith("_raw_ids") or k.endswith("_speaker") or k == "primary_raw_id":
+            continue
+        if isinstance(v, str) and v.strip():
+            parts.append(v.strip())
+        elif isinstance(v, list):
+            for el in v:
+                if isinstance(el, str) and el.strip():
+                    parts.append(el.strip())
+    content = "\n".join(parts)
+    if not content:
+        return None
+    if len(content) > EMBED_INPUT_CHAR_CAP:
+        content = content[:EMBED_INPUT_CHAR_CAP]
+    return upsert(sess, kind=item.type, ref=f"{raw_id}:{idx}", content=content)
+
+
+def delete_l1_atoms_for_raw(sess: Session, raw_id: int) -> None:
+    """rebuild raw 时清掉所有 (section|decision):raw_id:* 旧向量。"""
+    rows = sess.execute(
+        select(VectorIndex).where(
+            VectorIndex.kind.in_(("section", "decision")),
+            VectorIndex.ref.like(f"{raw_id}:%"),
+        )
+    ).scalars().all()
+    for r in rows:
+        try:
+            sess.execute(text("DELETE FROM vec_items WHERE rowid = :r"), {"r": r.rowid})
+            sess.delete(r)
+        except Exception:  # noqa: BLE001
+            log.exception("vector.delete_l1_atom failed kind=%s ref=%s", r.kind, r.ref)
+
+
 def index_spec(sess: Session, slug: str) -> int | None:
     """spec 落 git 后调。从 SpecCandidate 取 title + statement + rationale 拼。"""
     from helper.storage.models import SpecCandidate

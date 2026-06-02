@@ -740,15 +740,15 @@ def replay(limit: int, judge: bool) -> None:
 
 
 @main.command("reindex")
-@click.option("--clear", is_flag=True, default=False, help="先清空 vec_items + vector_index 再全量重建")
+@click.option("--clear", is_flag=True, default=False, help="先清空 vec_items + vector_index + fts_items 再全量重建")
 @click.option(
     "--kinds",
-    default="raw,spec,entity",
+    default="raw,spec,entity,section,decision",
     show_default=True,
     help="逗号分隔,只重建这些 kind",
 )
 def reindex(clear: bool, kinds: str) -> None:
-    """全量重建向量索引。换 embedding 模型 / 修复脏数据时用。
+    """全量重建向量 + FTS 索引。换 embedding 模型 / 修复脏数据 / 接通新 kind 时用。
 
     默认增量:已 index 且 (content_hash, model) 没变的不动。
     --clear 先全清再重建,适合换模型时。
@@ -756,9 +756,9 @@ def reindex(clear: bool, kinds: str) -> None:
     from sqlalchemy import select
 
     from helper.config import get_settings
-    from helper.storage import init_engine, session
+    from helper.storage import fts, init_engine, session
     from helper.storage import vector as vec
-    from helper.storage.models import EntityCandidate, L1Result, SpecCandidate
+    from helper.storage.models import EntityCandidate, L1Item, L1Result, SpecCandidate
 
     s = get_settings()
     init_engine(s.helper_data_dir / "helper.db")
@@ -767,10 +767,11 @@ def reindex(clear: bool, kinds: str) -> None:
     if clear:
         with session() as sess:
             vec.clear_all(sess)
-        click.echo("vec_items + vector_index cleared")
+            fts.clear_all(sess)
+        click.echo("vec_items + vector_index + fts_items cleared")
 
-    counts = {"raw": 0, "spec": 0, "entity": 0}
-    failed = {"raw": 0, "spec": 0, "entity": 0}
+    counts = {"raw": 0, "spec": 0, "entity": 0, "section": 0, "decision": 0}
+    failed = {"raw": 0, "spec": 0, "entity": 0, "section": 0, "decision": 0}
 
     if "raw" in selected:
         with session() as sess:
@@ -780,6 +781,7 @@ def reindex(clear: bool, kinds: str) -> None:
         for rid in ok_l1:
             with session() as sess:
                 rowid = vec.index_raw(sess, rid)
+                fts.index_raw(sess, rid)
             if rowid is not None:
                 counts["raw"] += 1
             else:
@@ -793,6 +795,7 @@ def reindex(clear: bool, kinds: str) -> None:
         for slug in spec_slugs:
             with session() as sess:
                 rowid = vec.index_spec(sess, slug)
+                fts.index_spec(sess, slug)
             if rowid is not None:
                 counts["spec"] += 1
             else:
@@ -806,15 +809,37 @@ def reindex(clear: bool, kinds: str) -> None:
         for slug in ent_slugs:
             with session() as sess:
                 rowid = vec.index_entity(sess, slug)
+                fts.index_entity(sess, slug)
             if rowid is not None:
                 counts["entity"] += 1
             else:
                 failed["entity"] += 1
 
-    click.echo(f"indexed: raw={counts['raw']} spec={counts['spec']} entity={counts['entity']}")
+    # section / decision: 走 l1_items 全量
+    for atom_kind in ("section", "decision"):
+        if atom_kind not in selected:
+            continue
+        with session() as sess:
+            pairs = sess.execute(
+                select(L1Item.raw_id, L1Item.idx).where(L1Item.type == atom_kind)
+            ).all()
+        for raw_id, idx in pairs:
+            with session() as sess:
+                rowid = vec.index_l1_atom(sess, raw_id, idx)
+                fts.index_l1_atom(sess, raw_id, idx)
+            if rowid is not None:
+                counts[atom_kind] += 1
+            else:
+                failed[atom_kind] += 1
+
+    click.echo(
+        f"indexed: raw={counts['raw']} spec={counts['spec']} entity={counts['entity']} "
+        f"section={counts['section']} decision={counts['decision']}"
+    )
     if any(failed.values()):
         click.echo(
-            f"  (failures: raw={failed['raw']} spec={failed['spec']} entity={failed['entity']})",
+            f"  (failures: raw={failed['raw']} spec={failed['spec']} entity={failed['entity']} "
+            f"section={failed['section']} decision={failed['decision']})",
             err=True,
         )
 

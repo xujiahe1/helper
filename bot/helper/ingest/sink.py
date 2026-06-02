@@ -127,6 +127,31 @@ def process_raw(
                 fts.index_raw(s, raw_id)
             except Exception:  # noqa: BLE001
                 log.exception("fts.index_raw failed raw_id=%s", raw_id)
+            # 逐条索引 section / decision(细粒度召回主力 — raw kind 是兜底,
+            # 长文档真正命中靠 section)。重跑前先清掉旧 atom 索引,避免 idx 漂移残留。
+            try:
+                from helper.storage import vector as vec
+                vec.delete_l1_atoms_for_raw(s, raw_id)
+            except Exception:  # noqa: BLE001
+                log.exception("vector.delete_l1_atoms_for_raw failed raw_id=%s", raw_id)
+            try:
+                from helper.storage import fts
+                fts.delete_l1_atoms_for_raw(s, raw_id)
+            except Exception:  # noqa: BLE001
+                log.exception("fts.delete_l1_atoms_for_raw failed raw_id=%s", raw_id)
+            for idx, it in enumerate(out.items):
+                if it.type not in ("section", "decision"):
+                    continue
+                try:
+                    from helper.storage import vector as vec
+                    vec.index_l1_atom(s, raw_id, idx)
+                except Exception:  # noqa: BLE001
+                    log.exception("vec.index_l1_atom failed raw_id=%s idx=%s", raw_id, idx)
+                try:
+                    from helper.storage import fts
+                    fts.index_l1_atom(s, raw_id, idx)
+                except Exception:  # noqa: BLE001
+                    log.exception("fts.index_l1_atom failed raw_id=%s idx=%s", raw_id, idx)
         s.commit()
 
     # L1 成功 → 串接 4 个候选 consumer(各自独立 session,失败互不影响)

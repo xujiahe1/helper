@@ -225,6 +225,61 @@ def index_raw(sess: Session, raw_id: int) -> None:
     upsert(sess, kind="raw", ref=str(raw_id), content="\n".join(parts))
 
 
+def index_l1_atom(sess: Session, raw_id: int, idx: int) -> None:
+    """L1Item(section / decision)接 fts。ref="{raw_id}:{idx}"。
+
+    section: title + body + topics 全文索引(body 直接进,不截 — fts 只切词,不存原文)
+    decision: scene + signals + tradeoffs + choice + rationale 拍平进索引
+    其他类型 (v1 fact/case/concept/relation) 走各自 candidate 表的 indexer,这里不重复。
+    """
+    import json as _json
+
+    from sqlalchemy import select as _select
+
+    from helper.storage.models import L1Item
+
+    item = sess.execute(
+        _select(L1Item).where(L1Item.raw_id == raw_id, L1Item.idx == idx)
+    ).scalar_one_or_none()
+    if item is None or item.type not in ("section", "decision"):
+        return
+    try:
+        payload = _json.loads(item.payload_json or "{}")
+    except _json.JSONDecodeError:
+        return
+
+    parts: list[str] = []
+    for k, v in payload.items():
+        if k.endswith("_raw_ids") or k.endswith("_speaker") or k == "primary_raw_id":
+            continue
+        if isinstance(v, str) and v.strip():
+            parts.append(v.strip())
+        elif isinstance(v, list):
+            for el in v:
+                if isinstance(el, str) and el.strip():
+                    parts.append(el.strip())
+    upsert(
+        sess,
+        kind=item.type,
+        ref=f"{raw_id}:{idx}",
+        content="\n".join(parts),
+    )
+
+
+def delete_l1_atoms_for_raw(sess: Session, raw_id: int) -> None:
+    """rebuild raw 时清掉所有 (section|decision):raw_id:* 旧索引。"""
+    try:
+        sess.execute(
+            text(
+                "DELETE FROM fts_items WHERE kind IN ('section','decision') "
+                "AND ref LIKE :p"
+            ),
+            {"p": f"{raw_id}:%"},
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("fts.delete_l1_atoms_for_raw failed raw_id=%s", raw_id)
+
+
 def index_spec(sess: Session, slug: str) -> None:
     from sqlalchemy import select as _select
     from helper.storage.models import SpecCandidate
