@@ -402,6 +402,66 @@ def l1_purge_bot_replies(dry_run: bool, limit: int) -> None:
     click.echo(f"purged {purged} bot reply raws")
 
 
+@main.command("bot-reply-purge-acks")
+@click.option("--dry-run", is_flag=True, default=False, help="只列出要删的 raw, 不真改 DB")
+@click.option("--limit", default=200, show_default=True, type=int)
+def bot_reply_purge_acks(dry_run: bool, limit: int) -> None:
+    """清现网 bot 自答里的纯系统 ack raw (🤔 / 🔄 / ✓ 已记录)。
+
+    这些 ack 没有上下文价值 (用户不会 quote "🤔 没看出能沉淀" 来追问),
+    留在 raw_inputs 里只会污染 chat_context 和引用反查。
+    保留 ❌ 拒答 / 实质答复 — 它们有上下文价值。
+
+    动作: 直接 DELETE FROM raw_inputs。前置条件:
+    - 索引层 (fts_items / vector_index) 已被 #8 (l1-purge-bot-replies) 清光
+    - L1Result 已是 purged:bot_reply, 删 raw 时 ON DELETE CASCADE 自动连带删
+
+    入口侧 _persist_bot_reply._is_ack_text 已堵, 这条 CLI 只针对历史脏数据。
+    """
+    from helper.config import get_settings
+    from helper.im.wave_actions import _is_ack_text
+    from helper.storage import init_engine, session
+    from helper.storage.models import L1Item, L1Result, RawInput
+
+    s = get_settings()
+    init_engine(s.helper_data_dir / "helper.db")
+
+    from sqlalchemy import delete as _delete
+    from sqlalchemy import select
+
+    with session() as sess:
+        rows = sess.execute(
+            select(RawInput.id, RawInput.content_text)
+            .where(RawInput.source_type.like("im_wave_bot%"))
+            .order_by(RawInput.id.desc())
+            .limit(limit)
+        ).all()
+
+    candidates = [(rid, text) for rid, text in rows if _is_ack_text(text or "")]
+    if not candidates:
+        click.echo("no ack-only bot raws to purge")
+        return
+
+    click.echo(f"found {len(candidates)} ack bot raws:")
+    for rid, text in candidates:
+        snip = (text or "").strip()[:60].replace("\n", " ")
+        click.echo(f"  raw#{rid}: {snip}")
+
+    if dry_run:
+        click.echo("(dry-run, no changes)")
+        return
+
+    deleted = 0
+    for rid, _text in candidates:
+        with session() as sess:
+            sess.execute(_delete(L1Item).where(L1Item.raw_id == rid))
+            sess.execute(_delete(L1Result).where(L1Result.raw_id == rid))
+            sess.execute(_delete(RawInput).where(RawInput.id == rid))
+            sess.commit()
+        deleted += 1
+    click.echo(f"deleted {deleted} ack raws")
+
+
 @main.command("wave-simulate")
 @click.argument("text")
 @click.option(

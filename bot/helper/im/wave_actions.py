@@ -251,6 +251,28 @@ def _run_l1_and_count(
         ).scalar_one() or 0
 
 
+_ACK_PREFIXES: tuple[str, ...] = (
+    "🤔",                 # judgment 失败 / "没明白你的意图" 等纯系统提示, 现网用法只在 ack
+    "🔄 ",                # km_ingest "已重新学习" + 路由 "已咨询" 等回执 (路由 ack 不会到这, 留前缀防御未来加路径)
+    "✓ 已记录(",          # judgment 纯文本 ack
+)
+
+
+def _is_ack_text(text: str) -> bool:
+    """判定 text 是不是纯系统 ack — 纯 UI 反馈, 没有上下文价值。
+
+    保留: 实质答复 / ❌ 拒答 (有上下文价值, 用户后续会 quote 或追问)。
+    过滤: 🤔 系列 (没看出能沉淀 / 没明白你的意图) / 🔄 操作回执 / ✓ 已记录 —
+    留下来只会污染 chat_context 和引用反查 (#9 _format_quoted_message)。
+    """
+    if not text:
+        return True
+    s = text.strip()
+    if not s:  # 全空白也算 ack
+        return True
+    return any(s.startswith(p) for p in _ACK_PREFIXES)
+
+
 def _persist_bot_reply(
     *,
     text: str,
@@ -264,11 +286,14 @@ def _persist_bot_reply(
 
     只对 ask / judgment / unknown 这三类"对话型"回复调用 — schedule_*
     操作回执 / 出错文案 / 文档拉取失败提示等噪音不存。
+    实质 ack 由 _is_ack_text 在入口拦下 (🤔 / 🔄 / ✓ 已记录), 不进 raw_inputs。
 
     author_domain 记录的是接收方域账号(谁正在跟 bot 对话),这样单聊兜底
     list_chat_history(fallback_author=domain) 能把 user/bot 双方消息都拉到。
     """
     if not text:
+        return
+    if _is_ack_text(text):
         return
     try:
         with session() as s:
