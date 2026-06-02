@@ -2,7 +2,7 @@
 
 Helper Python 实现根。设计文档在仓库根的 [`docs/`](../docs/)。
 
-## 本地开发(Month 1 阶段)
+## 本地开发
 
 ```bash
 cd bot/

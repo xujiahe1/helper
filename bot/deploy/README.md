@@ -1,6 +1,6 @@
 # Helper bot deployment
 
-> 服务器: `10.234.81.212`(Ubuntu 22.04 / 2C 3.6G 40G,**不可升配**)
+> 服务器: `10.234.81.212`(Ubuntu 22.04 / 2C 15G 40G)
 > 一切线上动作都在准备 deploy 时做,本地开发不要碰。
 
 ## 一次性 bootstrap
@@ -77,18 +77,20 @@ sudo $EDITOR /etc/helper/wave.env
 sudo systemctl restart helper
 ```
 
-## 内存看护
+## 资源看护
 
-服务器只 3.6G,helper.service 已在 unit 里限了 `MemoryMax=900M`。
-若 OOM:
+服务器已升到 15G。当前资源纪律见 [`docs/runtime.md`](../../docs/runtime.md) §3:
+单进程 + asyncio、SQLite 单写、LLM 并发上限 5、不在本地跑模型。
+
+若出现异常内存上涨或 OOM:
 
 ```bash
 journalctl -u helper -p err --since "10 min ago"
 free -h
 ```
 
-如确实超,先看是不是 Athenai 同时跑了多次 ask;`asyncio.to_thread` 默认线程池 32,
-M2 起若回调高峰可在 server.py 里改 `concurrent.futures.ThreadPoolExecutor(max_workers=4)` 的全局池。
+如确实超,先看是不是 Athenai 调用并发、文档批量 ingest 或索引重建在同一时间叠加;
+优先按 `docs/runtime.md` §3 的关键决策排查,不要回到旧 3.6G 时代的内存预算口径。
 
 ## 不做
 
