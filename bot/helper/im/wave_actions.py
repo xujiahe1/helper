@@ -425,10 +425,12 @@ def _route_message_sync(
         request_id_prefix=f"thinking-{raw_id}",
     ).start()
 
+    # KM URL 探测前置:供 intent classify 屏蔽 schedule_* 三类(含 URL 100% 不是定时任务)
+    km_urls = km_ingest.find_km_urls(text)
+
     try:
         # 前置富化:消息里含 KM URL → 拉文档作为这次会话的素材。
         fetched: list[km_ingest.KMIngestResult] = []
-        km_urls = km_ingest.find_km_urls(text)
         if km_urls:
             try:
                 fetched = km_ingest.ingest_text(
@@ -460,7 +462,7 @@ def _route_message_sync(
                 exclude_raw_id=raw_id,
             )
 
-        intent = classify(text, chat_context=chat_context)
+        intent = classify(text, chat_context=chat_context, has_km_url=bool(km_urls))
 
         if intent == "schedule_create":
             tracker.finish(handle_create(text, domain))
