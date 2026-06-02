@@ -429,65 +429,52 @@ def _hydrate_fts_hits(
             out.extend(_hydrate_l1_atoms(
                 s, "decision", by_kind["decision"], skip_raw_ids, score_map, "fts",
             ))
-        if "directive" in by_kind:
-            ids = [int(r) for r in by_kind["directive"] if r.isdigit()]
-            if ids:
-                rows = {
-                    m.id: m for m in s.execute(
-                        select(Memory).where(
-                            Memory.id.in_(ids),
-                            Memory.superseded_at.is_(None),
-                        )
-                    ).scalars()
-                }
-                for ref in by_kind["directive"]:
-                    if not ref.isdigit():
-                        continue
-                    mem = rows.get(int(ref))
-                    if mem is None:
-                        continue
-                    title = (
-                        f"directive 涉及『{mem.scope_ref}』"
-                        if mem.scope_type == "entity" and mem.scope_ref
-                        else "directive(global)"
-                    )
-                    out.append(Hit(
-                        type="directive", ref=ref, title=title,
-                        body=mem.directive or "",
-                        score=score_map[("directive", ref)], sources=["fts"],
-                    ))
     return out
 
 
 def _fts_pass(question: str, skip_raw_ids: set[int]) -> list[Hit]:
-    """FTS5 + jieba 词面召回,覆盖 raw + 5 类候选(不含 directive)。
-
-    directive 的 bm25 比 raw/section 小数量级(directive 文本短, 共词命中数少),
-    放进同 RRF 池会被压到 top_k 之外, 召回失效。directive 走独立 pass。
-    """
+    """FTS5 + jieba 词面召回,覆盖 raw + 5 类候选。"""
     try:
         with session() as s:
             hits = fts.search(s, query=question, top_k=FTS_TOP_K)
     except Exception as e:  # noqa: BLE001
         log.warning("fts_pass failed err=%s", e)
         return []
-    # 排除 directive — 它由 _directive_pass 单独处理
-    hits = [(k, r, sc) for (k, r, sc) in hits if k != "directive"]
     return _hydrate_fts_hits(hits, skip_raw_ids)
 
 
 def _directive_pass(question: str) -> list[Hit]:
-    """directive 单独走 fts, 只要词面命中就保留(不参与 RRF, 不和事实争 top_k)。
+    """alive directive 全捞, 题面 token 与 directive 文本 token 有交集即命中。
 
-    上限 5 条(全公司 alive directive 量级稳定在百条以内, 题面命中通常 ≤ 3)。
+    directive 是"行为指令"不是"事实", 优先级最高 — 不和 raw/section 走 bm25
+    抢 RRF top_k(directive 文本短, bm25 天然吃亏被压出榜)。 也不进 fts_items
+    表, 不需要 upsert/delete/reindex 同步。 alive directive 全公司量级稳定在
+    百条以内, jieba 切词遍历毫秒级, 不需要索引。
     """
-    try:
-        with session() as s:
-            hits = fts.search(s, query=question, top_k=5, kinds=["directive"])
-    except Exception as e:  # noqa: BLE001
-        log.warning("directive_pass failed err=%s", e)
+    qtoks = _tokens(question)
+    if not qtoks:
         return []
-    return _hydrate_fts_hits(hits, skip_raw_ids=set())
+    out: list[Hit] = []
+    with session() as s:
+        mems = s.execute(
+            select(Memory).where(Memory.superseded_at.is_(None)).order_by(Memory.id)
+        ).scalars().all()
+    for m in mems:
+        text = m.directive or ""
+        if not text.strip():
+            continue
+        if not (qtoks & _tokens(text)):
+            continue
+        title = (
+            f"directive 涉及『{m.scope_ref}』"
+            if m.scope_type == "entity" and m.scope_ref
+            else "directive(global)"
+        )
+        out.append(Hit(
+            type="directive", ref=str(m.id), title=title, body=text,
+            score=1.0, sources=["directive"],
+        ))
+    return out
 
 
 # ---------- bundle 内存 Jaccard 路径(只扫已编译的小集合) ----------

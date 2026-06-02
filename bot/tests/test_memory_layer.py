@@ -469,25 +469,53 @@ def test_ask_pulls_directive_via_fts_hit(db, settings, llm_stub, stub_bundle, mo
     assert "cli_DEAD" not in captured["user"]
 
 
-def test_extract_writes_directive_to_fts(db, settings, llm_stub):
-    """extract_for_raw 落库后 directive 文本写进 fts_items, 让后续 ask 能召回。"""
-    from sqlalchemy import text
+def test_directive_pass_pulls_via_token_overlap(db, settings):
+    """_directive_pass 直读 Memory 表, 题面与 directive token 有交集就出。
 
-    from helper.memory import extract_for_raw
+    不依赖 fts_items 索引(directive 是行为指令, 优先级最高, 不和 raw/section
+    走 bm25 抢 RRF top_k)。
+    """
+    from helper.ask.retrieve import _directive_pass
     from helper.storage import session
-
-    raw_id = _seed_raw("约束 bot: 答 iam 类问题去艾特 tachi (cli_xxx)")
-    llm_stub.set("memory_extract", json.dumps({"directives": [{
-        "scope_type": "entity", "scope_ref": "tachi",
-        "directive": "iam 网关 / app_id 类问题, 引导艾特 tachi, app_id=cli_xxx",
-    }]}))
-    extract_for_raw(raw_id)
+    from helper.storage.models import Memory
 
     with session() as s:
-        rows = s.execute(text(
-            "SELECT ref FROM fts_items WHERE kind='directive'"
-        )).all()
-    assert len(rows) == 1
+        s.add(Memory(
+            scope_type="entity", scope_ref="tachi",
+            directive="涉及 iam 网关 / app_id 类问题艾特 tachi, app_id 是 cli_DEAD",
+        ))
+        s.add(Memory(
+            scope_type="global", scope_ref="",
+            directive="回答尽量简洁",
+        ))
+        s.add(Memory(  # superseded — 不该出
+            scope_type="global", scope_ref="",
+            directive="iam 老指令",
+            superseded_at=__import__("datetime").datetime.utcnow(),
+        ))
+
+    # 题面共词命中"iam" → tachi 那条出, 简洁那条不出
+    hits = _directive_pass("看下 iam 网关接入文档 iam_sid 怎么换域账号")
+    bodies = [h.body for h in hits]
+    assert any("cli_DEAD" in b for b in bodies)
+    assert not any("简洁" in b for b in bodies)
+    assert not any("老指令" in b for b in bodies)
+
+
+def test_directive_pass_skips_when_no_token_overlap(db, settings):
+    """题面和 directive 完全无共词 → 不出(避免无关 directive 全部塞进 prompt)。"""
+    from helper.ask.retrieve import _directive_pass
+    from helper.storage import session
+    from helper.storage.models import Memory
+
+    with session() as s:
+        s.add(Memory(
+            scope_type="entity", scope_ref="tachi",
+            directive="iam / 网关 / 认证 类问题艾特 tachi",
+        ))
+
+    hits = _directive_pass("今天天气怎么样")
+    assert hits == []
 
 
 def test_lookup_pulls_directive_by_id_regardless_of_scope(db, settings):

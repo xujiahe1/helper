@@ -608,14 +608,6 @@ def resolve(
                     if mem is not None and mem.superseded_at is None:
                         mem.superseded_at = now
                         mem.superseded_by = row.raw_id
-                        # 同步清 fts(retrieve 的 directive 召回路径才不会再命中老指令)
-                        try:
-                            from helper.storage import fts as _fts
-                            _fts.delete(s, kind="directive", ref=str(mem_id))
-                        except Exception:  # noqa: BLE001
-                            log.exception(
-                                "resolve memory fts cleanup failed mem_id=%s", mem_id,
-                            )
             else:
                 model_cls = {
                     "spec": "SpecCandidate",

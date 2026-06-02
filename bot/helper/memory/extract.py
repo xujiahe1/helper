@@ -20,7 +20,7 @@ import re
 from sqlalchemy import select
 
 from helper.llm import run
-from helper.storage import fts, raw_store, session
+from helper.storage import raw_store, session
 from helper.storage.models import ConflictLog, EntityCandidate, Memory, RawInput
 
 log = logging.getLogger(__name__)
@@ -194,10 +194,6 @@ def extract_for_raw(raw_id: int) -> int:
             s.add(mem)
             s.flush()
             new_id = mem.id
-
-            # directive 文本进 fts 池, 让题面能直接命中"应该路由 / 应该这么答"
-            # 这类场景描述, 不再依赖 entity 字面词召回。
-            fts.upsert(s, kind="directive", ref=str(new_id), content=directive)
 
             if old_id is not None:
                 # 冲突走 inbox 周报裁决,不直接覆盖
