@@ -92,14 +92,13 @@ def test_extract_no_directives_when_pure_fact(db, settings, llm_stub):
 
 
 def test_extract_no_directives_when_doc_version_authority(db, settings, llm_stub):
-    """"以 X 文档为最新/为准" 这类知识源版本/权威性陈述,即便用祈使外壳,
-    也不该抽进 memory(应进 L1 知识层 entity / supersession)。
+    """闸 2: 知识源版本/权威性陈述应进 L1, 不进 memory。
 
-    回归 raw#231 → memory#7 误抽事件: 用户原话
+    回归 raw#231 → memory#7 误抽: 用户原话
         "https://km.mihoyo.com/doc/mhhujaiuuz18 这里面的员工属性,
          是当前阶段最新的。你现在里面的那个是老的"
-    被抽成 entity=lml员工属性 directive,后续在 ask system_prompt 里
-    强迫 bot 区分新/旧文档,污染回复风格。
+    被抽成 entity=lml员工属性 directive, 后续在 ask system_prompt 里
+    强迫 bot 区分新/旧文档, 污染回复风格。
     """
     from helper.memory import extract_for_raw
     from helper.storage import session
@@ -109,7 +108,68 @@ def test_extract_no_directives_when_doc_version_authority(db, settings, llm_stub
         "https://km.mihoyo.com/doc/mhhujaiuuz18 这里面的员工属性,"
         "是当前阶段最新的。你现在里面的那个是老的"
     )
-    # 配合新 prompt: LLM 该识别这是"知识源版本"陈述, 返回空 directives
+    llm_stub.set("memory_extract", json.dumps({"directives": []}))
+    n = extract_for_raw(raw_id)
+    assert n == 0
+    with session() as s:
+        assert s.execute(select(Memory)).scalars().all() == []
+
+
+def test_extract_skip_when_subject_is_third_party_behavior(db, settings, llm_stub):
+    """闸 1: 描述第三方行为模式不抽。
+
+    回归 raw#84 → memory#3: 用户原话
+        "你继续学习: 一般他很快回复,就是支持; 不回复,就是不支持。
+         这个时候你就不要持续追问,要等待他心情好的时候,说下你的想法
+         (不能很正确), 然后请教他的意思, 然后赞同。"
+    句首"你继续学习"是祈使外壳, 实际描述的是"他"的行为模式 + 客观规律,
+    不该抽成 bot 行为指令。
+    """
+    from helper.memory import extract_for_raw
+    from helper.storage import session
+    from helper.storage.models import Memory
+
+    raw_id = _seed_raw(
+        "你继续学习:一般他很快回复,就是支持这个事情;不回复,就是不支持。"
+    )
+    llm_stub.set("memory_extract", json.dumps({"directives": []}))
+    n = extract_for_raw(raw_id)
+    assert n == 0
+    with session() as s:
+        assert s.execute(select(Memory)).scalars().all() == []
+
+
+def test_extract_skip_when_objective_fact_with_imperative_shell(db, settings, llm_stub):
+    """闸 1: 关于第三方的客观事实, 即便包"你记住/告诉你"祈使外壳, 也不抽。
+
+    回归 raw#195 → memory#5: 用户原话 "小猫老师是好人,你记住"
+    是关于"小猫老师"的事实陈述,"你记住"只是语气词。被抽成
+    entity=小猫老师 directive 后污染 ask system_prompt。
+    """
+    from helper.memory import extract_for_raw
+    from helper.storage import session
+    from helper.storage.models import Memory
+
+    raw_id = _seed_raw("小猫老师是好人,你记住")
+    llm_stub.set("memory_extract", json.dumps({"directives": []}))
+    n = extract_for_raw(raw_id)
+    assert n == 0
+    with session() as s:
+        assert s.execute(select(Memory)).scalars().all() == []
+
+
+def test_extract_skip_when_unresolved_pronoun(db, settings, llm_stub):
+    """闸 3: 多义代词在历史对话里 resolve 不出唯一对象 → 不抽。
+
+    回归 raw#103 → memory#4: 用户原话 "如果是小猫老师本人问你, 你不能这么说"
+    "这么说"指上文某段, 没历史时无法 resolve 成唯一具体内容,
+    抽出来的 directive 是空心的, 不该抽。
+    """
+    from helper.memory import extract_for_raw
+    from helper.storage import session
+    from helper.storage.models import Memory
+
+    raw_id = _seed_raw("如果是小猫老师本人问你,你不能这么说")
     llm_stub.set("memory_extract", json.dumps({"directives": []}))
     n = extract_for_raw(raw_id)
     assert n == 0
