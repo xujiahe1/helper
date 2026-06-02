@@ -100,16 +100,29 @@ def tag_text(text: str) -> str:
 
 
 def tag_raw(raw_id: int) -> str:
-    """给 raw + 它派生的 atom 打标。返打上的 topic_id (可能是空串)。"""
+    """给 raw + 它派生的 atom 打标。返打上的 topic_id (可能是空串)。
+
+    护栏: 原标非空 + 新判定为空 → 保留旧标不降级。l1-backfill --force-all 会
+    走 _run_consumers 末尾重跑 tag_raw, LLM 判定漂移时能保住已有 ge 标不被
+    洗回公开。新判定也非空但与旧不同 → 以新为准(确实换 topic 的场景)。
+    """
     with session() as s:
         raw = s.get(RawInput, raw_id)
         if raw is None:
             return ""
         text = (raw.content_text or "").strip()
+        old_topic_id = raw.acl_topic_id or ""
     if not text:
         return ""
 
-    topic_id = tag_text(text)
+    new_topic_id = tag_text(text)
+    if old_topic_id and not new_topic_id:
+        log.info(
+            "tag_raw: keep existing topic=%s for raw_id=%s (LLM returned empty, no downgrade)",
+            old_topic_id, raw_id,
+        )
+        return old_topic_id
+    topic_id = new_topic_id
 
     with session() as s:
         s.execute(

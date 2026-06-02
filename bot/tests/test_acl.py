@@ -93,6 +93,69 @@ def test_tag_raw_propagates_to_candidates(db, settings, llm_stub, acl_reset):
         assert s.query(CaseCandidate).filter_by(slug="case1").first().acl_topic_id == "ge"
 
 
+def test_tag_raw_keeps_existing_topic_when_llm_returns_empty(db, settings, llm_stub, acl_reset):
+    """护栏: 已有 ge 标 + LLM 重判返空 → 保留旧标不降级。
+
+    回归 l1-backfill --force-all 重抽时 LLM 判定漂移把 ge 洗成公开的风险。
+    """
+    from helper.acl import tag_raw
+    from helper.storage import session
+    from helper.storage.models import L1Item, RawInput
+
+    with session() as s:
+        r = RawInput(source_type="im_wave", content_text="哥的私事", acl_topic_id="ge")
+        s.add(r); s.flush()
+        raw_id = r.id
+        s.add(L1Item(raw_id=raw_id, idx=0, type="section", payload_json="{}", acl_topic_id="ge"))
+
+    # LLM 返空(漂移)— 旧标必须保住
+    llm_stub.set("acl_tag", "")
+    out = tag_raw(raw_id)
+    assert out == "ge"
+
+    with session() as s:
+        assert s.get(RawInput, raw_id).acl_topic_id == "ge"
+        assert s.query(L1Item).filter_by(raw_id=raw_id).first().acl_topic_id == "ge"
+
+
+def test_tag_raw_overwrites_when_new_topic_non_empty(db, settings, llm_stub, acl_reset):
+    """护栏只防"非空→空"降级; 非空→非空仍以新为准(未来多 topic 场景)。"""
+    from helper.acl import tag_raw
+    from helper.storage import session
+    from helper.storage.models import RawInput
+
+    with session() as s:
+        r = RawInput(source_type="im_wave", content_text="x", acl_topic_id="ge")
+        s.add(r); s.flush()
+        raw_id = r.id
+
+    # LLM 返了别的 topic — 当前 yaml 只有 ge, "made_up" 会被 tag_text 当不确定降级到
+    # default_on_uncertain="" → 于是落到护栏分支保住 ge。
+    llm_stub.set("acl_tag", "made_up")
+    out = tag_raw(raw_id)
+    assert out == "ge"
+    with session() as s:
+        assert s.get(RawInput, raw_id).acl_topic_id == "ge"
+
+
+def test_tag_raw_first_pass_can_set_empty(db, settings, llm_stub, acl_reset):
+    """护栏只在"已有标"时生效; 首次打标允许写空(公开内容默认空)。"""
+    from helper.acl import tag_raw
+    from helper.storage import session
+    from helper.storage.models import RawInput
+
+    with session() as s:
+        r = RawInput(source_type="im_wave", content_text="iam 怎么配", acl_topic_id="")
+        s.add(r); s.flush()
+        raw_id = r.id
+
+    llm_stub.set("acl_tag", "")
+    out = tag_raw(raw_id)
+    assert out == ""
+    with session() as s:
+        assert s.get(RawInput, raw_id).acl_topic_id == ""
+
+
 def test_tag_raw_propagation_does_not_match_substring(db, settings, llm_stub, acl_reset):
     """raw_id=1 的标不能错误地继承到 raw_refs_json=[12, 21] 的候选(数字边界)。"""
     import json
