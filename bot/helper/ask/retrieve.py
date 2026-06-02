@@ -460,14 +460,34 @@ def _hydrate_fts_hits(
 
 
 def _fts_pass(question: str, skip_raw_ids: set[int]) -> list[Hit]:
-    """FTS5 + jieba 词面召回,覆盖 raw + 5 类候选。"""
+    """FTS5 + jieba 词面召回,覆盖 raw + 5 类候选(不含 directive)。
+
+    directive 的 bm25 比 raw/section 小数量级(directive 文本短, 共词命中数少),
+    放进同 RRF 池会被压到 top_k 之外, 召回失效。directive 走独立 pass。
+    """
     try:
         with session() as s:
             hits = fts.search(s, query=question, top_k=FTS_TOP_K)
     except Exception as e:  # noqa: BLE001
         log.warning("fts_pass failed err=%s", e)
         return []
+    # 排除 directive — 它由 _directive_pass 单独处理
+    hits = [(k, r, sc) for (k, r, sc) in hits if k != "directive"]
     return _hydrate_fts_hits(hits, skip_raw_ids)
+
+
+def _directive_pass(question: str) -> list[Hit]:
+    """directive 单独走 fts, 只要词面命中就保留(不参与 RRF, 不和事实争 top_k)。
+
+    上限 5 条(全公司 alive directive 量级稳定在百条以内, 题面命中通常 ≤ 3)。
+    """
+    try:
+        with session() as s:
+            hits = fts.search(s, query=question, top_k=5, kinds=["directive"])
+    except Exception as e:  # noqa: BLE001
+        log.warning("directive_pass failed err=%s", e)
+        return []
+    return _hydrate_fts_hits(hits, skip_raw_ids=set())
 
 
 # ---------- bundle 内存 Jaccard 路径(只扫已编译的小集合) ----------
@@ -719,9 +739,11 @@ def retrieve_relevant(
     jac = _bundle_jaccard_pass(qtoks)
     fts_hits = _fts_pass(question, skip)
     vec = _vector_pass(question, skip)
+    # directive 独立通道, 不进 RRF, 命中即拼到 prompt 用户偏好段
+    directives = _directive_pass(question)
 
-    # 三路全空 → 没东西召回
-    if not jac and not fts_hits and not vec:
+    # 全空 → 没东西召回
+    if not jac and not fts_hits and not vec and not directives:
         return []
 
     fused = _rrf_fuse(
@@ -742,4 +764,5 @@ def retrieve_relevant(
         except Exception:  # noqa: BLE001
             log.exception("acl filter failed; default to allow all (caller still has deny_for_question gate)")
 
-    return fused[:top_k]
+    # directive 不切 top_k(独立通道, 命中即拼); 事实段 top_k 后再 append
+    return fused[:top_k] + directives
