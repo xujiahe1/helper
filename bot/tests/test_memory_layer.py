@@ -91,6 +91,32 @@ def test_extract_no_directives_when_pure_fact(db, settings, llm_stub):
         assert s.execute(select(Memory)).scalars().all() == []
 
 
+def test_extract_no_directives_when_doc_version_authority(db, settings, llm_stub):
+    """"以 X 文档为最新/为准" 这类知识源版本/权威性陈述,即便用祈使外壳,
+    也不该抽进 memory(应进 L1 知识层 entity / supersession)。
+
+    回归 raw#231 → memory#7 误抽事件: 用户原话
+        "https://km.mihoyo.com/doc/mhhujaiuuz18 这里面的员工属性,
+         是当前阶段最新的。你现在里面的那个是老的"
+    被抽成 entity=lml员工属性 directive,后续在 ask system_prompt 里
+    强迫 bot 区分新/旧文档,污染回复风格。
+    """
+    from helper.memory import extract_for_raw
+    from helper.storage import session
+    from helper.storage.models import Memory
+
+    raw_id = _seed_raw(
+        "https://km.mihoyo.com/doc/mhhujaiuuz18 这里面的员工属性,"
+        "是当前阶段最新的。你现在里面的那个是老的"
+    )
+    # 配合新 prompt: LLM 该识别这是"知识源版本"陈述, 返回空 directives
+    llm_stub.set("memory_extract", json.dumps({"directives": []}))
+    n = extract_for_raw(raw_id)
+    assert n == 0
+    with session() as s:
+        assert s.execute(select(Memory)).scalars().all() == []
+
+
 def test_extract_handles_bad_json(db, settings, llm_stub):
     """LLM 返非 JSON → 静默 0 条,不抛错。"""
     from helper.memory import extract_for_raw
