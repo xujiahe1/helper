@@ -971,7 +971,7 @@ def replay(limit: int, judge: bool) -> None:
 @click.option("--clear", is_flag=True, default=False, help="先清空 vec_items + vector_index + fts_items 再全量重建")
 @click.option(
     "--kinds",
-    default="raw,spec,entity,section,decision",
+    default="raw,spec,entity,section,decision,directive",
     show_default=True,
     help="逗号分隔,只重建这些 kind",
 )
@@ -986,7 +986,9 @@ def reindex(clear: bool, kinds: str) -> None:
     from helper.config import get_settings
     from helper.storage import fts, init_engine, session
     from helper.storage import vector as vec
-    from helper.storage.models import EntityCandidate, L1Item, L1Result, SpecCandidate
+    from helper.storage.models import (
+        EntityCandidate, L1Item, L1Result, Memory, SpecCandidate,
+    )
 
     s = get_settings()
     init_engine(s.helper_data_dir / "helper.db")
@@ -998,8 +1000,8 @@ def reindex(clear: bool, kinds: str) -> None:
             fts.clear_all(sess)
         click.echo("vec_items + vector_index + fts_items cleared")
 
-    counts = {"raw": 0, "spec": 0, "entity": 0, "section": 0, "decision": 0}
-    failed = {"raw": 0, "spec": 0, "entity": 0, "section": 0, "decision": 0}
+    counts = {"raw": 0, "spec": 0, "entity": 0, "section": 0, "decision": 0, "directive": 0}
+    failed = {"raw": 0, "spec": 0, "entity": 0, "section": 0, "decision": 0, "directive": 0}
 
     if "raw" in selected:
         with session() as sess:
@@ -1060,14 +1062,31 @@ def reindex(clear: bool, kinds: str) -> None:
             else:
                 failed[atom_kind] += 1
 
+    # directive: 所有 alive memories 的 directive 文本进 fts(向量暂不接, fts
+    # 共词命中已经够把 memory#2 这种"涉及 iam/app_id"的 directive 拉出来)
+    if "directive" in selected:
+        with session() as sess:
+            mems = sess.execute(
+                select(Memory.id, Memory.directive).where(Memory.superseded_at.is_(None))
+            ).all()
+        for mem_id, directive in mems:
+            with session() as sess:
+                try:
+                    fts.upsert(sess, kind="directive", ref=str(mem_id), content=directive or "")
+                    counts["directive"] += 1
+                except Exception:  # noqa: BLE001
+                    failed["directive"] += 1
+
     click.echo(
         f"indexed: raw={counts['raw']} spec={counts['spec']} entity={counts['entity']} "
-        f"section={counts['section']} decision={counts['decision']}"
+        f"section={counts['section']} decision={counts['decision']} "
+        f"directive={counts['directive']}"
     )
     if any(failed.values()):
         click.echo(
             f"  (failures: raw={failed['raw']} spec={failed['spec']} entity={failed['entity']} "
-            f"section={failed['section']} decision={failed['decision']})",
+            f"section={failed['section']} decision={failed['decision']} "
+            f"directive={failed['directive']})",
             err=True,
         )
 

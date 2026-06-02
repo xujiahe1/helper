@@ -420,3 +420,90 @@ def test_ask_system_prompt_includes_directives(db, settings, llm_stub, stub_bund
 
     assert "## 用户偏好" in captured["system"]
     assert "回答尽量简洁" in captured["system"]
+
+
+def test_ask_pulls_directive_via_fts_hit(db, settings, llm_stub, stub_bundle, monkeypatch):
+    """题面里没有 entity 字面词,但 directive 文本本身被 fts 召回 → 仍拼进 prompt。
+
+    回归 raw#272/273 转发失败:题面"看 iam 网关接入文档 iam_sid"无"tachi"字面,
+    旧逻辑下 entity_refs=[] → entity scope directive 漏注入 → LLM 无完整 app_id
+    → 编出 cli_tachi 触发 wave 10401022。修复: directive 文本进 fts 池, 命中
+    后通过 directive_ids 路径强制拼接, 不再依赖 entity slug 命中。
+    """
+    from helper.ask.retrieve import Hit
+    from helper.ask.runtime import ask
+    from helper.storage import session
+    from helper.storage.models import Memory
+
+    with session() as s:
+        m = Memory(
+            scope_type="entity", scope_ref="tachi",
+            directive="涉及 iam 网关 / app_id 类问题, 引导用户去艾特 tachi, app_id 是 cli_DEAD",
+        )
+        s.add(m); s.flush()
+        mem_id = m.id
+
+    # 模拟 retrieve 通过 fts 命中 directive(题面无 "tachi" 字面, 但 fts 共词命中
+    # directive 内容里的 "iam 网关"); 同时 entity_refs 为空(没召回 entity#tachi)
+    fake_hits = [Hit(type="directive", ref=str(mem_id), title="t", body="b", score=1.0)]
+    monkeypatch.setattr(
+        "helper.ask.runtime.retrieve_relevant",
+        lambda q, top_k=8, asker_domain="": fake_hits,
+    )
+    monkeypatch.setattr("helper.ask.runtime.current_bundle_version", lambda: "test")
+
+    captured = {}
+
+    def fake_ask(system: str, user: str, **kw):
+        captured["system"] = system
+        captured["user"] = user
+        return "## 答复\nOK\n\n## 置信度\nlow\n\n## 引用\n"
+
+    llm_stub.set("ask", fake_ask)
+    ask("看 iam 网关接入文档 iam_sid 怎么换域账号", asker_domain="alice")
+
+    # directive 内容(含完整 app_id)拼进 system_prompt
+    assert "## 用户偏好" in captured["system"]
+    assert "cli_DEAD" in captured["system"]
+    # directive 不当成"检索结果"喂出去(那是事实段, directive 是行为指令)
+    assert "cli_DEAD" not in captured["user"]
+
+
+def test_extract_writes_directive_to_fts(db, settings, llm_stub):
+    """extract_for_raw 落库后 directive 文本写进 fts_items, 让后续 ask 能召回。"""
+    from sqlalchemy import text
+
+    from helper.memory import extract_for_raw
+    from helper.storage import session
+
+    raw_id = _seed_raw("约束 bot: 答 iam 类问题去艾特 tachi (cli_xxx)")
+    llm_stub.set("memory_extract", json.dumps({"directives": [{
+        "scope_type": "entity", "scope_ref": "tachi",
+        "directive": "iam 网关 / app_id 类问题, 引导艾特 tachi, app_id=cli_xxx",
+    }]}))
+    extract_for_raw(raw_id)
+
+    with session() as s:
+        rows = s.execute(text(
+            "SELECT ref FROM fts_items WHERE kind='directive'"
+        )).all()
+    assert len(rows) == 1
+
+
+def test_lookup_pulls_directive_by_id_regardless_of_scope(db, settings):
+    """directives_for_ask 收到 directive_ids 后, 命中的 memory 不论 scope 都拼。"""
+    from helper.memory.lookup import directives_for_ask
+    from helper.storage import session
+    from helper.storage.models import Memory
+
+    with session() as s:
+        m = Memory(scope_type="entity", scope_ref="tachi", directive="X 类问题艾特 tachi")
+        s.add(m); s.flush()
+        mem_id = m.id
+
+    # entity_refs 不命中 → 旧路径返空
+    assert directives_for_ask(entity_refs=[]) == ""
+    # directive_ids 命中 → 拼上(走新路径)
+    block = directives_for_ask(entity_refs=[], directive_ids=[mem_id])
+    assert "tachi" in block
+    assert "艾特 tachi" in block

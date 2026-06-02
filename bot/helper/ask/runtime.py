@@ -280,13 +280,19 @@ def ask(
     inline = _format_inline_docs(inline_context)
     if inline:
         parts.append(inline)
-    parts.append(_format_hits(hits))
+    # directive 是"行为指令"不是"事实", 只走 system prompt 用户偏好段, 不进检索结果
+    fact_hits = [h for h in hits if h.type != "directive"]
+    parts.append(_format_hits(fact_hits))
     user_msg = "\n\n".join(parts)
 
-    # 用户偏好(procedural memory)— 命中 entity 的 + global 的拼进 system prompt 末尾
+    # 用户偏好(procedural memory)— 三路命中合并:
+    #   - entity 命中(题面里有该 entity 字面词 → 拼对应 entity scope directive)
+    #   - directive 命中(directive 文本本身被 fts/vector 检索召回 → 拼)
+    #   - global scope 一律拼
     from helper.memory import directives_for_ask
     entity_refs = [h.ref for h in hits if h.type == "entity"]
-    prefs = directives_for_ask(entity_refs=entity_refs)
+    directive_ids = [int(h.ref) for h in hits if h.type == "directive" and h.ref.isdigit()]
+    prefs = directives_for_ask(entity_refs=entity_refs, directive_ids=directive_ids)
     system_prompt = SYSTEM_PROMPT + ("\n\n" + prefs if prefs else "")
 
     routing = current_routing()

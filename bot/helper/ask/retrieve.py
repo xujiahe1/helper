@@ -28,6 +28,7 @@ from helper.storage.models import (
     EntityCandidate,
     FactCandidate,
     L1Item,
+    Memory,
     RawInput,
     RelationCandidate,
     SpecCandidate,
@@ -428,6 +429,33 @@ def _hydrate_fts_hits(
             out.extend(_hydrate_l1_atoms(
                 s, "decision", by_kind["decision"], skip_raw_ids, score_map, "fts",
             ))
+        if "directive" in by_kind:
+            ids = [int(r) for r in by_kind["directive"] if r.isdigit()]
+            if ids:
+                rows = {
+                    m.id: m for m in s.execute(
+                        select(Memory).where(
+                            Memory.id.in_(ids),
+                            Memory.superseded_at.is_(None),
+                        )
+                    ).scalars()
+                }
+                for ref in by_kind["directive"]:
+                    if not ref.isdigit():
+                        continue
+                    mem = rows.get(int(ref))
+                    if mem is None:
+                        continue
+                    title = (
+                        f"directive 涉及『{mem.scope_ref}』"
+                        if mem.scope_type == "entity" and mem.scope_ref
+                        else "directive(global)"
+                    )
+                    out.append(Hit(
+                        type="directive", ref=ref, title=title,
+                        body=mem.directive or "",
+                        score=score_map[("directive", ref)], sources=["fts"],
+                    ))
     return out
 
 
