@@ -124,21 +124,72 @@ def _extract_raw_message(payload: dict[str, Any]) -> tuple[str, str]:
 def _extract_reply_text(payload: dict[str, Any]) -> str:
     """fallback: 抽对方回复的纯文本(仅在原样转发失败时兜底用)。"""
     _, content_str = _extract_raw_message(payload)
-    if not content_str:
-        return ""
+    return _extract_markdown_from_inner(_safe_json(content_str)) if content_str else ""
+
+
+def _safe_json(s: str) -> Any:
     try:
-        inner = json.loads(content_str)
+        return json.loads(s)
     except json.JSONDecodeError:
-        return ""
+        return None
+
+
+def _walk_card_elements(elems: Any, out: list[str]) -> None:
+    """递归走 card.elements,把 markdown / text / image / hr / 容器 元素抽成 markdown 段落。
+
+    Wave card 的 elements 可能嵌套(layout 容器里又有 elements),所以递归。
+    抽不出的组件(button / select / form / datepicker)忽略 — bot 间转发的视觉交互节点
+    没法在 helper app 下复活,丢比报错好。
+    """
+    if not isinstance(elems, list):
+        return
+    for e in elems:
+        if not isinstance(e, dict):
+            continue
+        tag = e.get("tag")
+        if tag in ("markdown", "text", "plain_text", "lark_md"):
+            t = e.get("text") or e.get("content")
+            if isinstance(t, str) and t.strip():
+                out.append(t.strip())
+        elif tag == "image":
+            url = e.get("image_url") or e.get("url")
+            alt = e.get("alt") or e.get("title") or "图片"
+            if isinstance(url, str) and url:
+                out.append(f"![{alt}]({url})")
+        elif tag == "hr":
+            out.append("---")
+        elif tag in ("note", "div"):
+            # note / div 通常含子 elements 或 text
+            t = e.get("text")
+            if isinstance(t, dict):
+                tt = t.get("content") or t.get("text")
+                if isinstance(tt, str) and tt.strip():
+                    out.append(tt.strip())
+            elif isinstance(t, str) and t.strip():
+                out.append(t.strip())
+            _walk_card_elements(e.get("elements"), out)
+        else:
+            # column_set / form / 其他 layout: 递归找子 elements
+            _walk_card_elements(e.get("elements"), out)
+            _walk_card_elements(e.get("columns"), out)
+
+
+def _extract_markdown_from_inner(inner: Any) -> str:
+    """从 tachi 回的 inner content 抽出可读 markdown。覆盖:
+      - 简单 text / rich_text(tags / items)
+      - card(header.title + card.elements 含 markdown / image / hr / 嵌套容器)
+      - i18n_card / i18n_text(优先 zh-cn → zh → en)
+    抽不到返空串。
+    """
     if not isinstance(inner, dict):
         return ""
 
-    # text
+    # 简单 text
     t = inner.get("text") or inner.get("content")
     if isinstance(t, str) and t.strip():
         return t.strip()
 
-    # rich_text
+    # rich_text(at / text / url)
     tags = inner.get("tags")
     if isinstance(tags, list):
         chunks: list[str] = []
@@ -154,35 +205,80 @@ def _extract_reply_text(payload: dict[str, Any]) -> str:
                 tt = it.get("type")
                 if tt == "text" and isinstance(c.get("text"), str):
                     chunks.append(c["text"])
-                elif tt == "url" and isinstance(c.get("url"), str):
-                    chunks.append(c["url"])
+                elif tt == "url":
+                    text = c.get("text") or c.get("url") or ""
+                    url = c.get("url") or ""
+                    if text and url:
+                        chunks.append(f"[{text}]({url})")
+                    elif url:
+                        chunks.append(url)
+                elif tt == "at":
+                    name = c.get("user_name") or c.get("name") or c.get("id") or "user"
+                    chunks.append(f"@{name}")
             chunks.append("\n")
         joined = "".join(chunks).strip()
         if joined:
             return joined
 
-    # card with i18n_text(我们见过 tachi 回的就是这种)
-    i18n = inner.get("i18n_text")
-    if isinstance(i18n, dict):
-        for key in ("zh-cn", "zh", "en"):
-            v = i18n.get(key)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
+    # card(本期 tachi 主要走这条)
+    parts: list[str] = []
+    header = inner.get("header")
+    if isinstance(header, dict):
+        title = header.get("title")
+        if isinstance(title, str) and title.strip():
+            parts.append(f"## {title.strip()}")
+        elif isinstance(title, dict):
+            tt = title.get("content") or title.get("text")
+            if isinstance(tt, str) and tt.strip():
+                parts.append(f"## {tt.strip()}")
+        i18n_title = header.get("i18n_title")
+        if not parts and isinstance(i18n_title, dict):
+            for key in ("zh-cn", "zh", "en"):
+                v = i18n_title.get(key)
+                if isinstance(v, str) and v.strip():
+                    parts.append(f"## {v.strip()}")
+                    break
 
-    # card.elements[].text(markdown 节点)
     card = inner.get("card")
     if isinstance(card, dict):
-        elems = card.get("elements")
-        if isinstance(elems, list):
-            chunks = []
-            for e in elems:
-                if isinstance(e, dict) and isinstance(e.get("text"), str):
-                    chunks.append(e["text"])
-            joined = "\n".join(chunks).strip()
-            if joined:
-                return joined
+        _walk_card_elements(card.get("elements"), parts)
 
-    return ""
+    # i18n_card.zh-cn.elements
+    i18n_card = inner.get("i18n_card")
+    if not parts and isinstance(i18n_card, dict):
+        for key in ("zh-cn", "zh", "en"):
+            sub = i18n_card.get(key)
+            if isinstance(sub, dict):
+                _walk_card_elements(sub.get("elements"), parts)
+                if parts:
+                    break
+
+    # i18n_text(简单文本卡片)
+    if not parts:
+        i18n = inner.get("i18n_text")
+        if isinstance(i18n, dict):
+            for key in ("zh-cn", "zh", "en"):
+                v = i18n.get(key)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+
+    return "\n\n".join(p for p in parts if p).strip()
+
+
+def _build_markdown_card_content(markdown_text: str) -> str:
+    """用 helper 自己 app 能过 send 校验的最简 card json 字符串。
+
+    只放 1 个 markdown element,不带 header / form / button — 避开 10401069 组件校验。
+    """
+    card_obj = {
+        "card": {
+            "tag": "flow",
+            "elements": [
+                {"tag": "markdown", "text": markdown_text, "text_align": "left"},
+            ],
+        }
+    }
+    return json.dumps(card_obj, ensure_ascii=False)
 
 
 def _format_prefix(via_label: str, asker_domain: str = "") -> str:
@@ -233,6 +329,10 @@ def handle_bot_reply(payload: dict[str, Any], *, sender_app_id: str) -> bool:
       c) 透传失败(unsupported msg_type 等) → 兜底抽 text 再发一遍
 
     返回 True = 关联到一条 routing 并回贴; False = 没找到 routing(应丢弃, 不走 raw_inputs)。
+
+    注意 b) 不能原样转发对方 card — Wave send 接口对 card 做组件级校验
+    (retcode 10401069),tachi 那边的 form / button / select 组件在 helper app
+    下过不了校验。改成抽 markdown 后用 helper 自己 app 重构最简 markdown card。
     """
     if not sender_app_id:
         return False
@@ -295,9 +395,12 @@ def handle_bot_reply(payload: dict[str, Any], *, sender_app_id: str) -> bool:
         except WaveAPIError as e:
             log.warning("send prefix failed routing=%d: %s", routing_id, e)
 
-    # b) 原样透传对方原消息(空串就 wave_quote 走 send 而非 reply, 不重复 reply 原问题)
+    # b) 转发对方消息:
+    #    - text / rich_text → 原样透传(简单消息无组件校验问题)
+    #    - card → 抽 markdown 后重构最简 card 发(避开 tachi card 里的 form/button 组件校验)
+    #    - 其他 msg_type → 跳过, 走 c) 兜底
     forwarded = False
-    if msg_type and content_str:
+    if msg_type in ("text", "rich_text") and content_str:
         try:
             _send_to_origin(
                 chat_id=chat_id,
@@ -309,9 +412,26 @@ def handle_bot_reply(payload: dict[str, Any], *, sender_app_id: str) -> bool:
             forwarded = True
         except WaveAPIError as e:
             log.warning(
-                "forward verbatim failed routing=%d msg_type=%s: %s",
-                routing_id, msg_type, e,
+                "forward %s verbatim failed routing=%d: %s",
+                msg_type, routing_id, e,
             )
+    elif msg_type == "card" and content_str:
+        markdown_text = _extract_markdown_from_inner(_safe_json(content_str))
+        if markdown_text:
+            try:
+                _send_to_origin(
+                    chat_id=chat_id,
+                    asker=asker,
+                    wave_quote="",
+                    msg_type="card",
+                    content_str=_build_markdown_card_content(markdown_text),
+                )
+                forwarded = True
+            except WaveAPIError as e:
+                log.warning(
+                    "forward rebuilt card failed routing=%d: %s",
+                    routing_id, e,
+                )
 
     # c) 透传失败 / 拿不到原 content → 抽 text 兜底发一遍
     if not forwarded:
