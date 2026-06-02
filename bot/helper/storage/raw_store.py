@@ -74,6 +74,21 @@ def list_recent(s: Session, limit: int = 20) -> list[RawInput]:
     return list(s.query(RawInput).order_by(RawInput.id.desc()).limit(limit).all())
 
 
+def get_by_wave_msg_id(
+    s: Session, wave_msg_id: str, *, chat_id: str | None = None
+) -> RawInput | None:
+    """按 Wave 协议 msg_id 反查 raw 行。私聊 chat_id 是空, 群聊不空 — 调用方传 None
+    表示不约束 chat_id(场景: 反查"用户引用的消息", 引用对象可能是 bot 自己更早的私聊回复)。
+
+    Wave msg_id 全平台唯一, 即便 chat_id 不约束也不会跨会话误命中。"""
+    if not wave_msg_id:
+        return None
+    q = s.query(RawInput).filter(RawInput.wave_message_id == wave_msg_id)
+    if chat_id is not None:
+        q = q.filter(RawInput.chat_id == chat_id)
+    return q.order_by(RawInput.id.desc()).first()
+
+
 def list_chat_history(
     s: Session,
     chat_id: str,

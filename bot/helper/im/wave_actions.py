@@ -336,6 +336,14 @@ def _route_message_sync(
     domain, _name = resolve_identity(sender_id, sender_id_type)
     _backfill_author_domain(raw_id, domain)
 
+    # 反查这条 raw 的 parent_message_id (webhook 入站时已存): 用户 quote 哪条
+    # → 给 ask runtime 反查原文拼到 prompt
+    parent_msg_id = ""
+    with session() as _s:
+        _row = _s.get(RawInput, raw_id)
+        if _row is not None:
+            parent_msg_id = _row.parent_message_id or ""
+
     # 群里发消息,卡片发到 chat_id;单聊用 sender 自身
     if chat_id:
         receiver_id, receiver_id_type = chat_id, "chat_id"
@@ -439,6 +447,7 @@ def _route_message_sync(
                     chat_id=chat_id,
                     raw_id=raw_id,
                     inline_context=inline_ctx,
+                    parent_message_id=parent_msg_id,
                 )
             except Exception:  # noqa: BLE001
                 log.exception("ask runtime failed raw#%d", raw_id)
