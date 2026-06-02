@@ -234,6 +234,92 @@ def l1_backfill(limit: int, force_all: bool) -> None:
     click.echo(f"backfilled {len(done)} raw_inputs: {done}")
 
 
+@main.command("l1-purge-questions")
+@click.option("--dry-run", is_flag=True, default=False, help="只列出要清的 raw, 不真改 DB")
+@click.option("--limit", default=200, show_default=True, type=int)
+def l1_purge_questions(dry_run: bool, limit: int) -> None:
+    """一次性清"问句被 L1 抽成 section"的污染数据。
+
+    扫: L1Result.error='' AND has L1Items AND raw.content_text 命中 prefilter.is_question。
+    动作:
+      - 删该 raw 的所有 L1Item
+      - fts/vector 清掉 raw 自身索引和 l1 atom 索引
+      - L1Result.error 改成 "purged:question"
+      - raw.processed 保持 True (避免反复扫)
+
+    本命令只针对历史污染, 走完后日常路径靠 prefilter.is_question 把入口堵上。
+    """
+    from helper.config import get_settings
+    from helper.ingest.prefilter import is_question
+    from helper.storage import fts as fts_idx
+    from helper.storage import init_engine, session
+    from helper.storage import vector as vec_idx
+    from helper.storage.models import L1Item, L1Result, RawInput
+
+    s = get_settings()
+    init_engine(s.helper_data_dir / "helper.db")
+
+    from sqlalchemy import distinct, select
+
+    candidates: list[tuple[int, str]] = []
+    with session() as sess:
+        # 候选: 有 L1Item 且 L1Result.error 空 (即抽出过原子) 的 raw
+        stmt = (
+            select(distinct(RawInput.id), RawInput.content_text)
+            .join(L1Result, L1Result.raw_id == RawInput.id)
+            .join(L1Item, L1Item.raw_id == RawInput.id)
+            .where(L1Result.error == "")
+            .order_by(RawInput.id.desc())
+            .limit(limit)
+        )
+        for rid, text in sess.execute(stmt).all():
+            if is_question(text or ""):
+                candidates.append((rid, (text or "").strip()[:60]))
+
+    if not candidates:
+        click.echo("no question-polluted L1 found")
+        return
+
+    click.echo(f"found {len(candidates)} question raws with L1 items:")
+    for rid, snip in candidates:
+        click.echo(f"  raw#{rid}: {snip}")
+
+    if dry_run:
+        click.echo("(dry-run, no changes)")
+        return
+
+    purged = 0
+    for rid, _snip in candidates:
+        with session() as sess:
+            # fts/vector 清掉
+            try:
+                fts_idx.delete_l1_atoms_for_raw(sess, rid)
+            except Exception:  # noqa: BLE001
+                click.echo(f"  raw#{rid}: fts.delete_l1_atoms warn (skipped)")
+            try:
+                vec_idx.delete_l1_atoms_for_raw(sess, rid)
+            except Exception:  # noqa: BLE001
+                click.echo(f"  raw#{rid}: vec.delete_l1_atoms warn (skipped)")
+            try:
+                fts_idx.delete(sess, kind="raw", ref=str(rid))
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                vec_idx.delete(sess, kind="raw", ref=str(rid))
+            except Exception:  # noqa: BLE001
+                pass
+            # 删 L1Item, 改 L1Result
+            from sqlalchemy import delete as _delete
+            sess.execute(_delete(L1Item).where(L1Item.raw_id == rid))
+            lr = sess.get(L1Result, rid)
+            if lr is not None:
+                lr.error = "purged:question"
+                lr.model = "purge"
+            sess.commit()
+        purged += 1
+    click.echo(f"purged {purged} raws")
+
+
 @main.command("wave-simulate")
 @click.argument("text")
 @click.option(

@@ -112,3 +112,60 @@ def test_process_raw_llm_failure_records_error(
         raw = s.get(RawInput, rid)
     assert items == []
     assert raw.processed is False
+
+
+# ---------- backfill_pending: 显式跳过的 raw 不再被当成漏抽 ----------
+
+
+def test_backfill_pending_skips_filtered_skipped_purged(
+    db, settings, llm_stub, retrieve_stub, stub_index_raw, make_raw
+):
+    """backfill_pending / force_all 都不能扫到 error in (filtered:*, skipped:*, purged:*)
+    的 raw, 否则 ask 路径的问句会被反复"漏抽"重抽 L1 (历史污染原因)。
+    """
+    from helper.ingest.sink import backfill_pending
+    from helper.storage import session
+    from helper.storage.models import L1Result
+
+    rid_filtered = make_raw("好的收到")
+    rid_skipped = make_raw("刘佳翔就是哥吗?")
+    rid_purged = make_raw("某条以前抽过的问句")
+    rid_real_pending = make_raw("决定下线某个功能")
+
+    with session() as s:
+        s.add(L1Result(raw_id=rid_filtered, error="filtered:llm_no", model="l1_prefilter"))
+        s.add(L1Result(raw_id=rid_skipped, error="skipped:ask_path", model="ask_route"))
+        s.add(L1Result(raw_id=rid_purged, error="purged:question", model="purge"))
+        s.commit()
+
+    # 让 process_raw 的 LLM 调用返回空 items, 避免 conftest 没设 stub 报错
+    llm_stub.set("l1_structure", "[]")
+
+    todo = backfill_pending(limit=50)
+    # 只该跑 rid_real_pending (它没 L1Result, 是真正的 pending)
+    assert rid_filtered not in todo
+    assert rid_skipped not in todo
+    assert rid_purged not in todo
+    assert rid_real_pending in todo
+
+
+def test_backfill_force_all_also_skips_filtered_skipped_purged(
+    db, settings, llm_stub, retrieve_stub, stub_index_raw, make_raw
+):
+    from helper.ingest.sink import backfill_pending
+    from helper.storage import session
+    from helper.storage.models import L1Result
+
+    rid_skipped = make_raw("谁是哥?")
+    rid_errored = make_raw("LLM 真的失败过的")  # 真正应被 force_all 重抽
+
+    with session() as s:
+        s.add(L1Result(raw_id=rid_skipped, error="skipped:ask_path", model="ask_route"))
+        s.add(L1Result(raw_id=rid_errored, error="LLM call failed: 503", model="l1"))
+        s.commit()
+
+    llm_stub.set("l1_structure", "[]")
+
+    todo = backfill_pending(limit=50, force_all=True)
+    assert rid_skipped not in todo
+    assert rid_errored in todo

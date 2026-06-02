@@ -268,9 +268,24 @@ def schedule_l1(raw_id: int, *, prefilter: bool = False) -> None:
 def backfill_pending(*, limit: int = 50, force_all: bool = False) -> list[int]:
     """扫缺 L1 / L1 失败的 raw_input,重跑。返回处理过的 raw_id 列表。
 
-    force_all=True: 把所有非 filtered 的 raw 全部用当前 prompt 版本重抽
+    force_all=True: 把所有非"显式跳过"的 raw 全部用当前 prompt 版本重抽
     (用于 prompt 版本翻车后批量迁移; 注意会跑 LLM 调用)。
+
+    "显式跳过" 包括:
+      - filtered:*   群"听"路径 prefilter 判定无信号
+      - skipped:*    主动 @bot / 单聊路径(ask 路径), 不该走 L1
+      - purged:*     人工治理后保留的占位记录
+    这些 error 前缀不能被 backfill 当成"漏抽"重跑, 否则会把疑问句之类的
+    raw 重新 L1 抽成 section (历史污染原因)。
     """
+    skip_prefixes = ("filtered:%", "skipped:%", "purged:%")
+
+    def _not_skip_filter(col):
+        cond = ~col.like(skip_prefixes[0])
+        for p in skip_prefixes[1:]:
+            cond = cond & ~col.like(p)
+        return cond
+
     with session() as s:
         if force_all:
             todo = s.execute(
@@ -278,7 +293,7 @@ def backfill_pending(*, limit: int = 50, force_all: bool = False) -> list[int]:
                 .outerjoin(L1Result, L1Result.raw_id == RawInput.id)
                 .where(
                     (L1Result.raw_id.is_(None))
-                    | (~L1Result.error.like("filtered:%"))
+                    | _not_skip_filter(L1Result.error)
                 )
                 .order_by(RawInput.id.desc())
                 .limit(limit)
@@ -295,7 +310,7 @@ def backfill_pending(*, limit: int = 50, force_all: bool = False) -> list[int]:
             errored = s.execute(
                 select(L1Result.raw_id)
                 .where(L1Result.error != "")
-                .where(~L1Result.error.like("filtered:%"))
+                .where(_not_skip_filter(L1Result.error))
                 .limit(limit)
             ).scalars().all()
             todo = list(missing) + [r for r in errored if r not in missing]

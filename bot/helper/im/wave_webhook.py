@@ -373,6 +373,22 @@ async def wave_callback(
     is_message_event = extracted is not None
     is_active_target = is_at_bot or not chat_id  # 单聊 chat_id 空也视为主动目标
     if is_message_event and is_active_target:
+        # 主动 @bot / 单聊路径预先打 "skipped:ask_path" 标 — 防 backfill --force-all
+        # 把这些 raw 当成"漏抽"重跑成 L1 (历史污染就是这么来的: ask 路径的 raw
+        # 没人写 L1Result, backfill 看见 NULL 就拿去抽, 问句被新 prompt 抽成 section)。
+        # 后续 intent 若判 judgment, process_raw 仍会覆盖此标继续跑 L1 (不阻塞主流程)。
+        def _mark_ask_skipped() -> None:
+            from helper.storage import session as _sess
+            from helper.storage.models import L1Result
+            with _sess() as s:
+                if s.get(L1Result, raw_id) is None:
+                    s.add(L1Result(
+                        raw_id=raw_id,
+                        error="skipped:ask_path",
+                        model="ask_route",
+                    ))
+                    s.commit()
+        await asyncio.to_thread(_mark_ask_skipped)
         # 用户正在跟 bot 说话,可能是问题也可能是指令(如"答哥别复述身份");
         # ask 与 memory 抽取并行 — ask 答这次问题,memory 抽下次起生效。
         from helper.memory import schedule_memory_extract
