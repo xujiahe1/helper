@@ -372,6 +372,38 @@ async def wave_callback(
     #                       judgment 路径走 L1 + ack
     is_message_event = extracted is not None
     is_active_target = is_at_bot or not chat_id  # 单聊 chat_id 空也视为主动目标
+
+    # /clear 命令: 短路 LLM 链路, 只钉一条上下文起点, 不删数据。
+    # cutoff = 当前最大 raw_id (含本条 /clear 自己), 之后 list_chat_history
+    # 用 RawInput.id > cutoff 过滤; 老 raw 在 ingest 流水线里仍正常用。
+    # 群里 /clear 群级生效, 私聊按 sender 域账号生效。
+    if is_message_event and is_active_target and (extracted or "").strip() == "/clear":
+        scope_key = chat_id if chat_id else (
+            f"user:{sender_id}" if sender_id_type == "user_id" else ""
+        )
+        if scope_key:
+            def _do_clear() -> None:
+                with session() as sess:
+                    cur_max = sess.query(raw_store.RawInput.id)\
+                        .order_by(raw_store.RawInput.id.desc()).limit(1).scalar() or 0
+                    raw_store.set_context_cutoff(sess, scope_key, int(cur_max))
+            await asyncio.to_thread(_do_clear)
+            from helper.im import wave_client
+            try:
+                if chat_id:
+                    wave_client.send_message(
+                        receiver_id=chat_id, receiver_id_type="chat_id",
+                        msg_type="text", content={"text": "已清除当前对话上下文"},
+                    )
+                else:
+                    wave_client.send_message(
+                        receiver_id=sender_id, receiver_id_type=sender_id_type or "user_id",
+                        msg_type="text", content={"text": "已清除当前对话上下文"},
+                    )
+            except Exception:  # noqa: BLE001
+                log.exception("/clear send ack failed scope=%s", scope_key)
+        return Response(content="", media_type="application/json")
+
     if is_message_event and is_active_target:
         # 主动 @bot / 单聊路径预先打 "skipped:ask_path" 标 — 防 backfill --force-all
         # 把这些 raw 当成"漏抽"重跑成 L1 (历史污染就是这么来的: ask 路径的 raw

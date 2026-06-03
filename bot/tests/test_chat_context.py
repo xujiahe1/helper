@@ -50,6 +50,61 @@ def test_list_chat_history_returns_empty_when_no_chat_or_author(db):
     assert rows == []
 
 
+def test_context_cutoff_filters_old_raws_in_group(db):
+    """群里 /clear 钉了 cutoff 后, 拉历史只返回 cutoff 之后的消息(老 raw 不删)。"""
+    from helper.storage import raw_store, session
+
+    with session() as s:
+        old1 = _make_msg(s, source_type="im_wave_msg", content_text="old A",
+                         author_domain="alice", chat_id="oc_g")
+        old2 = _make_msg(s, source_type="im_wave_msg", content_text="old B",
+                         author_domain="bob", chat_id="oc_g")
+        # /clear 钉到 old2
+        raw_store.set_context_cutoff(s, "oc_g", old2)
+        _make_msg(s, source_type="im_wave_msg", content_text="new C",
+                  author_domain="alice", chat_id="oc_g")
+        s.commit()
+
+    with session() as s:
+        rows = raw_store.list_chat_history(s, "oc_g")
+    assert [r.content_text for r in rows] == ["new C"]
+    # 老数据物理还在
+    with session() as s:
+        from helper.storage.models import RawInput
+        assert s.query(RawInput).filter_by(chat_id="oc_g").count() == 3
+
+
+def test_context_cutoff_filters_old_raws_in_dm(db):
+    """私聊 scope: user:<domain>。"""
+    from helper.storage import raw_store, session
+
+    with session() as s:
+        last_old = _make_msg(s, source_type="im_wave_msg", content_text="old user",
+                             author_domain="alice")
+        _make_msg(s, source_type="im_wave_bot", content_text="old bot reply",
+                  author_domain="alice")
+        # 钉到当前最大 raw
+        last = s.query(raw_store.RawInput.id).order_by(raw_store.RawInput.id.desc()).first()[0]
+        raw_store.set_context_cutoff(s, "user:alice", last)
+        _make_msg(s, source_type="im_wave_msg", content_text="post-clear", author_domain="alice")
+        s.commit()
+
+    with session() as s:
+        rows = raw_store.list_chat_history(s, "", fallback_author="alice")
+    assert [r.content_text for r in rows] == ["post-clear"]
+
+
+def test_set_context_cutoff_upsert_keeps_latest(db):
+    from helper.storage import raw_store, session
+
+    with session() as s:
+        raw_store.set_context_cutoff(s, "oc_g", 5)
+        raw_store.set_context_cutoff(s, "oc_g", 12)
+        s.commit()
+    with session() as s:
+        assert raw_store.get_context_cutoff(s, "oc_g") == 12
+
+
 def test_format_context_block_renders_user_and_bot(db):
     from helper.storage import raw_store, session
 

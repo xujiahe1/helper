@@ -515,3 +515,19 @@ class PendingRouting(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     expired_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ChatContextCutoff(Base):
+    """/clear 命令的"会话上下文加载起点"标记。
+
+    用户发 /clear 时记一行: scope_key (群=chat_id, 私聊=user:<domain>) 对应
+    当时最大 raw_id, 之后 list_chat_history 拉历史时用 RawInput.id > cutoff_raw_id
+    过滤 — 老消息只是不再被加载到 prompt, 数据本身不删 (ingest 流水线仍可正常用)。
+    重复 /clear 走 upsert, 同一 scope 只留最新。
+    """
+
+    __tablename__ = "chat_context_cutoffs"
+
+    scope_key: Mapped[str] = mapped_column(String(96), primary_key=True)
+    cutoff_raw_id: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)

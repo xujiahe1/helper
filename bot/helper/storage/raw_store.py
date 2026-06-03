@@ -6,7 +6,38 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
-from helper.storage.models import RawInput
+from helper.storage.models import ChatContextCutoff, RawInput
+
+
+def _scope_key(chat_id: str, fallback_author: str) -> str:
+    """list_chat_history 与 /clear 共用的 scope 键: 群=chat_id, 私聊=user:<domain>。"""
+    if chat_id:
+        return chat_id
+    if fallback_author:
+        return f"user:{fallback_author}"
+    return ""
+
+
+def get_context_cutoff(s: Session, scope_key: str) -> int:
+    if not scope_key:
+        return 0
+    row = s.get(ChatContextCutoff, scope_key)
+    return row.cutoff_raw_id if row else 0
+
+
+def set_context_cutoff(s: Session, scope_key: str, cutoff_raw_id: int) -> None:
+    """upsert: /clear 触发时把当前最大 raw_id 钉作起点。"""
+    if not scope_key:
+        return
+    row = s.get(ChatContextCutoff, scope_key)
+    now = datetime.now(timezone.utc)
+    if row is None:
+        s.add(ChatContextCutoff(
+            scope_key=scope_key, cutoff_raw_id=cutoff_raw_id, updated_at=now,
+        ))
+    else:
+        row.cutoff_raw_id = cutoff_raw_id
+        row.updated_at = now
 
 # 上下文窗口默认值 — intent classify / ask runtime / 后续需要"短期记忆"
 # 的地方共用。16 条 / 1 天,覆盖跨日承接但不让 prompt 失控。
@@ -136,6 +167,10 @@ def list_chat_history(
         return []
     if exclude_raw_id is not None:
         q = q.filter(RawInput.id != exclude_raw_id)
+    # /clear 起点: 老于 cutoff 的 raw 不再加载到 prompt(数据本身保留)
+    cutoff = get_context_cutoff(s, _scope_key(chat_id, fallback_author))
+    if cutoff:
+        q = q.filter(RawInput.id > cutoff)
     q = q.order_by(RawInput.id.desc()).limit(limit)
     rows = list(q.all())
     rows.reverse()  # 时间正序
