@@ -107,6 +107,36 @@
 
 ---
 
+## Month 10 — Agent Surface ⏳ 计划中
+
+> Phase 0 可行性 2026-06-03 全绿(`bot/scripts/poc_agent_athenai.py`)。详细方案见 `runtime.md` §4。
+
+让 helper 在 Wave 里能"干活"(出 Excel / 跑分析 / 生成文档 / 自动化), 而不只是"答题"。**不自研 agent 执行层**,内置 `claude-agent-sdk` 走 Athenai。
+
+实装拆 4 步:
+
+| Phase | 范围 | 预估 |
+|---|---|---|
+| Phase 1 文档纠偏 | 清掉旧 extensions / sandbox / "bot 自写代码"设想, Agent Surface 写进 runtime.md §4 + roadmap M10 | ✅ 已完成 (2026-06-03) |
+| Phase 2 最薄通路 PoC | `bot/helper/agent/{runtime,workdir,hooks,wave_files}.py` + intent_classify 加 tool_task + Wave 文件出站 + llm_routing.yaml 加 agent_runtime task。**不接 KB**, 先验通路 | 2-3 天 |
+| Phase 3 KB / memory / ACL 注入 | retrieve_relevant + memory directives 拼进 system_prompt, ACL 入口跑 deny_for_question | 1-2 天 |
+| Phase 4 安全 hooks + 回流 | PreToolUse Bash 黑名单 + PostToolUse 落 raw (`source_type='agent_run'`) + 长任务进度卡片 | 1-2 天 |
+
+**Kill 条件**:
+- Athenai 限流策略变更, agent 长链路被掐 → 退回纯文本路径, M10 砍掉
+- 实装 1 周后 dogfood 失败率 > 50% → 这条路死, 退回只做 KB 问答
+
+**强约束**(防止 M10 走偏):
+- 不自研 tool runtime / sandbox / extensions / Plugin 协议
+- agent 进程 = bot 进程, 不引入 Docker / cgroup 隔离
+- 不在 bot 依赖里装 openpyxl / pandas (agent 自己装到 workdir)
+- Claude Agent SDK 必须走 Athenai (`ANTHROPIC_BASE_URL` 强制覆盖)
+- Wave 是唯一 IO 入口, 不开终端 / web 上传
+
+完整不做事项见 `runtime.md` §4.6。
+
+---
+
 ## Inbox 节奏 — 周报 vs 主动触发
 
 owner 不必等周一才看到待办。两条触发并存:
@@ -126,6 +156,7 @@ owner 不必等周一才看到待办。两条触发并存:
 |---|---|
 | OP-2 | 第二个领域专家是谁 — Month 3 核心验收,未启动 |
 | OP-3 | M5 撤销路径(`取消刚才那条`)还没 dogfood 验证 |
+| OP-4 | M10 Phase 2 PoC 实装排期 — Phase 0 已绿(2026-06-03), 等 jiahe.xu 拍是否进 dogfood 节奏 |
 
 ---
 

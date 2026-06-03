@@ -23,7 +23,7 @@
 
 **面向开发**:
 - [`docs/architecture.md`](docs/architecture.md) — 产品形态 · 模块拆分 · 5 层知识化 · 存储设计 · 5 个押注
-- [`docs/runtime.md`](docs/runtime.md) — 模型路由 (Athenai) · Wave IM 集成 · 服务器约束 · 自迭代边界
+- [`docs/runtime.md`](docs/runtime.md) — 模型路由 (Athenai) · Wave IM 集成 · 服务器约束 · Agent Surface 接入策略 (M10 内置 Claude Agent SDK)
 - [`docs/roadmap.md`](docs/roadmap.md) — Month 1/2/3 节奏 · kill 条件 · 当前 open 问题 · dogfood 策略
 
 代码骨架:

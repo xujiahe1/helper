@@ -20,7 +20,7 @@ helper hello   # 烟测试
 
 模块拆分见 [`docs/architecture.md`](../docs/architecture.md) §4 内部模块。
 
-`extensions/` 目录(自迭代外挂层)和 `var/`(本地数据)放在仓库根,不在 `bot/` 内。
+`var/`(本地数据)放在仓库根,不在 `bot/` 内。M10 Agent Surface 实装时,agent 工作目录走 `/var/lib/helper/agent-workdir/`,详见 `docs/runtime.md` §4。
 
 ## 部署
 
