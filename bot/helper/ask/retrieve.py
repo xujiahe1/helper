@@ -1,14 +1,18 @@
-"""从 bundle + sqlite FTS5 + 向量索引检索相关 spec / entity / raw / fact / case / relation。
+"""从 bundle + sqlite FTS5 + 向量索引检索相关 spec / entity / section / decision / fact / case / relation。
 
 M7 起 hybrid:
   - 路径 A:bundle 内存 Jaccard(几十~几百条 spec/entity 摘要,直接全扫便宜)
-  - 路径 B:FTS5 + jieba 词面召回(raw / 4 类候选表;替换原 Jaccard 全扫)
-  - 路径 C:bge-m3 向量召回(对同义改写强;raw + 已晋升 spec/entity/fact/case/relation)
+  - 路径 B:FTS5 + jieba 词面召回(候选表 + section/decision atom)
+  - 路径 C:bge-m3 向量召回(对同义改写强;已晋升 spec/entity/fact/case/relation + section/decision)
   - 用 RRF (Reciprocal Rank Fusion, k=60) 融合所有路 rank,出 top_k
 
 向量 / FTS 失败 → 各自路径降级返空,其余路仍正常工作。
 为啥 bundle 还走 Jaccard:bundle 是已编译的小集合(内存),走 FTS 反而要先 jieba 切词
 再 sqlite 一趟,得不偿失。
+
+raw 不进主召回:raw 是原文层,知识已抽到 section/decision。raw 直接和 section
+平权进 RRF 会让"知识已经结构化"这件事打折(粗粒度命中挤掉细粒度)。fts/vector
+索引层仍保留 raw kind 不动 — 服务 reindex / 未来"原文回查"场景。
 """
 
 from __future__ import annotations
@@ -41,15 +45,14 @@ JACCARD_TOP_K = 30
 VECTOR_TOP_K = 30
 FTS_TOP_K = 30
 
-# section/decision 是细粒度召回主力,body 直接进 LLM 上下文,放宽 cap;
-# raw 是粗粒度兜底,body 仍按 600 字 head 处理(避免长 KM 文档塞爆窗口)。
+# section/decision 是细粒度召回主力,body 直接进 LLM 上下文。
 SECTION_BODY_CAP = 1500
 
 
 @dataclass
 class Hit:
-    type: str  # spec / entity / raw
-    ref: str   # slug 或 raw_id
+    type: str  # spec / entity / section / decision / fact / case / relation / directive
+    ref: str   # slug 或 "raw_id:idx" (atom)
     title: str
     body: str
     score: float
@@ -278,26 +281,23 @@ def _hydrate_fts_hits(
 ) -> list[Hit]:
     """fts.search 给的 (kind, ref, score) 反查正文,组成 Hit。
 
-    raw   → RawInput.content_text(过 skip)
+    raw kind 命中直接丢弃 — raw 是原文层,知识已抽到 section/decision,主召回不出 raw。
     spec  → 优先 bundle(已 review),没有再回 SpecCandidate
     entity/fact/case/relation → 候选表(过滤 superseded_at)
+    section/decision → l1_items 反查
     bundle 命中的 spec / entity 这里也会被反查到,但 _bundle_jaccard_pass 也会出
     同 (type, ref),由 RRF 融合层去重。
     """
     if not fts_hits:
         return []
 
-    # 按 kind 拆 ref 列表
+    # 按 kind 拆 ref 列表; raw kind 直接丢
     by_kind: dict[str, list[str]] = {}
     score_map: dict[tuple[str, str], float] = {}
     for kind, ref, score in fts_hits:
         if kind == "raw":
-            try:
-                if int(ref) in skip_raw_ids:
-                    continue
-            except ValueError:
-                continue
-        elif kind in ("section", "decision"):
+            continue
+        if kind in ("section", "decision"):
             p = _parse_l1_atom_ref(ref)
             if p is None or p[0] in skip_raw_ids:
                 continue
@@ -306,29 +306,6 @@ def _hydrate_fts_hits(
 
     out: list[Hit] = []
     with session() as s:
-        if "raw" in by_kind:
-            ids = [int(r) for r in by_kind["raw"] if r.isdigit()]
-            if ids:
-                # 召回硬隔离: bot 自答的 raw 整类不进检索结果
-                rows = {
-                    r.id: r for r in s.execute(
-                        select(RawInput).where(
-                            RawInput.id.in_(ids),
-                            ~RawInput.source_type.like("im_wave_bot%"),
-                        )
-                    ).scalars()
-                }
-                for ref in by_kind["raw"]:
-                    rid = int(ref) if ref.isdigit() else None
-                    if rid is None or rid not in rows:
-                        continue
-                    r = rows[rid]
-                    title = (r.content_text or "").replace("\n", " ")[:80] or f"raw#{rid}"
-                    out.append(Hit(
-                        type="raw", ref=ref, title=title,
-                        body=(r.content_text or "")[:600],
-                        score=score_map[("raw", ref)], sources=["fts"],
-                    ))
         if "spec" in by_kind:
             slugs = by_kind["spec"]
             rows = {
@@ -540,10 +517,11 @@ def _bundle_jaccard_pass(qtoks: set[str]) -> list[Hit]:
 def _hydrate_vector_hits(
     vec_hits: list[vector.VectorHit], skip_raw_ids: set[int]
 ) -> list[Hit]:
-    """vec0 KNN 给的是 (kind, ref, distance);需要把对应 spec / entity / raw / section / decision
+    """vec0 KNN 给的是 (kind, ref, distance);需要把对应 spec / entity / section / decision
     的标题 + 正文取出来。
 
-    spec / entity 走 bundle(已编译好,正文可读);raw 走 sqlite 直查;
+    raw kind 命中直接丢弃 — raw 不进主召回。
+    spec / entity 走 bundle(已编译好,正文可读);
     section/decision 走 l1_items 反查,与 fts 路径共用 _hydrate_l1_atoms。
     """
     if not vec_hits:
@@ -554,18 +532,6 @@ def _hydrate_vector_hits(
     ent_by_slug = {str(ec.get("slug", "")): ec for ec in bundle.get("entities", [])}
 
     out: list[Hit] = []
-    raw_refs_to_fetch = [int(h.ref) for h in vec_hits if h.kind == "raw" and h.ref.isdigit()]
-    raw_map: dict[int, RawInput] = {}
-    if raw_refs_to_fetch:
-        # 召回硬隔离: bot 自答的 raw 整类不进检索结果
-        with session() as s:
-            for r in s.execute(
-                select(RawInput).where(
-                    RawInput.id.in_(raw_refs_to_fetch),
-                    ~RawInput.source_type.like("im_wave_bot%"),
-                )
-            ).scalars():
-                raw_map[r.id] = r
 
     # 收集 section/decision refs + 它们的 score(用于 _hydrate_l1_atoms 复用)
     atom_refs_by_kind: dict[str, list[str]] = {"section": [], "decision": []}
@@ -578,6 +544,8 @@ def _hydrate_vector_hits(
             atom_refs_by_kind[h.kind].append(h.ref)
             atom_score_map[(h.kind, h.ref)] = readable
             continue
+        if h.kind == "raw":
+            continue  # raw 不进主召回
         if h.kind == "spec":
             sp = spec_by_slug.get(h.ref)
             if sp is None:
@@ -602,22 +570,6 @@ def _hydrate_vector_hits(
                 score=readable,
                 sources=["vector"],
             ))
-        elif h.kind == "raw":
-            try:
-                rid = int(h.ref)
-            except ValueError:
-                continue
-            r = raw_map.get(rid)
-            if r is None:
-                continue
-            out.append(Hit(
-                type="raw",
-                ref=h.ref,
-                title=(r.content_text or "")[:80],
-                body=(r.content_text or "")[:600],
-                score=readable,
-                sources=["vector"],
-            ))
 
     # section / decision 复用 _hydrate_l1_atoms(同一份 l1_items 反查 + body cap 逻辑)
     if atom_refs_by_kind["section"] or atom_refs_by_kind["decision"]:
@@ -639,17 +591,7 @@ def _vector_pass(question: str, skip_raw_ids: set[int]) -> list[Hit]:
     except Exception as e:  # noqa: BLE001
         log.warning("vector_pass failed err=%s", e)
         return []
-    # _hydrate_vector_hits 内部已对 section/decision 应用 skip 过滤;
-    # raw 命中在这里再过一道(保留原行为)。
-    hydrated = _hydrate_vector_hits(vec_hits, skip_raw_ids)
-    if not skip_raw_ids:
-        return hydrated
-    out = []
-    for h in hydrated:
-        if h.type == "raw" and h.ref.isdigit() and int(h.ref) in skip_raw_ids:
-            continue
-        out.append(h)
-    return out
+    return _hydrate_vector_hits(vec_hits, skip_raw_ids)
 
 
 # ---------- RRF 融合 ----------
@@ -676,13 +618,11 @@ def _rrf_fuse(lists: list[tuple[str, list[Hit]]], top_k: int) -> list[Hit]:
             if source_name not in fused[key].sources:
                 fused[key].sources.append(source_name)
 
-    # spec 维持"权重高"语义,fact/case 与 entity 同档,raw 略低
+    # spec 维持"权重高"语义,fact/case 与 entity / section / decision 同档
     for key, h in fused.items():
         s = score[key]
         if h.type == "spec":
             s *= 1.5
-        elif h.type == "raw":
-            s *= 0.8
         h.score = s
 
     out = sorted(fused.values(), key=lambda x: -x.score)
