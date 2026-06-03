@@ -27,6 +27,11 @@ tasks:
   # M8 ACL 内容打标: 入库时给 raw 判 topic, ask 入口给 question 判 topic;
   # 都是结构化短输出(返 topic_id 或空), sonnet 完全够。
   acl_tag:         { model: claude-sonnet-4-6, provider: anthropic, max_tokens: 64 }
+  # M9 路由场景: 外部 bot (如 tachi) 私聊回 helper, helper 用这个 task 把对方
+  # 原文重新组织成 markdown 卡片再回贴原会话 — 对方可能输出扁平 i18n_text(表格被
+  # 压成空格连续行)或带组件的 card(form/button 在 helper app 下过不了校验),
+  # 由 LLM 重写成可读 markdown 比 helper 端做规则 reflow 更稳。
+  restate_bot_reply: { model: claude-sonnet-4-6, provider: anthropic }
 
   # ── L1 预筛(mini): 群聊"听"路径上,关键词没命中时让小模型快速判 yes/no ──
   # 群消息无差别全量跑 Sonnet L1 太烧;关键词预筛覆盖大头,边缘 case 让 mini 兜底。

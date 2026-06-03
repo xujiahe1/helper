@@ -413,7 +413,7 @@ def test_ask_system_prompt_includes_directives(db, settings, llm_stub, stub_bund
 
     def fake_ask(system: str, user: str, **kw):
         captured["system"] = system
-        return "## 答复\nOK\n\n## 置信度\nlow\n\n## 引用\n"
+        return "OK"
 
     llm_stub.set("ask", fake_ask)
     ask("无所谓问什么", asker_domain="alice")
@@ -426,9 +426,9 @@ def test_ask_pulls_directive_via_fts_hit(db, settings, llm_stub, stub_bundle, mo
     """题面里没有 entity 字面词,但 directive 文本本身被 fts 召回 → 仍拼进 prompt。
 
     回归 raw#272/273 转发失败:题面"看 iam 网关接入文档 iam_sid"无"tachi"字面,
-    旧逻辑下 entity_refs=[] → entity scope directive 漏注入 → LLM 无完整 app_id
-    → 编出 cli_tachi 触发 wave 10401022。修复: directive 文本进 fts 池, 命中
-    后通过 directive_ids 路径强制拼接, 不再依赖 entity slug 命中。
+    旧逻辑下 entity_refs=[] → entity scope directive 漏注入 → 路由分支不触发。
+    修复: directive 文本进 fts 池, 命中后通过 directive_ids 路径强制拼接,
+    不再依赖 entity slug 命中。
     """
     from helper.ask.retrieve import Hit
     from helper.ask.runtime import ask
@@ -438,13 +438,12 @@ def test_ask_pulls_directive_via_fts_hit(db, settings, llm_stub, stub_bundle, mo
     with session() as s:
         m = Memory(
             scope_type="entity", scope_ref="tachi",
-            directive="涉及 iam 网关 / app_id 类问题, 引导用户去艾特 tachi, app_id 是 cli_DEAD",
+            directive="涉及 iam 网关 / app_id 类问题, 引导用户去艾特 tachi",
+            route_app_id="cli_DEAD",
         )
         s.add(m); s.flush()
         mem_id = m.id
 
-    # 模拟 retrieve 通过 fts 命中 directive(题面无 "tachi" 字面, 但 fts 共词命中
-    # directive 内容里的 "iam 网关"); 同时 entity_refs 为空(没召回 entity#tachi)
     fake_hits = [Hit(type="directive", ref=str(mem_id), title="t", body="b", score=1.0)]
     monkeypatch.setattr(
         "helper.ask.runtime.retrieve_relevant",
@@ -457,15 +456,17 @@ def test_ask_pulls_directive_via_fts_hit(db, settings, llm_stub, stub_bundle, mo
     def fake_ask(system: str, user: str, **kw):
         captured["system"] = system
         captured["user"] = user
-        return "## 答复\nOK\n\n## 置信度\nlow\n\n## 引用\n"
+        return "OK"
 
     llm_stub.set("ask", fake_ask)
     ask("看 iam 网关接入文档 iam_sid 怎么换域账号", asker_domain="alice")
 
-    # directive 内容(含完整 app_id)拼进 system_prompt
+    # directive 文本(不含 hash)拼进 system_prompt
     assert "## 用户偏好" in captured["system"]
-    assert "cli_DEAD" in captured["system"]
-    # directive 不当成"检索结果"喂出去(那是事实段, directive 是行为指令)
+    assert "tachi" in captured["system"]
+    assert "iam 网关" in captured["system"]
+    # cli_xxx hash 绝不进 LLM 视野 — 防 LLM 复述给用户
+    assert "cli_DEAD" not in captured["system"]
     assert "cli_DEAD" not in captured["user"]
 
 
@@ -482,7 +483,8 @@ def test_directive_pass_pulls_via_token_overlap(db, settings):
     with session() as s:
         s.add(Memory(
             scope_type="entity", scope_ref="tachi",
-            directive="涉及 iam 网关 / app_id 类问题艾特 tachi, app_id 是 cli_DEAD",
+            directive="涉及 iam 网关 / app_id 类问题艾特 tachi",
+            route_app_id="cli_DEAD",
         ))
         s.add(Memory(
             scope_type="global", scope_ref="",
@@ -497,7 +499,7 @@ def test_directive_pass_pulls_via_token_overlap(db, settings):
     # 题面共词命中"iam" → tachi 那条出, 简洁那条不出
     hits = _directive_pass("看下 iam 网关接入文档 iam_sid 怎么换域账号")
     bodies = [h.body for h in hits]
-    assert any("cli_DEAD" in b for b in bodies)
+    assert any("tachi" in b for b in bodies)
     assert not any("简洁" in b for b in bodies)
     assert not any("老指令" in b for b in bodies)
 
@@ -516,6 +518,184 @@ def test_directive_pass_skips_when_no_token_overlap(db, settings):
 
     hits = _directive_pass("今天天气怎么样")
     assert hits == []
+
+
+def test_extract_splits_app_id_to_route_field(db, settings, llm_stub):
+    """LLM 把 cli_xxx 抽到 route_app_id 字段, directive 文本不含 hash。
+
+    回归: 之前 LLM 抽出来的 directive 文本里夹着 'tachi 的 appid 是 cli_xxx',
+    在 ask system_prompt 里被 LLM 当成可复述的事实 — 用户问相邻话题时 LLM
+    在回答末尾抄出这个 hash 推荐用户去问 tachi。
+    """
+    from helper.memory import extract_for_raw
+    from helper.storage import session
+    from helper.storage.models import Memory
+
+    raw_id = _seed_raw(
+        "iam 网关 / 查 app_id 类问题艾特 tachi, tachi 的 appid 是 cli_7847a145e02d020b9b7dcec8b6391ab6",
+    )
+    llm_stub.set("memory_extract", json.dumps({"directives": [{
+        "scope_type": "entity", "scope_ref": "tachi",
+        "directive": "iam 网关 / 查 app_id 类问题艾特 tachi",
+        "route_app_id": "cli_7847a145e02d020b9b7dcec8b6391ab6",
+    }]}))
+
+    extract_for_raw(raw_id)
+
+    with session() as s:
+        m = s.execute(select(Memory)).scalar_one()
+        assert m.scope_ref == "tachi"
+        assert m.route_app_id == "cli_7847a145e02d020b9b7dcec8b6391ab6"
+        # directive 文本不含 hash
+        assert "cli_" not in m.directive
+        assert "tachi" in m.directive
+        assert "iam" in m.directive
+
+
+def test_extract_scrubs_app_id_when_llm_forgets(db, settings, llm_stub):
+    """兜底: LLM 漏剥 hash 仍把 cli_xxx 写进 directive → 落库前正则抠掉。
+
+    LLM prompt 已经让它分离, 但 prompt 不是硬约束, 落库前必须再做一次结构清洗。
+    """
+    from helper.memory import extract_for_raw
+    from helper.storage import session
+    from helper.storage.models import Memory
+
+    raw_id = _seed_raw("iam 类问题艾特 tachi, app_id cli_7847a145e02d020b9b7dcec8b6391ab6")
+    # 模拟 LLM "懒" — 没把 hash 抽到 route_app_id 而是留在 directive 里
+    llm_stub.set("memory_extract", json.dumps({"directives": [{
+        "scope_type": "entity", "scope_ref": "tachi",
+        "directive": "iam 类问题艾特 tachi, app_id 是 cli_7847a145e02d020b9b7dcec8b6391ab6",
+        "route_app_id": "",
+    }]}))
+
+    extract_for_raw(raw_id)
+
+    with session() as s:
+        m = s.execute(select(Memory)).scalar_one()
+        assert "cli_" not in m.directive
+        assert m.route_app_id == "cli_7847a145e02d020b9b7dcec8b6391ab6"
+
+
+def test_lookup_directive_text_does_not_leak_app_id(db, settings):
+    """directives_for_ask 输出的偏好段里, 即便 memory.route_app_id 有值, hash 也不出现。"""
+    from helper.memory.lookup import directives_for_ask
+    from helper.storage import session
+    from helper.storage.models import Memory
+
+    with session() as s:
+        s.add(Memory(
+            scope_type="entity", scope_ref="tachi",
+            directive="iam 类问题艾特 tachi",
+            route_app_id="cli_FAKE",
+        ))
+
+    block = directives_for_ask(entity_refs=["tachi"])
+    assert "iam" in block
+    assert "cli_" not in block
+
+
+def test_resolve_route_app_id_by_name(db, settings):
+    """resolve_route_app_id 按 entity 名反查, 取最新的 alive memory.route_app_id。"""
+    from datetime import datetime, timezone
+
+    from helper.memory.lookup import resolve_route_app_id
+    from helper.storage import session
+    from helper.storage.models import Memory
+
+    with session() as s:
+        # 旧的 superseded
+        s.add(Memory(
+            scope_type="entity", scope_ref="tachi",
+            directive="老 指令", route_app_id="cli_OLD",
+            superseded_at=datetime.now(timezone.utc),
+        ))
+        # 新的 alive
+        s.add(Memory(
+            scope_type="entity", scope_ref="tachi",
+            directive="新 指令", route_app_id="cli_NEW",
+        ))
+        # 不相干 entity
+        s.add(Memory(
+            scope_type="entity", scope_ref="other",
+            directive="...", route_app_id="cli_OTHER",
+        ))
+
+    assert resolve_route_app_id("tachi") == "cli_NEW"
+    assert resolve_route_app_id("other") == "cli_OTHER"
+    assert resolve_route_app_id("does_not_exist") == ""
+    assert resolve_route_app_id("") == ""
+
+
+def test_ask_route_resolves_by_name_not_llm_hash(db, settings, llm_stub, stub_bundle, monkeypatch):
+    """ask 路由分支: LLM 输出 ROUTE: tachi 后, 由代码反查真 app_id 发 RouteRequest。
+
+    LLM 视野里没 hash, 不会编造 cli_tachi 之类错的 hash。
+    """
+    from helper.ask.runtime import RouteRequest, ask
+    from helper.storage import session
+    from helper.storage.models import Memory
+
+    with session() as s:
+        s.add(Memory(
+            scope_type="entity", scope_ref="tachi",
+            directive="iam 类问题艾特 tachi",
+            route_app_id="cli_REAL",
+        ))
+
+    monkeypatch.setattr("helper.ask.runtime.retrieve_relevant", lambda q, top_k=8, asker_domain="": [])
+    monkeypatch.setattr("helper.ask.runtime.current_bundle_version", lambda: "test")
+
+    llm_stub.set("ask", "ROUTE: tachi")
+    out = ask("iam 网关接入流程", asker_domain="alice")
+
+    assert isinstance(out, RouteRequest)
+    assert out.target_app_id == "cli_REAL"
+    assert out.via_label == "tachi"
+
+
+def test_ask_route_legacy_format_still_works(db, settings, llm_stub, stub_bundle, monkeypatch):
+    """LLM 凭旧训练习惯抄 'ROUTE: cli_xxx | tachi' 旧格式 → 我们丢弃 cli_, 按 name 反查。
+
+    防 LLM 拼了一个过期或编造的 hash 直接被当成 target_app_id 发出去。
+    """
+    from helper.ask.runtime import RouteRequest, ask
+    from helper.storage import session
+    from helper.storage.models import Memory
+
+    with session() as s:
+        s.add(Memory(
+            scope_type="entity", scope_ref="tachi",
+            directive="iam 类问题艾特 tachi",
+            route_app_id="cli_REAL",
+        ))
+
+    monkeypatch.setattr("helper.ask.runtime.retrieve_relevant", lambda q, top_k=8, asker_domain="": [])
+    monkeypatch.setattr("helper.ask.runtime.current_bundle_version", lambda: "test")
+
+    # LLM 抄回旧格式且 cli_ 部分是错的 — 我们应该忽略 cli_FAKE, 按 tachi 反查到 cli_REAL
+    llm_stub.set("ask", "ROUTE: cli_FAKE | tachi")
+    out = ask("iam 网关接入流程", asker_domain="alice")
+
+    assert isinstance(out, RouteRequest)
+    assert out.target_app_id == "cli_REAL"
+
+
+def test_ask_route_fallback_when_no_app_id_registered(db, settings, llm_stub, stub_bundle, monkeypatch):
+    """LLM 输出 ROUTE: <name> 但 memory 里没登记 route_app_id → 走兜底文案, 不发 RouteRequest。
+
+    防 LLM 给了一个不存在的 bot 名字时把链路打挂。
+    """
+    from helper.ask.runtime import Answer, ask
+
+    monkeypatch.setattr("helper.ask.runtime.retrieve_relevant", lambda q, top_k=8, asker_domain="": [])
+    monkeypatch.setattr("helper.ask.runtime.current_bundle_version", lambda: "test")
+
+    llm_stub.set("ask", "ROUTE: ghost_bot")
+    out = ask("随便问个问题", asker_domain="alice")
+
+    assert isinstance(out, Answer)
+    assert "ghost_bot" in out.answer
 
 
 def test_lookup_pulls_directive_by_id_regardless_of_scope(db, settings):

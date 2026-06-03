@@ -47,3 +47,26 @@ def directives_for_ask(
     if not lines:
         return ""
     return "## 用户偏好\n" + "\n".join(lines)
+
+
+def resolve_route_app_id(via_label: str) -> str:
+    """ask 输出 ROUTE: <bot 名> 哨兵后, 按 entity 名反查 alive memory.route_app_id 拿真 app_id。
+
+    LLM 视野里没有 cli_xxx hash(directive 文本里被 extract 抠掉了), 路由动作发生时
+    才反查这一列把真 hash 拿回来。匹配规则:
+      - 优先 scope_type=entity 且 scope_ref==via_label
+      - 多条命中(理论上不该出现)取最新写入的那条
+      - 没找到返空 → 调用方降级走自答兜底
+    """
+    if not via_label:
+        return ""
+    with session() as s:
+        rows = s.execute(
+            select(Memory)
+            .where(Memory.scope_type == "entity")
+            .where(Memory.scope_ref == via_label)
+            .where(Memory.superseded_at.is_(None))
+            .where(Memory.route_app_id != "")
+            .order_by(Memory.id.desc())
+        ).scalars().all()
+    return rows[0].route_app_id if rows else ""

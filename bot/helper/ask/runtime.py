@@ -44,57 +44,37 @@ class RouteRequest:
 SYSTEM_PROMPT = """你是企业内部决策规约助手,也是可以自然对话的大模型助手。
 
 检索到的"已沉淀规约/entity/历史 raw 判断"是增强材料,不是你开口回答的前提。
-有检索结果时,优先使用它们回答并给出引用;没有检索结果时,也可以基于你的通用知识、
+有检索结果时,优先使用它们回答;没有检索结果时,也可以基于你的通用知识、
 当前对话和助手角色继续帮助用户。只有当用户明确询问企业内部事实、已有规约、
 历史判断、人物/项目等需要库内依据的问题,而检索结果不足时,才说明当前知识库里没有查到依据。
 
 如果消息附了「历史对话」段(用户和 bot 之前几轮的对话),用它来理解当前问题里的
 指代和承接(如"再读一下"是对上一条 bot 回复的回应,"那个文档"指上文出现过的 KM 链接)。
-历史对话只用于解情境,不能作为引用依据,citations 仍只从检索结果里挑。
+历史对话只用于解情境。
 
 如果消息附了「用户引用的消息」段, 这是用户在问当前问题时显式引用(quote)的那条 —
 它是问题所指的具体对象, 优先以它作为承接对象, 而不是历史对话里的最近一条。
 
-如果消息里有「引用文档」段(用户随消息附的 KM 文档全文),回答时优先用文档内容,
-但 citations 仍只能从「检索结果」里挑(文档可能还没沉淀到知识库)。
+如果消息里有「引用文档」段(用户随消息附的 KM 文档全文),回答时优先用文档内容。
 
-# 输出格式 — 固定 markdown 分段, 不要 JSON
+# 路由哨兵(优先判断, 命中则只输出哨兵这一行)
 
-## 路由分支(优先判断)
+如果用户偏好(procedural memory)里写过"涉及 X / Y / Z 类问题, 全部去艾特 bot N 询问"
+之类的路由指令, 当前问题命中或接近 X / Y / Z 描述的范围 → **不要自己回答, 也不要建议
+用户去艾特**, 在第一行单独输出:
 
-如果用户偏好(procedural memory)里写过"<某类问题> 应路由到外部 bot 处理, app_id 是 cli_xxx",
-而当前问题命中了那类场景, 不要自己回答, 在第一行单独输出:
+ROUTE: <bot 名字>
 
-ROUTE: cli_xxx | <bot 名字, 如 tachi>
+(就这一行, 不要任何前后内容。系统会按 bot 名字反查路由目标自动转发, 你不需要也不
+应该知道 bot 的 app_id 或任何 cli_xxx hash。)
 
-(就这一行, 不要任何前后内容。`|` 后是显示用名字, 没名字就只写 app_id。)
+判断宽松: directive 描述的关键词、主题域、相邻概念都算命中, 让目标 bot 自己决定能不能答。
+反过来, 题面跟所有 directive 描述的范围**都不沾边**时(纯天气、纯通用知识), 才自答。
 
-判断从严: 必须 memory 里有明确的"路由给 bot X"指令, 且当前问题命中 memory 里写的场景。
-不要凭直觉路由(比如看到"app_id"字面就路由), 除非 memory 里写了"问 app_id 类问题 @ X"。
+# 自答分支
 
-## 答题分支(默认)
-
-不路由就按下面三段输出, 段标题严格 `## 答复` / `## 置信度` / `## 引用`, 顺序固定:
-
-## 答复
-<对用户问题的答复, 自由 markdown, 引号 / 换行 / 列表随便用, 不需要任何转义>
-
-## 置信度
-high
-
-(三选一: high / medium / low。判断:
-- high: 至少一条 spec 直接命中
-- medium: 多条 entity / raw 间接相关
-- low: 检索结果薄弱, 或主要基于通用知识 / 当前对话回答)
-
-## 引用
-- spec: <slug>
-- entity: <slug>
-- raw: <id>
-
-(每行一条, 形如 `- <type>: <ref>`。type 限 spec / entity / raw / fact / case / relation。
-没有使用检索结果时,`## 引用` 后面留空即可,不要因此自动拒答。
-不要编造引用 — 引用只能从下面"检索结果"段里挑。)"""
+不路由就直接给答案, 自由 markdown, 不要分段标题, 不要"置信度", 不要"引用"列表,
+不要"根据知识库..."这种引述话术 — 该说什么直接说。"""
 
 
 def _format_hits(hits: list[Hit]) -> str:
@@ -127,9 +107,9 @@ def _format_chat_context(
 
 
 _FENCE_RE = re.compile(r"```(?:\w+)?\s*(.+?)\s*```", re.DOTALL)
-_ROUTE_LINE_RE = re.compile(r"^\s*ROUTE\s*:\s*([^\s|]+)\s*(?:\|\s*(.+?))?\s*$", re.MULTILINE)
-_SECTION_RE = re.compile(r"^##\s+(\S.*?)\s*$", re.MULTILINE)
-_CITATION_LINE_RE = re.compile(r"^\s*[-*]\s*([A-Za-z]+)\s*:\s*(\S.*?)\s*$")
+# 新格式: ROUTE: <bot 名字>。 兼容旧 ROUTE: cli_xxx | <name> 形态(过渡期),
+# 但旧形态下我们丢弃 cli_ 部分, 仍按 name 反查 — 防 LLM 误抄过期 hash。
+_ROUTE_LINE_RE = re.compile(r"^\s*ROUTE\s*:\s*(.+?)\s*$", re.MULTILINE)
 
 
 def _strip_fence(text: str) -> str:
@@ -139,49 +119,34 @@ def _strip_fence(text: str) -> str:
     return m.group(1).strip() if m else text
 
 
-def _parse_route(text: str) -> tuple[str, str] | None:
-    """识别首行 `ROUTE: <app_id> | <label>` 哨兵。返 (app_id, label) 或 None。
+def _parse_route(text: str) -> str | None:
+    """识别首行 `ROUTE: <bot 名字>` 哨兵, 返 bot 名字 (= entity scope_ref) 或 None。
 
-    宽容: 哨兵不必严格在第 0 行, 只要在前 3 行内单独成行即可。
+    宽容:
+      - 哨兵不必严格在第 0 行, 只要在前 3 行内单独成行即可
+      - 兼容旧 `ROUTE: cli_xxx | <name>` 形态: LLM 万一抄了缓存的旧格式, 我们丢弃
+        cli_ 部分(可能是过期/编造的 hash), 取 `|` 后的 name; 如果没有 `|`, 那这条
+        ROUTE 是裸 cli_, 我们当解析失败 → None, 强制走答题分支兜底。
+
+    返回 None 时调用方走答题分支。返回 "" 也视作失败。
     """
     body = _strip_fence(text)
     m = _ROUTE_LINE_RE.search(body)
     if not m:
         return None
-    # 前面只允许空行 — 防止 LLM 把 ROUTE 写在答复正文里
     pre = body[: m.start()].strip()
     if pre:
         return None
-    app_id = m.group(1).strip()
-    label = (m.group(2) or "").strip()
-    return (app_id, label) if app_id else None
-
-
-def _parse_sections(text: str) -> dict[str, str]:
-    """切 `## 标题\\n正文` 段, 返 {title: body}。title 已 lower-strip。"""
-    body = _strip_fence(text)
-    matches = list(_SECTION_RE.finditer(body))
-    out: dict[str, str] = {}
-    for i, m in enumerate(matches):
-        title = m.group(1).strip().lower()
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
-        out[title] = body[start:end].strip()
-    return out
-
-
-def _parse_citations(block: str) -> list[dict[str, str]]:
-    """从 `## 引用` 段切出 [{type, ref}]。空行/非法行跳过。"""
-    out: list[dict[str, str]] = []
-    for line in block.splitlines():
-        m = _CITATION_LINE_RE.match(line)
-        if not m:
-            continue
-        ctype = m.group(1).strip().lower()
-        cref = m.group(2).strip().rstrip(",;.")
-        if ctype and cref:
-            out.append({"type": ctype, "ref": cref})
-    return out
+    raw = m.group(1).strip()
+    if "|" in raw:
+        # 旧格式 `cli_xxx | name`: 取 `|` 后的 name
+        _, _, name = raw.partition("|")
+        name = name.strip()
+        return name or None
+    if raw.startswith("cli_"):
+        # 裸 cli_xxx 没 `|` — 没法反查 entity 名, 当解析失败
+        return None
+    return raw or None
 
 
 def _format_quoted_message(parent_message_id: str) -> str:
@@ -309,27 +274,33 @@ def ask(
             model=model,
         )
 
-    # 路由分支: 首行 ROUTE: <app_id> | <label> 哨兵
-    route = _parse_route(reply)
-    if route is not None:
-        target_app_id, via_label = route
-        return RouteRequest(
-            target_app_id=target_app_id,
-            via_label=via_label or target_app_id,
+    # 路由分支: 首行 ROUTE: <bot 名字> 哨兵 → 按名字反查 alive memory.route_app_id
+    # 拿真 app_id (LLM 视野里没 hash, 解决 LLM 编造 cli_xxx 的根因)。
+    via_label = _parse_route(reply)
+    if via_label:
+        from helper.memory import resolve_route_app_id
+        target_app_id = resolve_route_app_id(via_label)
+        if target_app_id:
+            return RouteRequest(
+                target_app_id=target_app_id,
+                via_label=via_label,
+                bundle_version=current_bundle_version(),
+                model=model,
+            )
+        # 反查不到 — LLM 给了一个 memory 里没登记 route_app_id 的名字 → 兜底文案
+        # (不去解析 reply 后续答题段, 因为 LLM 走的就是 ROUTE 分支, 没生成答题段)
+        log.warning("route hint=%r but no alive memory route_app_id; fallback msg", via_label)
+        return Answer(
+            answer=f"这个问题可能更适合 @{via_label} 来答, 你可以直接 @ 它问问。",
+            confidence="low",
             bundle_version=current_bundle_version(),
             model=model,
         )
 
-    sections = _parse_sections(reply)
-    answer_text = sections.get("答复", "").strip()
-    if not answer_text:
-        # 解析失败兜底: LLM 没按格式输出 → 直接吃整段回复但去 fence
-        answer_text = _strip_fence(reply)
-    confidence = sections.get("置信度", "").strip().lower().splitlines()[0:1]
-    confidence = (confidence[0] if confidence else "").strip()
-    if confidence not in ("high", "medium", "low"):
-        confidence = "unknown"
-    citations: list[dict[str, Any]] = _parse_citations(sections.get("引用", ""))
+    # prompt 已不要求 LLM 输出分段标题/置信度/引用 — 整段回复(去 fence)就是答案
+    answer_text = _strip_fence(reply).strip()
+    confidence = "unknown"
+    citations: list[dict[str, Any]] = []
 
     # ACL 出口硬过滤: LLM 即便没拿到敏感原文 (retrieve 已过滤 + chat_context 已过滤),
     # 仍可能凭参数知识 / 迂回话术自己脑补出敏感名字 → 整段替换为 deny_response。

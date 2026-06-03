@@ -8,10 +8,11 @@
 """
 
 from helper.memory.extract import extract_for_raw, schedule_memory_extract
-from helper.memory.lookup import directives_for_ask
+from helper.memory.lookup import directives_for_ask, resolve_route_app_id
 
 __all__ = [
     "directives_for_ask",
     "extract_for_raw",
+    "resolve_route_app_id",
     "schedule_memory_extract",
 ]

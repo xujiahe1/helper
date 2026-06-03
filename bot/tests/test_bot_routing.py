@@ -112,9 +112,9 @@ def test_dispatch_route_send_failure_returns_false_no_db_row(
 
 
 def test_handle_bot_reply_group_replies_with_prefix_and_forwards(
-    db, settings, wave_action_log,
+    db, settings, wave_action_log, llm_stub,
 ):
-    """群聊: 1 条 reply 前缀("@asker 已咨询 @via:") + 1 条 send 原样透传(msg_type=text)。"""
+    """群聊: 1 条 reply 前缀("@asker 已咨询 @via:") + 1 张 markdown card(LLM 转述结果)。"""
     import json as _json
 
     from helper.im.bot_routing import dispatch_route, handle_bot_reply
@@ -128,6 +128,8 @@ def test_handle_bot_reply_group_replies_with_prefix_and_forwards(
         original_wave_msg_id="om_user_q", original_asker_domain="alice",
         tracker=None,
     )
+
+    llm_stub.set("restate_bot_reply", "## 查询结果\n- agent_name: HYG谷多曼\n- owner: zhishuang.li")
 
     reply_payload = {
         "event": {
@@ -148,11 +150,16 @@ def test_handle_bot_reply_group_replies_with_prefix_and_forwards(
     assert prefix_payload["text"] == "@alice 已咨询 @tachi:"
     assert reply_calls[0]["msg_type"] == "text"
 
-    # b) 透传走 send_message(receiver=chat_id, msg_type=text, content 原 JSON 字符串)
+    # b) 转述后用 markdown card 发到原会话
     sends = [e for e in wave_action_log if e["kind"] == "send" and e.get("receiver_id") == "oc_group"]
     assert len(sends) == 1
-    assert sends[0]["msg_type"] == "text"
-    assert sends[0]["content"] == '{"text":"agent_name: HYG谷多曼, owner: zhishuang.li"}'
+    assert sends[0]["msg_type"] == "card"
+    rebuilt = _json.loads(sends[0]["content"])
+    assert rebuilt["card"]["tag"] == "flow"
+    el = rebuilt["card"]["elements"]
+    assert len(el) == 1 and el[0]["tag"] == "markdown"
+    assert "HYG谷多曼" in el[0]["text"]
+    assert "zhishuang.li" in el[0]["text"]
 
     # consumed_at 已标
     with session() as sess:
@@ -161,9 +168,9 @@ def test_handle_bot_reply_group_replies_with_prefix_and_forwards(
 
 
 def test_handle_bot_reply_dm_replies_in_dm_no_at(
-    db, settings, wave_action_log,
+    db, settings, wave_action_log, llm_stub,
 ):
-    """私聊: 2 条 send 给 asker(无 chat_id 不走 reply): 前缀 "已咨询 @via:" + 原样透传。"""
+    """私聊: 2 条 send 给 asker(无 chat_id 不走 reply): 前缀 "已咨询 @via:" + markdown card。"""
     import json as _json
 
     from helper.im.bot_routing import dispatch_route, handle_bot_reply
@@ -176,6 +183,7 @@ def test_handle_bot_reply_dm_replies_in_dm_no_at(
         original_asker_domain="alice",
         tracker=None,
     )
+    llm_stub.set("restate_bot_reply", "**重写后的 answer body**")
 
     reply_payload = {
         "event": {
@@ -197,9 +205,10 @@ def test_handle_bot_reply_dm_replies_in_dm_no_at(
     assert "@alice" not in prefix["text"]
     assert sends_to_alice[0]["msg_type"] == "text"
 
-    # 第 2 条: 原样透传
-    assert sends_to_alice[1]["msg_type"] == "text"
-    assert sends_to_alice[1]["content"] == '{"text":"answer body"}'
+    # 第 2 条: LLM 转述后的 markdown card
+    assert sends_to_alice[1]["msg_type"] == "card"
+    rebuilt = _json.loads(sends_to_alice[1]["content"])
+    assert rebuilt["card"]["elements"][0]["text"] == "**重写后的 answer body**"
 
 
 def test_handle_bot_reply_no_pending_drops(db, settings, wave_action_log):
@@ -217,9 +226,11 @@ def test_handle_bot_reply_no_pending_drops(db, settings, wave_action_log):
     assert wave_action_log == []
 
 
-def test_handle_bot_reply_forwards_card_as_rebuilt_markdown(db, settings, wave_action_log):
-    """tachi 回 card 时不能原样透传(retcode 10401069 组件校验失败) — 改为抽 markdown
-    后用 helper 自己 app 重构最简 card 发出。验证: 抽出的文字 + 重构 card 结构正确。
+def test_handle_bot_reply_forwards_card_via_llm_restate(
+    db, settings, wave_action_log, llm_stub,
+):
+    """tachi 回 card(i18n_text 扁平字符串)时,helper 抽原文 → LLM 转述 → markdown card。
+    验证: LLM 拿到的是抽出的原文; 卡片正文是 LLM 输出。
     """
     from helper.im.bot_routing import dispatch_route, handle_bot_reply
     import json as _json
@@ -233,6 +244,13 @@ def test_handle_bot_reply_forwards_card_as_rebuilt_markdown(db, settings, wave_a
     card_content_str = _json.dumps({
         "i18n_text": {"zh-cn": "查询到了 👇 agent_name: HYG", "en": "got it"}
     })
+
+    captured: dict = {}
+    def _restate(system, user, **kw):
+        captured["user"] = user
+        return "## 结果\n- agent_name: HYG"
+    llm_stub.set("restate_bot_reply", _restate)
+
     payload = {
         "event": {
             "sender": {"id": "cli_tachi", "id_type": "app_id"},
@@ -241,52 +259,47 @@ def test_handle_bot_reply_forwards_card_as_rebuilt_markdown(db, settings, wave_a
     }
     handle_bot_reply(payload, sender_app_id="cli_tachi")
 
-    # a) 前缀: reply_message text
+    # LLM 拿到的 user 内容里包含 helper 从 i18n_text 抽出来的原文
+    assert "查询到了" in captured["user"]
+    assert "agent_name: HYG" in captured["user"]
+    assert "@tachi" in captured["user"]
+
+    # 前缀
     reply_calls = [e for e in wave_action_log if e["kind"] == "reply"]
     assert len(reply_calls) == 1
-    assert reply_calls[0]["msg_type"] == "text"
     assert _json.loads(reply_calls[0]["content"])["text"] == "@bob 已咨询 @tachi:"
 
-    # b) 重构 card: 仍然是 card 类型, 但 content 是 helper 自己拼的最简 markdown card
+    # markdown card 正文 = LLM 输出
     sends = [e for e in wave_action_log if e["kind"] == "send" and e.get("receiver_id") == "oc_group"]
     assert len(sends) == 1
     assert sends[0]["msg_type"] == "card"
     rebuilt = _json.loads(sends[0]["content"])
     assert rebuilt["card"]["tag"] == "flow"
-    elements = rebuilt["card"]["elements"]
-    assert len(elements) == 1
-    assert elements[0]["tag"] == "markdown"
-    assert "查询到了" in elements[0]["text"]
-    assert "agent_name: HYG" in elements[0]["text"]
+    el = rebuilt["card"]["elements"]
+    assert len(el) == 1 and el[0]["tag"] == "markdown"
+    assert el[0]["text"] == "## 结果\n- agent_name: HYG"
 
 
-def test_handle_bot_reply_card_with_elements_extracts_markdown_and_image(
-    db, settings, wave_action_log,
+def test_handle_bot_reply_llm_failure_falls_back_to_extracted_text(
+    db, settings, wave_action_log, llm_stub,
 ):
-    """tachi 回的 card 含 header.title + markdown elements + image — 抽出后保留段落和图片。"""
+    """LLM 转述失败 → 兜底用抽出的扁平文本直发(text 消息)。"""
     from helper.im.bot_routing import dispatch_route, handle_bot_reply
     import json as _json
 
     dispatch_route(
         target_app_id="cli_tachi", via_label="tachi", forwarded_text="x",
-        original_raw_id=21, original_chat_id="oc_group",
+        original_raw_id=22, original_chat_id="oc_group",
         original_wave_msg_id="om_q", original_asker_domain="bob",
         tracker=None,
     )
     card_content_str = _json.dumps({
-        "header": {"title": "iam_sid 换取方式"},
-        "card": {
-            "tag": "flow",
-            "elements": [
-                {"tag": "markdown", "text": "## 核心结论\n生产不允许后端拿 iam_sid"},
-                {"tag": "hr"},
-                {"tag": "image", "image_url": "https://example.com/x.png", "alt": "图"},
-                {"tag": "markdown", "text": "**链路**: 浏览器 → 网关 → ACR"},
-                # 含 form/button 元素 — 应被忽略, 不影响其他元素抽取
-                {"tag": "button", "text": "click", "value": {"action": "x"}},
-            ],
-        },
+        "i18n_text": {"zh-cn": "扁平的回复"}
     })
+    def _boom(**kw):
+        raise RuntimeError("athenai down")
+    llm_stub.set("restate_bot_reply", _boom)
+
     payload = {
         "event": {
             "sender": {"id": "cli_tachi", "id_type": "app_id"},
@@ -297,18 +310,13 @@ def test_handle_bot_reply_card_with_elements_extracts_markdown_and_image(
 
     sends = [e for e in wave_action_log if e["kind"] == "send" and e.get("receiver_id") == "oc_group"]
     assert len(sends) == 1
-    rebuilt = _json.loads(sends[0]["content"])
-    md = rebuilt["card"]["elements"][0]["text"]
-    assert "## iam_sid 换取方式" in md
-    assert "核心结论" in md
-    assert "生产不允许" in md
-    assert "---" in md
-    assert "https://example.com/x.png" in md
-    assert "**链路**" in md
+    # 兜底走 text 直发
+    assert sends[0]["msg_type"] == "text"
+    assert _json.loads(sends[0]["content"])["text"] == "扁平的回复"
 
 
 def test_handle_bot_reply_consumed_routing_not_picked_again(
-    db, settings, wave_action_log,
+    db, settings, wave_action_log, llm_stub,
 ):
     from helper.im.bot_routing import dispatch_route, handle_bot_reply
 
@@ -318,6 +326,7 @@ def test_handle_bot_reply_consumed_routing_not_picked_again(
         original_wave_msg_id="om_q", original_asker_domain="alice",
         tracker=None,
     )
+    llm_stub.set("restate_bot_reply", "first")
     payload = {
         "event": {
             "sender": {"id": "cli_tachi", "id_type": "app_id"},
@@ -364,7 +373,7 @@ def test_expire_old_routings_marks_expired_and_notifies(
     assert r.consumed_at is None
 
 
-def test_expire_does_not_touch_consumed_or_fresh(db, settings, wave_action_log):
+def test_expire_does_not_touch_consumed_or_fresh(db, settings, wave_action_log, llm_stub):
     from helper.im.bot_routing import dispatch_route, expire_old_routings, handle_bot_reply
     from helper.storage import session
     from helper.storage.models import PendingRouting
@@ -382,6 +391,7 @@ def test_expire_does_not_touch_consumed_or_fresh(db, settings, wave_action_log):
         original_raw_id=2, original_chat_id="",
         original_wave_msg_id="", original_asker_domain="u2", tracker=None,
     )
+    llm_stub.set("restate_bot_reply", "ok")
     handle_bot_reply(
         {"event": {"sender": {"id": "cli_b", "id_type": "app_id"},
                    "message": {"msg_type": "text", "content": '{"text":"ok"}'}}},

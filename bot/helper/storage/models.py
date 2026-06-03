@@ -477,7 +477,12 @@ class Memory(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     scope_type: Mapped[str] = mapped_column(String(16), default="global")  # entity/global
     scope_ref: Mapped[str] = mapped_column(String(128), default="")        # entity slug;global 时空
-    directive: Mapped[str] = mapped_column(Text)                           # 指令文本
+    directive: Mapped[str] = mapped_column(Text)                           # 指令文本(给 LLM 读, 不含 cli_xxx hash)
+    # 路由结构数据 — 这条 directive 触发路由时的目标 bot app_id。
+    # 单独存而不写进 directive 文本: hash 不该进 LLM 视野(否则 LLM 会复述给用户),
+    # 也避免 LLM 从 directive 文本里抄出错的 app_id; 路由动作内部按 scope_ref(entity 名)
+    # 反查这一列拿真 hash。无路由意图的 directive 留空。
+    route_app_id: Mapped[str] = mapped_column(String(64), default="")
     source_raw_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("raw_inputs.id", ondelete="SET NULL"), nullable=True
     )

@@ -276,11 +276,12 @@ def test_deny_for_question_passes_through_for_whitelist(
 
     monkeypatch.setattr("helper.ask.runtime.current_bundle_version", lambda: "test")
     llm_stub.set("acl_tag", "ge")
-    llm_stub.set("ask", "## 答复\n这是答\n\n## 置信度\nhigh\n\n## 引用\n")
+    llm_stub.set("ask", "这是答")
 
     ans = ask("谁是螃蟹", asker_domain="jiahe.xu", chat_id="oc1")
     assert ans.answer == "这是答"
-    assert ans.confidence == "high"
+    # confidence 现在恒为 unknown — prompt 已不再要求 LLM 输出置信度
+    assert ans.confidence == "unknown"
 
 
 def test_deny_for_question_no_block_for_public_question(
@@ -291,7 +292,7 @@ def test_deny_for_question_no_block_for_public_question(
 
     monkeypatch.setattr("helper.ask.runtime.current_bundle_version", lambda: "test")
     llm_stub.set("acl_tag", "")
-    llm_stub.set("ask", "## 答复\nIAM\n\n## 置信度\nlow\n\n## 引用\n")
+    llm_stub.set("ask", "IAM")
 
     ans = ask("可见性怎么配置", asker_domain="outsider")
     assert ans.answer == "IAM"
@@ -331,7 +332,7 @@ def test_ask_scrubs_answer_when_llm_leaks_blocked_name(
 
     monkeypatch.setattr("helper.ask.runtime.current_bundle_version", lambda: "test")
     llm_stub.set("acl_tag", "")  # 入口闸不命中(模拟问题表述无敏感)
-    llm_stub.set("ask", "## 答复\n据我所知刘佳翔目前在主导 IAM 改造。\n\n## 置信度\nlow\n\n## 引用\n")
+    llm_stub.set("ask", "据我所知刘佳翔目前在主导 IAM 改造。")
 
     ans = ask("信息化负责人最近在干嘛", asker_domain="outsider")
     assert ans.answer == "这个话题我不知道。"

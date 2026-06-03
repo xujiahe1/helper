@@ -320,24 +320,65 @@ def _send_to_origin(
         )
 
 
+_RESTATE_SYSTEM_PROMPT = """你正在帮 helper bot 把外部 bot 的回答重新组织成 markdown 卡片。
+
+输入是一个外部 bot 给用户问题的回复, 已经抽成纯文本(可能扁平、表格被压成空格分隔行、
+段落分隔丢失)。你的任务: 把它整理成结构清晰的 markdown, 让用户看着舒服。
+
+要求:
+- 用 markdown 自由表达: 标题、列表、表格、代码块都可以, 不要分段标题脚手架(像 ## 答复)
+- 内容重新组织, 不必逐字保留措辞 — 但所有事实细节必须原样保留:
+  * 链接 URL、API 路径、HTTP 方法、参数名、字段名、返回码、Cookie 名等技术 token 不允许改写
+  * 数字、人名、bot 名、产品名不允许改写
+  * 不要补任何原文里没有的事实
+- 不要加"以下是..."、"我来重新整理..."这种引导语, 直接给重写后的内容
+- 不要加 ## 来自 X 的回答 之类的 header — helper 已经有专门的咨询前缀卡片
+- 输出就是给用户看的最终内容, 不要任何外层包装、不要 fence"""
+
+
+def _restate_to_markdown(extracted_text: str, via_label: str) -> str:
+    """走 restate_bot_reply task 把对方扁平输出重写成 markdown。失败返空串。"""
+    if not extracted_text.strip():
+        return ""
+    from helper.llm import run
+    user = f"外部 bot 是 @{via_label}, 它给用户问题的回复(已抽成纯文本):\n\n{extracted_text}"
+    try:
+        out = run("restate_bot_reply", system=_RESTATE_SYSTEM_PROMPT, user=user, temperature=0.2)
+    except Exception as e:  # noqa: BLE001
+        log.warning("restate_bot_reply LLM failed: %s", e)
+        return ""
+    return out.strip()
+
+
 def handle_bot_reply(payload: dict[str, Any], *, sender_app_id: str) -> bool:
-    """target bot 私聊回 helper → 找最近未消费 PendingRouting → 前缀 + 原样透传 + 标 consumed。
+    """target bot 私聊回 helper → 找最近未消费 PendingRouting → 前缀 + LLM 转述卡片 + 标 consumed。
 
     流程:
       a) 前缀("@asker 已咨询 @via:") → 优先替换 tracker 卡片, 否则发一条 text
-      b) 原样转发对方原消息(card/rich_text/text 按原 msg_type+content 直发, 视觉保真)
-      c) 透传失败(unsupported msg_type 等) → 兜底抽 text 再发一遍
+      b) 抽对方原文 → LLM 转述 → markdown card 发到原会话
+      c) 转述失败 / 抽不到原文 → 兜底抽 text 直发
 
     返回 True = 关联到一条 routing 并回贴; False = 没找到 routing(应丢弃, 不走 raw_inputs)。
 
-    注意 b) 不能原样转发对方 card — Wave send 接口对 card 做组件级校验
-    (retcode 10401069),tachi 那边的 form / button / select 组件在 helper app
-    下过不了校验。改成抽 markdown 后用 helper 自己 app 重构最简 markdown card。
+    历史: b) 早期是"原样透传"(直接把对方 card content 喂回 send_message),
+    但对方 card 里的 form/button/select 组件在 helper app 下过不了 Wave 组件校验
+    (retcode 10401069); 退一步用 walker 抽 markdown 重构最简 card 又会拿到 tachi
+    端已经被压扁的 i18n_text(表格 → 空格分隔单行, 段落 → 连续无 \\n)。最后落到
+    LLM 转述: 由 restate_bot_reply task 重新组织成结构清晰的 markdown, 用 helper
+    自己 app 的最简 markdown card 出。
     """
     if not sender_app_id:
         return False
 
     msg_type, content_str = _extract_raw_message(payload)
+    # 现场取证: 落对方 bot 原始消息体, 用于排查格式还原问题(walker 抽不全 / column_set
+    # 表格丢结构 / 图片走 fallback 之类)。content_str 是 Wave 协议 JSON 字符串原文,
+    # 完整保真。WARNING 级别确保 uvicorn root logger 默认配置下也能落到 helper.err,
+    # 不依赖 helper 自定义 log config (不存在)。只在出格式问题时翻, 不需要长期保留。
+    log.warning(
+        "bot reply payload sender=%s msg_type=%s content=%s",
+        sender_app_id, msg_type, content_str,
+    )
     cutoff = _utcnow() - ROUTING_TTL
 
     with session() as s:
@@ -395,47 +436,43 @@ def handle_bot_reply(payload: dict[str, Any], *, sender_app_id: str) -> bool:
         except WaveAPIError as e:
             log.warning("send prefix failed routing=%d: %s", routing_id, e)
 
-    # b) 转发对方消息:
-    #    - text / rich_text → 原样透传(简单消息无组件校验问题)
-    #    - card → 抽 markdown 后重构最简 card 发(避开 tachi card 里的 form/button 组件校验)
-    #    - 其他 msg_type → 跳过, 走 c) 兜底
+    # b) 抽对方原文 → LLM 转述 → markdown card 发
+    extracted = _extract_markdown_from_inner(_safe_json(content_str)) if content_str else ""
     forwarded = False
-    if msg_type in ("text", "rich_text") and content_str:
-        try:
-            _send_to_origin(
-                chat_id=chat_id,
-                asker=asker,
-                wave_quote="",
-                msg_type=msg_type,
-                content_str=content_str,
-            )
-            forwarded = True
-        except WaveAPIError as e:
+    if extracted:
+        restated = _restate_to_markdown(extracted, via)
+        # 现场取证: 落 LLM 转述出来的原始 markdown 文本和实际发到 wave 的 card content_str。
+        # 用来排查"卡片渲染扁平"问题: LLM 是否按 Wave 卡片 markdown 语法 (| 表格 | / # 标题 / ```代码块```)
+        # 输出, 还是给了平铺的伪结构。WARNING 级别走 helper.err 默认 root logger。
+        # 只在排查格式问题时翻, 不需要长期保留。
+        log.warning(
+            "restate output routing=%d via=%s restated=%r",
+            routing_id, via, restated,
+        )
+        if restated:
+            card_content = _build_markdown_card_content(restated)
             log.warning(
-                "forward %s verbatim failed routing=%d: %s",
-                msg_type, routing_id, e,
+                "outbound restated card routing=%d content=%s",
+                routing_id, card_content,
             )
-    elif msg_type == "card" and content_str:
-        markdown_text = _extract_markdown_from_inner(_safe_json(content_str))
-        if markdown_text:
             try:
                 _send_to_origin(
                     chat_id=chat_id,
                     asker=asker,
                     wave_quote="",
                     msg_type="card",
-                    content_str=_build_markdown_card_content(markdown_text),
+                    content_str=card_content,
                 )
                 forwarded = True
             except WaveAPIError as e:
                 log.warning(
-                    "forward rebuilt card failed routing=%d: %s",
+                    "forward restated card failed routing=%d: %s",
                     routing_id, e,
                 )
 
-    # c) 透传失败 / 拿不到原 content → 抽 text 兜底发一遍
+    # c) 转述失败 / 抽不到原文 → 抽 text 兜底直发
     if not forwarded:
-        fallback_text = _extract_reply_text(payload) or "(对方回了, 但内容抽不到, 请直接看会话)"
+        fallback_text = extracted or _extract_reply_text(payload) or "(对方回了, 但内容抽不到, 请直接看会话)"
         try:
             _send_to_origin(
                 chat_id=chat_id,
