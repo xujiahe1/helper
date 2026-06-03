@@ -71,9 +71,7 @@
 ## Month 6 — Conflict 5 类全过 + Bot-routing ✅
 
 - 5 类原子统一过 LLM judge(sonnet,输出 contradicts / scope_diff / dup / orthogonal,支持 auto_superseded / auto_rejected / auto_coexist)
-- conflict_judge opus → sonnet
 - Bot-routing(命中"X 类问题去问 @Y" → 私聊外部 bot 代发 + `pending_routings` 5min 超时)
-- 卡片透传保真(前缀 `@asker 已咨询 @Y:` + 原样透传 msg_type+content)
 - bot-to-bot 入站不污染语料(`sender.id_type=app_id` 且非己 → 不落 raw_inputs)
 
 ---
@@ -99,6 +97,16 @@
 
 ---
 
+## Month 9 — Bot-routing v2 + 会话控制 ✅
+
+- Bot-routing 转述化: 对外 bot 回执 LLM 重写为 markdown card (替代原样透传 — form/button 过不了 Wave 校验, 扁平 i18n_text 丢表格)
+- `/clear` 命令: 给当前 scope 钉 cutoff_raw_id, `list_chat_history` 过滤 — 屏蔽上下文加载不删数据
+- 检索通道分离: directive 走独立 fts 通道, 不与 raw/section 抢 RRF top_k
+- 引用消息反查: 用户 quote 某条历史消息提问时, 被引原文拼进 prompt
+- bot 回复检索硬隔离: `im_wave_bot` 打 `skipped:bot_reply`, 纯 ack 文案不落 raw
+
+---
+
 ## Inbox 节奏 — 周报 vs 主动触发
 
 owner 不必等周一才看到待办。两条触发并存:
@@ -118,7 +126,6 @@ owner 不必等周一才看到待办。两条触发并存:
 |---|---|
 | OP-2 | 第二个领域专家是谁 — Month 3 核心验收,未启动 |
 | OP-3 | M5 撤销路径(`取消刚才那条`)还没 dogfood 验证 |
-| OP-4 | reply 父消息反查 — 当前只存 `parent_message_id` 不反查内容,实测群里大家不用 reply 语义,优先级低 |
 
 ---
 

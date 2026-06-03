@@ -53,3 +53,6 @@
 - 工具调用经济性: 已知路径直接 Read,≥3 个陌生文件探索用 Agent(Explore),不滥用搜索
 - **部署纪律**: 本地开发优先,服务器是部署目标不是开发环境;改 Wave 回调 URL、deploy systemd unit 等线上动作只在准备部署时做
 - **领域纪律**: 任何"为某领域优化"的设计都需要先停下来问"这个能复用到其他领域吗",不能则不做
+- **诊断先于推测**: 线上行为不符合预期, **先在外部 IO 边界 (LLM 入参出参 / Wave 出站 / DB 写入) 加 WARN 日志再触发一次**, 不要凭推测改代码 ship。诊断口 `/var/log/helper/helper.err`。
+- **新 LLM task 三处同步**: 加 task 必须同时改 `bot/helper/policy/defaults/llm_routing.yaml` + `bot/var/helper/git-repo/meta/policies/llm_routing.yaml` + **服务器 `/var/lib/helper/git-repo/meta/policies/llm_routing.yaml`** (运行时实际读这份)。漏第三处 → router 抛 `Unknown task type` → 调用方静默走兜底。
+- **完整踩坑清单**: `docs/runtime.md` §6 — 加新功能前过一遍。
