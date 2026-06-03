@@ -32,6 +32,11 @@ tasks:
   # 压成空格连续行)或带组件的 card(form/button 在 helper app 下过不了校验),
   # 由 LLM 重写成可读 markdown 比 helper 端做规则 reflow 更稳。
   restate_bot_reply: { model: claude-sonnet-4-6, provider: anthropic }
+  # 路由场景升级: 拿到外部 bot 回执后, 结合 helper 自己的 KB 检索命中 + procedural
+  # memory + 群聊上下文 → 让 LLM 综合给一个最终答案 (而不是只重排版 tachi 原话)。
+  # 冲突时以 tachi 为准 (它是被路由到的领域专家); helper KB 没命中则调用方退化回
+  # restate_bot_reply, 不走这个 task。
+  synthesize_with_routed_reply: { model: claude-sonnet-4-6, provider: anthropic }
 
   # ── L1 预筛(mini): 群聊"听"路径上,关键词没命中时让小模型快速判 yes/no ──
   # 群消息无差别全量跑 Sonnet L1 太烧;关键词预筛覆盖大头,边缘 case 让 mini 兜底。

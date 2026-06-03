@@ -28,7 +28,7 @@ from helper.im import wave_client
 from helper.im.progress_card import ThinkingTracker
 from helper.im.wave_client import WaveAPIError
 from helper.storage import session
-from helper.storage.models import PendingRouting, _utcnow
+from helper.storage.models import PendingRouting, RawInput, _utcnow
 
 log = logging.getLogger(__name__)
 
@@ -350,6 +350,121 @@ def _restate_to_markdown(extracted_text: str, via_label: str) -> str:
     return out.strip()
 
 
+_SYNTHESIZE_SYSTEM_PROMPT = """你正在替 helper bot 整合一份最终回答。
+
+输入由三段组成:
+  1. 用户原问题
+  2. helper 自己 KB 检索到的相关素材 (可能为空)
+  3. 外部 bot @{via} 的回复 (已抽成纯文本, 可能扁平、表格被压成空格分隔行)
+
+外部 bot 是该领域被路由到的专家, 它的回答是回答的主体; helper KB 是补充和对照。
+
+要求:
+- **冲突时以外部 bot 的回答为准** (它领域更专、信息更新), 但如果 helper KB 里有
+  明显更具体的事实 (例如更精确的字段名、更完整的步骤、外部 bot 没提到的相关知识),
+  把这些事实合进来。如果两边正面冲突且 helper KB 看起来明显是旧版/过期信息, 直接
+  以外部 bot 为准, 不必标注差异; 只在两边都像是当前事实但表述不一致时, 简短一句
+  注明 "据 helper KB ..." 让用户自己判断。
+- **不要凭空编造**: 如果一个事实只在外部 bot 输出里, helper KB 没提, 直接用外部
+  bot 的; 反之亦然。两边都没提的, 一律不要补。
+- **保留所有技术细节**: 链接 URL、API 路径、HTTP 方法、参数名、字段名、返回码、
+  Cookie 名等技术 token 不允许改写; 数字、人名、bot 名、产品名不允许改写。
+- **重新组织表达**: 不必逐字保留措辞, 用 markdown 自由表达 (标题、列表、表格、
+  代码块都可以)。整合后的回答应该比单独看任一来源更连贯、更完整。
+- **不加引导语**: 不要 "以下是..."、"我来综合..." 这种话。直接给最终内容。
+- **不加 ## 来自 X 的回答 之类的 header** — helper 在卡片外有专门的咨询前缀。
+- 输出就是给用户看的最终内容, 不要任何外层包装、不要 fence。"""
+
+
+def _format_helper_kb(hits: list) -> str:
+    """把 retrieve_relevant 返回的 hits 列出成 helper KB 段落。空 hits 返空串。
+
+    模仿 ask runtime 的 _format_hits 但格式更精简 — synthesize prompt 只是参考素材,
+    不需要把 score 等元信息也喂进去。
+    """
+    if not hits:
+        return ""
+    lines = []
+    for h in hits:
+        body = (h.body or "").strip()
+        if not body:
+            continue
+        lines.append(f"### {h.type}#{h.ref} — {h.title}\n{body}")
+    return "\n\n".join(lines)
+
+
+def _load_original_question(raw_id: int) -> str:
+    """按 original_raw_id 反查用户原问题文本。找不到返空串。"""
+    if not raw_id:
+        return ""
+    with session() as s:
+        row = s.get(RawInput, raw_id)
+        if row is None:
+            return ""
+        return (row.content_text or "").strip()
+
+
+def _synthesize_with_helper_kb(
+    *,
+    extracted_text: str,
+    via_label: str,
+    original_raw_id: int,
+    asker_domain: str,
+    chat_id: str,
+) -> str:
+    """综合 helper KB + 外部 bot 回执 → 最终 markdown 答案。
+
+    步骤:
+      1. 反查用户原问题 (没有 → 直接退化, 调用方走 restate)
+      2. 跑 retrieve_relevant 拿 helper KB 命中
+      3. helper KB 没命中 → 返空串, 让调用方退化走 restate
+      4. 拼 prompt → synthesize_with_routed_reply LLM
+
+    LLM / 反查异常一律返空串, 让调用方退化。不抛。
+    """
+    if not extracted_text.strip():
+        return ""
+
+    question = _load_original_question(original_raw_id)
+    if not question:
+        log.info("synthesize: original raw#%d not found, fall back to restate", original_raw_id)
+        return ""
+
+    try:
+        from helper.ask.retrieve import retrieve_relevant
+        hits = retrieve_relevant(question, top_k=8, asker_domain=asker_domain)
+    except Exception as e:  # noqa: BLE001
+        log.warning("synthesize: retrieve_relevant failed: %s, fall back to restate", e)
+        return ""
+
+    fact_hits = [h for h in hits if getattr(h, "type", "") != "directive"]
+    kb_block = _format_helper_kb(fact_hits)
+    if not kb_block:
+        # Q2=a: helper KB 没命中事实素材 → 退化走 restate, 不强行综合
+        log.info("synthesize: no helper KB hits for raw#%d, fall back to restate", original_raw_id)
+        return ""
+
+    user_msg = (
+        f"# 用户原问题\n{question}\n\n"
+        f"# helper KB 检索到的相关素材\n{kb_block}\n\n"
+        f"# 外部 bot @{via_label} 的回复 (已抽成纯文本)\n{extracted_text}"
+    )
+    system = _SYNTHESIZE_SYSTEM_PROMPT.replace("{via}", via_label)
+
+    from helper.llm import run
+    try:
+        out = run(
+            "synthesize_with_routed_reply",
+            system=system,
+            user=user_msg,
+            temperature=0.2,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("synthesize_with_routed_reply LLM failed: %s", e)
+        return ""
+    return (out or "").strip()
+
+
 def handle_bot_reply(payload: dict[str, Any], *, sender_app_id: str) -> bool:
     """target bot 私聊回 helper → 找最近未消费 PendingRouting → 前缀 + LLM 转述卡片 + 标 consumed。
 
@@ -402,6 +517,7 @@ def handle_bot_reply(payload: dict[str, Any], *, sender_app_id: str) -> bool:
         via = row.via_label
         tracker_card = row.tracker_card_msg_id
         wave_quote = row.original_wave_msg_id
+        original_raw_id = row.original_raw_id
 
     prefix = _format_prefix(via_label=via, asker_domain=asker if chat_id else "")
 
@@ -436,23 +552,33 @@ def handle_bot_reply(payload: dict[str, Any], *, sender_app_id: str) -> bool:
         except WaveAPIError as e:
             log.warning("send prefix failed routing=%d: %s", routing_id, e)
 
-    # b) 抽对方原文 → LLM 转述 → markdown card 发
+    # b) 抽对方原文 → 优先综合 (helper KB + tachi 回执 → LLM 整合); 综合失败/无 KB 命中
+    #    退化走 restate (只重排版); 都失败再走 c) 兜底 text 直发
     extracted = _extract_markdown_from_inner(_safe_json(content_str)) if content_str else ""
     forwarded = False
     if extracted:
-        restated = _restate_to_markdown(extracted, via)
-        # 现场取证: 落 LLM 转述出来的原始 markdown 文本和实际发到 wave 的 card content_str。
-        # 用来排查"卡片渲染扁平"问题: LLM 是否按 Wave 卡片 markdown 语法 (| 表格 | / # 标题 / ```代码块```)
-        # 输出, 还是给了平铺的伪结构。WARNING 级别走 helper.err 默认 root logger。
-        # 只在排查格式问题时翻, 不需要长期保留。
-        log.warning(
-            "restate output routing=%d via=%s restated=%r",
-            routing_id, via, restated,
+        synthesized = _synthesize_with_helper_kb(
+            extracted_text=extracted,
+            via_label=via,
+            original_raw_id=original_raw_id,
+            asker_domain=asker,
+            chat_id=chat_id,
         )
-        if restated:
-            card_content = _build_markdown_card_content(restated)
+        final_md = synthesized or _restate_to_markdown(extracted, via)
+        # 现场取证: 落 synthesize/restate 出来的最终 markdown 和实际发到 wave 的 card content_str。
+        # 用来排查"卡片渲染扁平 / 综合答案漏事实 / 综合走没走"问题。
+        # mode=synth 表示综合分支命中 (有 helper KB), mode=restate 表示退化为重排版。
+        # WARNING 级别走 helper.err 默认 root logger, 只在排查时翻。
+        log.warning(
+            "compose output routing=%d via=%s mode=%s final=%r",
+            routing_id, via,
+            "synth" if synthesized else "restate",
+            final_md,
+        )
+        if final_md:
+            card_content = _build_markdown_card_content(final_md)
             log.warning(
-                "outbound restated card routing=%d content=%s",
+                "outbound composed card routing=%d content=%s",
                 routing_id, card_content,
             )
             try:
@@ -466,7 +592,7 @@ def handle_bot_reply(payload: dict[str, Any], *, sender_app_id: str) -> bool:
                 forwarded = True
             except WaveAPIError as e:
                 log.warning(
-                    "forward restated card failed routing=%d: %s",
+                    "forward composed card failed routing=%d: %s",
                     routing_id, e,
                 )
 

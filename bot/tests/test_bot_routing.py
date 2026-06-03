@@ -338,6 +338,179 @@ def test_handle_bot_reply_consumed_routing_not_picked_again(
     assert handle_bot_reply(payload, sender_app_id="cli_tachi") is False
 
 
+def test_handle_bot_reply_synthesizes_with_helper_kb(
+    db, settings, wave_action_log, llm_stub, monkeypatch,
+):
+    """helper KB 有命中 + 用户原问题可反查到 → 走 synthesize_with_routed_reply。
+    验证: LLM 拿到的 user 内容里同时含 KB 素材和 tachi 回执; 卡片是 synth 输出。
+    """
+    import json as _json
+
+    from helper.ask.retrieve import Hit
+    from helper.im.bot_routing import dispatch_route, handle_bot_reply
+    from helper.storage import session
+    from helper.storage.models import RawInput, _utcnow
+
+    # 落一条 RawInput 让 _load_original_question 能反查到
+    with session() as sess:
+        r = RawInput(
+            id=100, chat_id="oc_group", wave_message_id="om_q",
+            author_domain="bob", source_type="im_wave_user",
+            content_text="iam 网关的 cookie 名是什么", created_at=_utcnow(),
+        )
+        sess.add(r)
+
+    # mock retrieve_relevant 返回一条事实 hit (避开真跑 fts/vector)
+    fake_hits = [Hit(
+        type="raw", ref="999", title="IAM 配置笔记",
+        body="iam 网关 cookie 名: HYG_SESSION", score=2.0,
+    )]
+    monkeypatch.setattr(
+        "helper.ask.retrieve.retrieve_relevant",
+        lambda question, top_k=8, asker_domain="": fake_hits,
+    )
+
+    dispatch_route(
+        target_app_id="cli_tachi", via_label="tachi",
+        forwarded_text="iam 网关的 cookie 名是什么",
+        original_raw_id=100, original_chat_id="oc_group",
+        original_wave_msg_id="om_q", original_asker_domain="bob",
+        tracker=None,
+    )
+
+    captured: dict = {}
+    def _synth(system, user, **kw):
+        captured["system"] = system
+        captured["user"] = user
+        return "## 综合答案\n- cookie 名: HYG_SESSION (来自 tachi)\n- 补充: 配在 IAM 配置笔记里"
+    llm_stub.set("synthesize_with_routed_reply", _synth)
+
+    payload = {
+        "event": {
+            "sender": {"id": "cli_tachi", "id_type": "app_id"},
+            "message": {
+                "msg_type": "text",
+                "content": '{"text":"cookie 名是 HYG_SESSION"}',
+            },
+        },
+    }
+    ok = handle_bot_reply(payload, sender_app_id="cli_tachi")
+    assert ok is True
+
+    # synth prompt 同时含 KB 素材 + tachi 回执 + 用户原问题 + via_label
+    u = captured["user"]
+    assert "iam 网关的 cookie 名是什么" in u
+    assert "HYG_SESSION" in u  # 来自 KB hit body
+    assert "IAM 配置笔记" in u  # KB hit title
+    assert "cookie 名是 HYG_SESSION" in u  # tachi 回执原文
+    assert "@tachi" in u
+    assert "@tachi" in captured["system"]  # via 替换进 system prompt
+
+    # 卡片正文 = synth 输出
+    sends = [e for e in wave_action_log if e["kind"] == "send" and e.get("receiver_id") == "oc_group"]
+    assert len(sends) == 1
+    assert sends[0]["msg_type"] == "card"
+    rebuilt = _json.loads(sends[0]["content"])
+    assert "综合答案" in rebuilt["card"]["elements"][0]["text"]
+    assert "HYG_SESSION" in rebuilt["card"]["elements"][0]["text"]
+
+
+def test_handle_bot_reply_falls_back_to_restate_when_no_kb_hits(
+    db, settings, wave_action_log, llm_stub, monkeypatch,
+):
+    """raw_id 反查得到原问题, 但 KB 检索没命中 → Q2=a 退化回 restate, 不调 synth。"""
+    import json as _json
+
+    from helper.im.bot_routing import dispatch_route, handle_bot_reply
+    from helper.storage import session
+    from helper.storage.models import RawInput, _utcnow
+
+    with session() as sess:
+        sess.add(RawInput(
+            id=200, chat_id="oc_group", wave_message_id="om_q",
+            author_domain="bob", source_type="im_wave_user",
+            content_text="一个 helper 完全不懂的领域问题", created_at=_utcnow(),
+        ))
+
+    monkeypatch.setattr(
+        "helper.ask.retrieve.retrieve_relevant",
+        lambda question, top_k=8, asker_domain="": [],
+    )
+
+    dispatch_route(
+        target_app_id="cli_tachi", via_label="tachi",
+        forwarded_text="x", original_raw_id=200,
+        original_chat_id="oc_group", original_wave_msg_id="om_q",
+        original_asker_domain="bob", tracker=None,
+    )
+
+    # 只 set restate, 不 set synth — 若错误地调 synth, llm_stub 会 AssertionError
+    llm_stub.set("restate_bot_reply", "## 仅重排\n- tachi 原话")
+
+    payload = {
+        "event": {
+            "sender": {"id": "cli_tachi", "id_type": "app_id"},
+            "message": {"msg_type": "text", "content": '{"text":"tachi 原话"}'},
+        },
+    }
+    handle_bot_reply(payload, sender_app_id="cli_tachi")
+
+    sends = [e for e in wave_action_log if e["kind"] == "send" and e.get("receiver_id") == "oc_group"]
+    assert len(sends) == 1
+    rebuilt = _json.loads(sends[0]["content"])
+    assert "仅重排" in rebuilt["card"]["elements"][0]["text"]
+
+
+def test_handle_bot_reply_synth_llm_failure_falls_back_to_restate(
+    db, settings, wave_action_log, llm_stub, monkeypatch,
+):
+    """KB 命中走 synth, 但 synth LLM 异常 → 退化回 restate (不到 c) 兜底 text)。"""
+    import json as _json
+
+    from helper.ask.retrieve import Hit
+    from helper.im.bot_routing import dispatch_route, handle_bot_reply
+    from helper.storage import session
+    from helper.storage.models import RawInput, _utcnow
+
+    with session() as sess:
+        sess.add(RawInput(
+            id=300, chat_id="oc_group", wave_message_id="om_q",
+            author_domain="bob", source_type="im_wave_user",
+            content_text="一个有 KB 命中的问题", created_at=_utcnow(),
+        ))
+    monkeypatch.setattr(
+        "helper.ask.retrieve.retrieve_relevant",
+        lambda question, top_k=8, asker_domain="": [
+            Hit(type="raw", ref="1", title="某文档", body="某事实", score=1.0)
+        ],
+    )
+
+    dispatch_route(
+        target_app_id="cli_tachi", via_label="tachi", forwarded_text="x",
+        original_raw_id=300, original_chat_id="oc_group",
+        original_wave_msg_id="om_q", original_asker_domain="bob", tracker=None,
+    )
+
+    def _boom(system, user, **kw):
+        raise RuntimeError("athenai down")
+    llm_stub.set("synthesize_with_routed_reply", _boom)
+    llm_stub.set("restate_bot_reply", "## 退化重排\n- 仅 tachi 原话")
+
+    payload = {
+        "event": {
+            "sender": {"id": "cli_tachi", "id_type": "app_id"},
+            "message": {"msg_type": "text", "content": '{"text":"tachi 原话"}'},
+        },
+    }
+    handle_bot_reply(payload, sender_app_id="cli_tachi")
+
+    sends = [e for e in wave_action_log if e["kind"] == "send" and e.get("receiver_id") == "oc_group"]
+    assert len(sends) == 1
+    assert sends[0]["msg_type"] == "card"
+    rebuilt = _json.loads(sends[0]["content"])
+    assert "退化重排" in rebuilt["card"]["elements"][0]["text"]
+
+
 def test_expire_old_routings_marks_expired_and_notifies(
     db, settings, wave_action_log,
 ):
