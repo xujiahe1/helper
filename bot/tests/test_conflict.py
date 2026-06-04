@@ -248,62 +248,29 @@ def test_memory_directives_passed_to_judge(db, settings, llm_stub, retrieve_stub
     assert "发版相关以王一鸣说的为准" in user_prompt
 
 
-def test_fact_conflict_uses_llm_judge(db, settings, llm_stub, retrieve_stub, make_raw):
-    """fact 冲突也过 LLM judge — 不再是结构裸过的 auto-medium。"""
-    from helper.conflict import detect_for_raw
-    from helper.storage import session
-    from helper.storage.models import FactCandidate, L1Item
-
-    with session() as s:
-        s.add(FactCandidate(
-            slug="fact-existing", subject="lml账号", predicate="同步至",
-            object="米哈游账号", scope="", statement="...",
-        ))
-    rid = make_raw("新输入")
-    with session() as s:
-        s.add(L1Item(
-            raw_id=rid, idx=0, type="fact",
-            payload_json=json.dumps({
-                "subject": "lml账号", "predicate": "同步至",
-                "object": "米哈游账号", "scope": "lml→mhy",
-            }, ensure_ascii=False),
-        ))
-    # LLM 判 paraphrase / scope 不冲突
-    llm_stub.set("conflict_judge", json.dumps({
-        "verdict": "none", "summary": "", "severity": "low",
-    }, ensure_ascii=False))
-
-    hits = detect_for_raw(rid)
-    assert hits == []
-    judge_calls = [c for c in llm_stub.calls if c[0] == "conflict_judge"]
-    assert len(judge_calls) == 1
-
-
 # ---------- rejudge ----------
 
 def test_rejudge_closes_verdict_none(db, settings, llm_stub, make_raw):
     """rejudge: 已 open 的 ConflictLog 重判 verdict=none → auto_rejected close。"""
     from helper.conflict.rejudge import rejudge_open_conflicts
     from helper.storage import session
-    from helper.storage.models import ConflictLog, FactCandidate, L1Item
+    from helper.storage.models import ConflictLog, L1Item, SpecCandidate
 
-    # 准备一条假 fact 冲突(噪声场景)
     with session() as s:
-        s.add(FactCandidate(
-            slug="fact-old", subject="X", predicate="同步至",
-            object="Y", scope="", statement="...",
+        s.add(SpecCandidate(
+            slug="spec-old", title="老规约", statement="老结论",
         ))
     rid = make_raw("新输入")
     with session() as s:
         s.add(L1Item(
-            raw_id=rid, idx=0, type="fact",
+            raw_id=rid, idx=0, type="decision",
             payload_json=json.dumps({
-                "subject": "X", "predicate": "同步回", "object": "Y", "scope": "",
+                "scene": "X 场景", "choice": "新选择", "rationale": "...",
             }, ensure_ascii=False),
         ))
         s.add(ConflictLog(
-            raw_id=rid, target_type="fact", target_slug="fact-old",
-            summary="同步至 vs 同步回(paraphrase)", severity="medium",
+            raw_id=rid, target_type="spec", target_slug="spec-old",
+            summary="老 vs 新(paraphrase)", severity="medium",
             resolution="open",
         ))
 

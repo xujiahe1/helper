@@ -159,13 +159,6 @@ def create_app() -> FastAPI:
             done = backfill_pending(limit=limit)
             return {"backfilled": len(done), "raw_ids": done}
 
-        @admin.post("/promote-entities")
-        def post_promote_entities(limit: int = 50) -> dict[str, Any]:
-            from helper.ontology import promote_eligible
-
-            promoted = promote_eligible(limit=limit)
-            return {"promoted": promoted, "count": len(promoted)}
-
         @admin.post("/specgen/run")
         def post_specgen_run() -> dict[str, Any]:
             from helper.specgen import cluster_l1_results, draft_spec_from_cluster
@@ -197,7 +190,7 @@ def create_app() -> FastAPI:
 
         @admin.post("/index/rebuild")
         def post_index_rebuild(
-            kinds: str = "raw,spec,entity,fact,case,relation",
+            kinds: str = "raw,spec,section,decision",
             clear: bool = False,
         ) -> dict[str, Any]:
             """全量重建 FTS + 向量索引 — 部署 / 升级 / 排障后的"清+重灌"。
@@ -205,19 +198,14 @@ def create_app() -> FastAPI:
             FTS:fts_items 全清后按 kind 过的活候选逐条 jieba 切词重塞。
             向量:vector.upsert 自带 hash 比对,clear=False 时只补未索引的;
             clear=True 时先 clear_all 再全重 embed(慢,且烧 embed quota,慎用)。
-
-            kinds 默认全跑;调用方可只指定 fact/case/relation 三个新加的。
             """
             from sqlalchemy import select as _select
 
             from helper.storage import fts, session as _sess, vector as _vec
             from helper.storage.models import (
-                CaseCandidate,
-                EntityCandidate,
-                FactCandidate,
+                L1Item,
                 L1Result,
                 RawInput,
-                RelationCandidate,
                 SpecCandidate,
             )
 
@@ -227,9 +215,7 @@ def create_app() -> FastAPI:
             with _sess() as s:
                 if clear:
                     fts.clear_all(s)
-                    if "raw" in wanted or any(
-                        k in wanted for k in ("spec", "entity", "fact", "case", "relation")
-                    ):
+                    if wanted:
                         _vec.clear_all(s)
 
             if "raw" in wanted:
@@ -257,53 +243,18 @@ def create_app() -> FastAPI:
                         _vec.index_spec(s, slug)
                     counts["spec"] += 1
 
-            if "entity" in wanted:
+            for atom_kind in ("section", "decision"):
+                if atom_kind not in wanted:
+                    continue
                 with _sess() as s:
-                    slugs = s.execute(
-                        _select(EntityCandidate.slug)
-                        .where(EntityCandidate.superseded_at.is_(None))
-                    ).scalars().all()
-                for slug in slugs:
+                    pairs = s.execute(
+                        _select(L1Item.raw_id, L1Item.idx).where(L1Item.type == atom_kind)
+                    ).all()
+                for rid, ix in pairs:
                     with _sess() as s:
-                        fts.index_entity(s, slug)
-                        # entity 向量只在 promoted 后才进 — 这里跳过,跟 promoter 行为一致
-                    counts["entity"] += 1
-
-            if "fact" in wanted:
-                with _sess() as s:
-                    slugs = s.execute(
-                        _select(FactCandidate.slug)
-                        .where(FactCandidate.superseded_at.is_(None))
-                    ).scalars().all()
-                for slug in slugs:
-                    with _sess() as s:
-                        fts.index_fact(s, slug)
-                        _vec.index_fact(s, slug)
-                    counts["fact"] += 1
-
-            if "case" in wanted:
-                with _sess() as s:
-                    slugs = s.execute(
-                        _select(CaseCandidate.slug)
-                        .where(CaseCandidate.superseded_at.is_(None))
-                    ).scalars().all()
-                for slug in slugs:
-                    with _sess() as s:
-                        fts.index_case(s, slug)
-                        _vec.index_case(s, slug)
-                    counts["case"] += 1
-
-            if "relation" in wanted:
-                with _sess() as s:
-                    slugs = s.execute(
-                        _select(RelationCandidate.slug)
-                        .where(RelationCandidate.superseded_at.is_(None))
-                    ).scalars().all()
-                for slug in slugs:
-                    with _sess() as s:
-                        fts.index_relation(s, slug)
-                        _vec.index_relation(s, slug)
-                    counts["relation"] += 1
+                        fts.index_l1_atom(s, rid, ix)
+                        _vec.index_l1_atom(s, rid, ix)
+                    counts[atom_kind] += 1
 
             return {"clear": clear, "counts": counts}
 

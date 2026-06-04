@@ -163,31 +163,9 @@ def process_raw(
 
 
 def _run_consumers(raw_id: int) -> None:
-    """L1Item → 5 类候选表(concept/fact/case/relation;decision 留给 specgen 聚类)
-    + 末尾跑追问 Engine 扫边界缺口 + 跑 ACL 打标。每个 consumer 独立 try/except,失败互不影响。
-
-    注意: ACL 放在最后跑, 这样新建的候选行(consume_*)已经写入,
-    tag_raw 内部会反查 raw_refs_json 把 topic 标继承到这些候选行。
+    """L1Item 入库后跑追问 Engine 扫边界缺口 + 跑 ACL 打标。
+    每个 consumer 独立 try/except,失败互不影响。
     """
-    try:
-        from helper.ontology import consume_concept_items, consume_relation_items
-        consume_concept_items(raw_id)
-    except Exception:  # noqa: BLE001
-        log.exception("consume_concept_items failed raw_id=%s", raw_id)
-    try:
-        consume_relation_items(raw_id)
-    except Exception:  # noqa: BLE001
-        log.exception("consume_relation_items failed raw_id=%s", raw_id)
-    try:
-        from helper.facts import consume_fact_items
-        consume_fact_items(raw_id)
-    except Exception:  # noqa: BLE001
-        log.exception("consume_fact_items failed raw_id=%s", raw_id)
-    try:
-        from helper.cases import consume_case_items
-        consume_case_items(raw_id)
-    except Exception:  # noqa: BLE001
-        log.exception("consume_case_items failed raw_id=%s", raw_id)
     try:
         from helper.inquiry import generate_inquiries
         generate_inquiries(raw_id)

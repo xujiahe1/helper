@@ -88,7 +88,6 @@ def llm_stub(monkeypatch: pytest.MonkeyPatch):
         "helper.conflict.detector.run",
         "helper.ask.runtime.run",
         "helper.scheduler.parser.run",
-        "helper.ontology.maintenance.run",
         "helper.specgen.draft.run",
         "helper.batch.ingest.run",
         "helper.im.intent.run",

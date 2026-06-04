@@ -37,13 +37,13 @@ def test_search_basic_recall(db, settings):
     from helper.storage import fts, session
 
     with session() as s:
-        fts.upsert(s, kind="fact", ref="f-1", content="Helper 生产端口是 8009")
+        fts.upsert(s, kind="section", ref="1:0", content="Helper 生产端口是 8009")
         s.commit()
 
     with session() as s:
         hits = fts.search(s, query="生产端口", top_k=10)
     refs = {(k, r) for k, r, _ in hits}
-    assert ("fact", "f-1") in refs
+    assert ("section", "1:0") in refs
 
 
 def test_search_kind_filter(db, settings):
@@ -52,7 +52,7 @@ def test_search_kind_filter(db, settings):
 
     with session() as s:
         fts.upsert(s, kind="raw", ref="100", content="生产端口")
-        fts.upsert(s, kind="fact", ref="f-2", content="生产端口")
+        fts.upsert(s, kind="section", ref="2:0", content="生产端口")
         s.commit()
 
     with session() as s:
@@ -67,17 +67,17 @@ def test_upsert_replaces_old_text(db, settings):
 
     # 用完全不重叠的词:旧"芒果橘子"vs 新"葡萄苹果",避免 OR 召回串台
     with session() as s:
-        fts.upsert(s, kind="fact", ref="f-3", content="芒果 橘子 9000")
+        fts.upsert(s, kind="section", ref="3:0", content="芒果 橘子 9000")
         s.commit()
     with session() as s:
-        fts.upsert(s, kind="fact", ref="f-3", content="葡萄 苹果 8009")
+        fts.upsert(s, kind="section", ref="3:0", content="葡萄 苹果 8009")
         s.commit()
 
     with session() as s:
         hits_old = fts.search(s, query="芒果", top_k=10)
         hits_new = fts.search(s, query="葡萄", top_k=10)
-    assert ("fact", "f-3") not in {(k, r) for k, r, _ in hits_old}
-    assert ("fact", "f-3") in {(k, r) for k, r, _ in hits_new}
+    assert ("section", "3:0") not in {(k, r) for k, r, _ in hits_old}
+    assert ("section", "3:0") in {(k, r) for k, r, _ in hits_new}
 
 
 def test_delete_removes_from_index(db, settings):
@@ -85,14 +85,14 @@ def test_delete_removes_from_index(db, settings):
     from helper.storage import fts, session
 
     with session() as s:
-        fts.upsert(s, kind="case", ref="c-1", content="发版前周一不发版本")
+        fts.upsert(s, kind="section", ref="4:0", content="发版前周一不发版本")
         s.commit()
     with session() as s:
-        fts.delete(s, kind="case", ref="c-1")
+        fts.delete(s, kind="section", ref="4:0")
         s.commit()
     with session() as s:
         hits = fts.search(s, query="周一不发版本", top_k=10)
-    assert ("case", "c-1") not in {(k, r) for k, r, _ in hits}
+    assert ("section", "4:0") not in {(k, r) for k, r, _ in hits}
 
 
 # ---------- supersede 自动清场(detector 路径) ----------
@@ -101,34 +101,30 @@ def test_supersede_target_clears_fts_and_vector(db, settings):
     """conflict._supersede_target 给候选打 superseded_at 时,同步清 fts/vec。"""
     from helper.conflict.detector import _supersede_target
     from helper.storage import fts, session
-    from helper.storage.models import FactCandidate
+    from helper.storage.models import SpecCandidate
 
     with session() as s:
-        fc = FactCandidate(
-            slug="f-old", subject="Helper", predicate="端口",
-            object="8001", statement="Helper 端口是 8001",
-            raw_refs_json=json.dumps([[1, 0]]),
-            mention_count=1,
-        )
-        s.add(fc)
+        s.add(SpecCandidate(
+            slug="s-old", title="老规约", statement="Helper 端口是 8001",
+        ))
     with session() as s:
-        fts.index_fact(s, "f-old")
+        fts.index_spec(s, "s-old")
         s.commit()
 
     # 确认能搜到
     with session() as s:
         hits_before = fts.search(s, query="Helper 端口 8001", top_k=10)
-    assert ("fact", "f-old") in {(k, r) for k, r, _ in hits_before}
+    assert ("spec", "s-old") in {(k, r) for k, r, _ in hits_before}
 
     # 触发 supersede
     with session() as s:
-        _supersede_target(s, "fact", "f-old", raw_id=99)
+        _supersede_target(s, "spec", "s-old", raw_id=99)
         s.commit()
 
     # fts 应该已经清掉
     with session() as s:
         hits_after = fts.search(s, query="Helper 端口 8001", top_k=10)
-    assert ("fact", "f-old") not in {(k, r) for k, r, _ in hits_after}
+    assert ("spec", "s-old") not in {(k, r) for k, r, _ in hits_after}
 
 
 # ---------- 中文召回:确认 jieba 切词比单字 2-gram 强 ----------
@@ -138,12 +134,12 @@ def test_chinese_domain_term_recalled(db, settings):
     from helper.storage import fts, session
 
     with session() as s:
-        fts.upsert(s, kind="entity", ref="e-iam",
+        fts.upsert(s, kind="section", ref="iam:0",
                    content="加黑规则组 仅可配置主体不可见客体的规则组")
         s.commit()
     with session() as s:
         hits = fts.search(s, query="加黑规则", top_k=10)
-    assert ("entity", "e-iam") in {(k, r) for k, r, _ in hits}
+    assert ("section", "iam:0") in {(k, r) for k, r, _ in hits}
 
 
 # ---------- perf 抽样:1k 行 search 应该是毫秒级,而不是秒级 ----------
@@ -159,7 +155,7 @@ def test_perf_thousand_rows_under_500ms(db, settings):
     with session() as s:
         for i in range(1000):
             content = f"实体{i % 50} 谓词{i % 30} 对象{i} 描述 关于 测试 数据 第{i}条"
-            fts.upsert(s, kind="fact", ref=f"f-perf-{i}", content=content)
+            fts.upsert(s, kind="section", ref=f"perf:{i}", content=content)
         s.commit()
 
     # 跑 5 次 search 取最大值,排除 jieba 冷启动

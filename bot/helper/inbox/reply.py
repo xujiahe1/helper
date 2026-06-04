@@ -39,13 +39,9 @@ from sqlalchemy import select
 from helper.config import get_settings
 from helper.storage import session
 from helper.storage.models import (
-    CaseCandidate,
     ConflictLog,
-    EntityCandidate,
-    FactCandidate,
     InboxDigest,
     InquiryLog,
-    RelationCandidate,
     SpecCandidate,
 )
 
@@ -77,31 +73,12 @@ _LEGACY_ANSWER_BARE_RE = re.compile(r"^\s*#(\d+)[\s,，:]+(.+)$", re.DOTALL)
 
 def _humanize_target(s, target_type: str, slug: str) -> str:
     """把 target_type+slug 转成给用户看的人话标签。失败回落 slug。"""
-    type_label = {
-        "spec": "规约", "fact": "事实", "case": "案例",
-        "concept": "概念", "relation": "关系", "memory": "偏好",
-    }.get(target_type, target_type)
+    type_label = {"spec": "规约", "memory": "偏好"}.get(target_type, target_type)
     try:
-        if target_type == "fact":
-            row = s.execute(select(FactCandidate).where(FactCandidate.slug == slug)).scalar_one_or_none()
-            if row is not None:
-                return f"{type_label} · {row.subject} {row.predicate} {row.object}".strip()
-        elif target_type == "spec":
+        if target_type == "spec":
             row = s.execute(select(SpecCandidate).where(SpecCandidate.slug == slug)).scalar_one_or_none()
             if row is not None:
                 return f"{type_label} · {row.title}"
-        elif target_type == "case":
-            row = s.execute(select(CaseCandidate).where(CaseCandidate.slug == slug)).scalar_one_or_none()
-            if row is not None:
-                return f"{type_label} · {row.title}"
-        elif target_type == "relation":
-            row = s.execute(select(RelationCandidate).where(RelationCandidate.slug == slug)).scalar_one_or_none()
-            if row is not None:
-                return f"{type_label} · {row.entity_a} —[{row.relation}]→ {row.entity_b}"
-        elif target_type == "concept":
-            row = s.execute(select(EntityCandidate).where(EntityCandidate.slug == slug)).scalar_one_or_none()
-            if row is not None:
-                return f"{type_label} · {row.name}"
         elif target_type == "memory":
             from helper.storage.models import Memory
             try:

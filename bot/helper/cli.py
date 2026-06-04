@@ -585,18 +585,13 @@ def wave_simulate(text: str, mode: str, author: str, chat_id: str, reply_to: str
 @main.command("l1-dryrun")
 @click.argument("raw_id", type=int)
 @click.option(
-    "--version", "-v", default="v2", show_default=True,
-    type=click.Choice(["v1", "v2"]),
-    help="L1 prompt 版本。v2=section+decision,v1=旧 5 类",
-)
-@click.option(
     "--instruction", "-i", default="",
     help="模拟用户随文档发的取舍指令(如『只读 xxx 部分』),作为 ## 用户附加说明 拼到 prompt 末尾",
 )
-def l1_dryrun(raw_id: int, version: str, instruction: str) -> None:
-    """对指定 raw 用指定 prompt 版本跑 L1,**只打印,不写库**。
+def l1_dryrun(raw_id: int, instruction: str) -> None:
+    """对指定 raw 跑 L1,**只打印,不写库**。
 
-    用于在切换 prompt 前对比新老抽取结果。不动 l1_items / l1_results 表。
+    不动 l1_items / l1_results 表。
     """
     from helper.config import get_settings
     from helper.ingest.l1_structure import structure
@@ -614,12 +609,12 @@ def l1_dryrun(raw_id: int, version: str, instruction: str) -> None:
         text = raw.content_text or ""
         title = (raw.source_ref or "")[:40]
 
-    click.echo(f"raw#{raw_id} ({title}) — {len(text)} chars, prompt={version}")
+    click.echo(f"raw#{raw_id} ({title}) — {len(text)} chars")
     if instruction.strip():
         click.echo(f"用户附加说明: {instruction.strip()}")
     click.echo("=" * 60)
 
-    out = structure(text, prompt_version=version, user_instruction=instruction)
+    out = structure(text, user_instruction=instruction)
     if out.error:
         click.echo(f"ERROR: {out.error}")
         raise SystemExit(1)
@@ -636,65 +631,6 @@ def l1_dryrun(raw_id: int, version: str, instruction: str) -> None:
             "  "
             + json.dumps(it.payload, ensure_ascii=False, indent=2).replace("\n", "\n  ")
         )
-
-
-@main.command("consume-l1")
-@click.argument("raw_id", type=int)
-def consume_l1(raw_id: int) -> None:
-    """把指定 raw 的 L1Item 收口到 4 类候选(concept/fact/case/relation)。
-
-    sink.process_raw 已经会自动调,这条命令用于手动重跑(比如改了 consumer 逻辑)。
-    """
-    from helper.cases import consume_case_items
-    from helper.config import get_settings
-    from helper.facts import consume_fact_items
-    from helper.ontology import consume_concept_items, consume_relation_items
-    from helper.storage import init_engine
-
-    s = get_settings()
-    init_engine(s.helper_data_dir / "helper.db")
-
-    cs = consume_concept_items(raw_id)
-    rs = consume_relation_items(raw_id)
-    fs = consume_fact_items(raw_id)
-    ks = consume_case_items(raw_id)
-    click.echo(f"  concept   : {len(cs)}")
-    click.echo(f"  relation  : {len(rs)}")
-    click.echo(f"  fact      : {len(fs)}")
-    click.echo(f"  case      : {len(ks)}")
-
-
-@main.command("ontology-promote")
-@click.option("--limit", default=50, type=int)
-def ontology_promote(limit: int) -> None:
-    """扫所有 candidate,把够格的晋升到 git。"""
-    from helper.config import get_settings
-    from helper.ontology import promote_eligible
-    from helper.storage import init_engine
-
-    s = get_settings()
-    init_engine(s.helper_data_dir / "helper.db")
-    out = promote_eligible(limit=limit)
-    if not out:
-        click.echo("nothing eligible to promote")
-        return
-    click.echo(f"promoted {len(out)}: {out}")
-
-
-@main.command("ontology-maintain")
-@click.option("--dry-run", is_flag=True, default=False)
-def ontology_maintain(dry_run: bool) -> None:
-    """周期体检: 合并近似 entity / 标记孤儿 / decay。"""
-    from helper.config import get_settings
-    from helper.ontology import run_maintenance
-    from helper.storage import init_engine
-
-    s = get_settings()
-    init_engine(s.helper_data_dir / "helper.db")
-    rep = run_maintenance(dry_run=dry_run)
-    click.echo(f"merged: {rep.merged}")
-    click.echo(f"archived orphans: {rep.archived_orphans}")
-    click.echo(f"decayed promoted: {rep.decayed_promoted}")
 
 
 @main.command("specgen-run")
@@ -716,29 +652,6 @@ def specgen_run() -> None:
         sc = draft_spec_from_cluster(c)
         if sc:
             click.echo(f"    → spec_candidate slug={sc.slug} title={sc.title}")
-
-
-@main.command("knowledge-promote")
-@click.option("--limit", default=100, type=int)
-def knowledge_promote(limit: int) -> None:
-    """扫所有候选(entity/relation/fact/case),把够格的全部晋升到 git。"""
-    from helper.cases import promote_eligible as promote_cases
-    from helper.config import get_settings
-    from helper.facts import promote_eligible as promote_facts
-    from helper.ontology import promote_eligible as promote_entities
-    from helper.ontology import promote_eligible_relations
-    from helper.storage import init_engine
-
-    s = get_settings()
-    init_engine(s.helper_data_dir / "helper.db")
-    e = promote_entities(limit=limit)
-    r = promote_eligible_relations(limit=limit)
-    f = promote_facts(limit=limit)
-    k = promote_cases(limit=limit)
-    click.echo(f"  entities  : {len(e)} {e}")
-    click.echo(f"  relations : {len(r)} {r}")
-    click.echo(f"  facts     : {len(f)} {f}")
-    click.echo(f"  cases     : {len(k)} {k}")
 
 
 @main.command("spec-list")
@@ -971,7 +884,7 @@ def replay(limit: int, judge: bool) -> None:
 @click.option("--clear", is_flag=True, default=False, help="先清空 vec_items + vector_index + fts_items 再全量重建")
 @click.option(
     "--kinds",
-    default="raw,spec,entity,section,decision",
+    default="raw,spec,section,decision",
     show_default=True,
     help="逗号分隔,只重建这些 kind",
 )
@@ -986,7 +899,7 @@ def reindex(clear: bool, kinds: str) -> None:
     from helper.config import get_settings
     from helper.storage import fts, init_engine, session
     from helper.storage import vector as vec
-    from helper.storage.models import EntityCandidate, L1Item, L1Result, SpecCandidate
+    from helper.storage.models import L1Item, L1Result, SpecCandidate
 
     s = get_settings()
     init_engine(s.helper_data_dir / "helper.db")
@@ -998,8 +911,8 @@ def reindex(clear: bool, kinds: str) -> None:
             fts.clear_all(sess)
         click.echo("vec_items + vector_index + fts_items cleared")
 
-    counts = {"raw": 0, "spec": 0, "entity": 0, "section": 0, "decision": 0}
-    failed = {"raw": 0, "spec": 0, "entity": 0, "section": 0, "decision": 0}
+    counts = {"raw": 0, "spec": 0, "section": 0, "decision": 0}
+    failed = {"raw": 0, "spec": 0, "section": 0, "decision": 0}
 
     if "raw" in selected:
         with session() as sess:
@@ -1029,20 +942,6 @@ def reindex(clear: bool, kinds: str) -> None:
             else:
                 failed["spec"] += 1
 
-    if "entity" in selected:
-        with session() as sess:
-            ent_slugs = sess.execute(
-                select(EntityCandidate.slug).where(EntityCandidate.promoted_at.isnot(None))
-            ).scalars().all()
-        for slug in ent_slugs:
-            with session() as sess:
-                rowid = vec.index_entity(sess, slug)
-                fts.index_entity(sess, slug)
-            if rowid is not None:
-                counts["entity"] += 1
-            else:
-                failed["entity"] += 1
-
     # section / decision: 走 l1_items 全量
     for atom_kind in ("section", "decision"):
         if atom_kind not in selected:
@@ -1061,12 +960,12 @@ def reindex(clear: bool, kinds: str) -> None:
                 failed[atom_kind] += 1
 
     click.echo(
-        f"indexed: raw={counts['raw']} spec={counts['spec']} entity={counts['entity']} "
+        f"indexed: raw={counts['raw']} spec={counts['spec']} "
         f"section={counts['section']} decision={counts['decision']}"
     )
     if any(failed.values()):
         click.echo(
-            f"  (failures: raw={failed['raw']} spec={failed['spec']} entity={failed['entity']} "
+            f"  (failures: raw={failed['raw']} spec={failed['spec']} "
             f"section={failed['section']} decision={failed['decision']})",
             err=True,
         )
@@ -1100,10 +999,7 @@ def acl_status() -> None:
     from helper.config import get_settings
     from helper.storage import session
     from helper.storage.db import init_engine
-    from helper.storage.models import (
-        CaseCandidate, EntityCandidate, FactCandidate, L1Item,
-        RawInput, RelationCandidate,
-    )
+    from helper.storage.models import L1Item, RawInput
 
     s = get_settings()
     init_engine(s.helper_data_dir / "helper.db")
@@ -1117,10 +1013,6 @@ def acl_status() -> None:
         for label, model in (
             ("raw_inputs", RawInput),
             ("l1_items", L1Item),
-            ("entity_candidates", EntityCandidate),
-            ("fact_candidates", FactCandidate),
-            ("case_candidates", CaseCandidate),
-            ("relation_candidates", RelationCandidate),
         ):
             rows = sess.execute(
                 select(model.acl_topic_id, func.count())

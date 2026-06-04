@@ -56,8 +56,7 @@ class RawInput(Base):
 
     # ---- Topic ACL(M8): 内容打标, 非白名单用户问到带标的内容直接装作不知道。
     # 空串 = 公开可见; 非空 = 命中 topic_acl.yaml 里某个 topic.id, 仅 allowed_domains 可见。
-    # 派生层(L1Item / EntityCandidate / FactCandidate / CaseCandidate / RelationCandidate)
-    # 在各自表上也冗余这一列, retrieve 阶段直接列过滤, 不 join。
+    # 派生层(L1Item) 在各自表上也冗余这一列, retrieve 阶段直接列过滤, 不 join。
     acl_topic_id: Mapped[str] = mapped_column(String(32), default="")
 
     # 业务层去重: (chat_id, wave_message_id) 唯一。
@@ -97,31 +96,6 @@ class WaveEventDedup(Base):
 
     event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     received_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-
-
-class EntityCandidate(Base):
-    """Ontology 涌现层 — 从 L1 signals 抽出的 entity 候选。
-
-    阈值未到的留在 sqlite,达标晋升到 git ontology/entities/<slug>.md。
-    晋升后该行 promoted_at 非空,作为"已转正"标记;后续仍可被 raw 增量引用。
-    """
-
-    __tablename__ = "entity_candidates"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    slug: Mapped[str] = mapped_column(String(128), unique=True)  # 规范化名(小写下划线)
-    name: Mapped[str] = mapped_column(String(255))               # 人类可读
-    entity_type: Mapped[str] = mapped_column(String(64), default="decision_concept")
-    description: Mapped[str] = mapped_column(Text, default="")
-    raw_refs_json: Mapped[str] = mapped_column(Text, default="[]")  # raw_id 列表
-    mention_count: Mapped[int] = mapped_column(Integer, default=0)
-    first_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-    last_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-    promoted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    git_path: Mapped[str] = mapped_column(String(255), default="")  # ontology/entities/<slug>.md
-    superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 取代它的 raw_id
-    acl_topic_id: Mapped[str] = mapped_column(String(32), default="")  # 见 RawInput.acl_topic_id
 
 
 class SpecCandidate(Base):
@@ -349,18 +323,10 @@ class L1Result(Base):
 class L1Item(Base):
     """L1 抽取出的单条知识原子。一条 raw 出 0..N 条 L1Item。
 
-    type 取决于抽取所用的 prompt 版本(helper.config.l1_prompt_version):
-
-    v1(legacy)— 5 类细分:
-      decision: {scene, signals[], tradeoffs[], choice, rationale}
-      fact:     {subject, predicate, object, scope}
-      case:     {scene, what_happened, outcome, referenced_spec?}
-      concept:  {name, entity_type, description}
-      relation: {entity_a, relation, entity_b}
-
-    v2(default)— 二分:
-      section:  {title, body, topics[], entities[], scope?}  ← 语义独立单元,原文保留
-      decision: 同 v1
+    二分 type:
+      section:  {title, body, topics[], entities[]}  ← 语义独立单元,原文保留
+      decision: {scene, signals[], tradeoffs[], choice, rationale,
+                 source_raw_ids?, primary_raw_id?, decision_speaker?, rationale_speaker?}
 
     复合主键 (raw_id, idx) — 重跑 raw 时 sink 先 DELETE 同 raw_id 全部行再写,保证幂等。
     """
@@ -381,91 +347,11 @@ class L1Item(Base):
     )
 
 
-class FactCandidate(Base):
-    """决策性事实候选 — 主谓宾 + 适用范围。
-
-    fact 与 entity 相比是一句陈述(有谓词);与 spec 相比无"决策选择"。
-    达晋升阈值 → facts/<slug>.md。
-    """
-
-    __tablename__ = "fact_candidates"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    slug: Mapped[str] = mapped_column(String(128), unique=True)
-    statement: Mapped[str] = mapped_column(Text)         # 一句话陈述,人类可读
-    subject: Mapped[str] = mapped_column(String(255), default="")
-    predicate: Mapped[str] = mapped_column(String(255), default="")
-    object: Mapped[str] = mapped_column(Text, default="")
-    scope: Mapped[str] = mapped_column(Text, default="")
-    raw_refs_json: Mapped[str] = mapped_column(Text, default="[]")  # [[raw_id, idx], ...]
-    mention_count: Mapped[int] = mapped_column(Integer, default=0)
-    first_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-    last_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-    promoted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    git_path: Mapped[str] = mapped_column(String(255), default="")
-    superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    acl_topic_id: Mapped[str] = mapped_column(String(32), default="")  # 见 RawInput.acl_topic_id
-
-
-class CaseCandidate(Base):
-    """反例 / 决策案例候选 — 一个具体场景里发生了什么、结果如何。
-
-    case 是 episode 级别 — 通常 1 case = 1 文件,不需要聚类,但允许 mention_count
-    去重("同一案例被多人复述")。达阈值 → cases/<slug>.md。
-    """
-
-    __tablename__ = "case_candidates"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    slug: Mapped[str] = mapped_column(String(128), unique=True)
-    title: Mapped[str] = mapped_column(String(255))
-    scene: Mapped[str] = mapped_column(Text, default="")
-    what_happened: Mapped[str] = mapped_column(Text, default="")
-    outcome: Mapped[str] = mapped_column(Text, default="")
-    referenced_spec: Mapped[str] = mapped_column(String(128), default="")  # 触发的 spec slug,可空
-    raw_refs_json: Mapped[str] = mapped_column(Text, default="[]")
-    mention_count: Mapped[int] = mapped_column(Integer, default=0)
-    first_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-    last_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-    promoted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    git_path: Mapped[str] = mapped_column(String(255), default="")
-    superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    acl_topic_id: Mapped[str] = mapped_column(String(32), default="")  # 见 RawInput.acl_topic_id
-
-
-class RelationCandidate(Base):
-    """实体关系候选 — (entity_a, relation, entity_b)。
-
-    达晋升阈值 → ontology/relationships/<slug>.md。
-    slug = f"{a_slug}__{relation}__{b_slug}"。
-    """
-
-    __tablename__ = "relation_candidates"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    slug: Mapped[str] = mapped_column(String(255), unique=True)
-    entity_a: Mapped[str] = mapped_column(String(128))   # entity slug 或自由文本
-    relation: Mapped[str] = mapped_column(String(64))    # 谓词:has_one / supersedes / part_of / ...
-    entity_b: Mapped[str] = mapped_column(String(128))
-    description: Mapped[str] = mapped_column(Text, default="")
-    raw_refs_json: Mapped[str] = mapped_column(Text, default="[]")
-    mention_count: Mapped[int] = mapped_column(Integer, default=0)
-    first_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-    last_seen: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
-    promoted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    git_path: Mapped[str] = mapped_column(String(255), default="")
-    superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    acl_topic_id: Mapped[str] = mapped_column(String(32), default="")  # 见 RawInput.acl_topic_id
-
-
 class Memory(Base):
     """Procedural memory — 用户对 bot 行为的指令(M5)。
 
-    与 5 类 semantic 原子(decision/fact/case/concept/relation)正交:
-    - 那些是"描述世界",进 retrieve 给 LLM 当素材
+    与 semantic 原子(section / decision)正交:
+    - section / decision 是"描述世界",进 retrieve 给 LLM 当素材
     - 这个是"约束 bot 行为",进 ask 的 SYSTEM_PROMPT 当指令
 
     全公司共享(任何人能写,后写覆盖,撤销显式触发);冲突复用 ConflictLog

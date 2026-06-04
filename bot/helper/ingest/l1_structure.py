@@ -1,21 +1,9 @@
 """L1 抽取 — 把毛坯输入(聊天 / 文档 / 任意文本)抽成 0..N 条**知识原子**。
 
-支持两套 prompt(v1 / v2),由 helper.config.get_settings().l1_prompt_version 决定:
-
-v1(legacy)— 5 类细分原子,LLM 自己判类型:
-- decision: {scene, signals[], tradeoffs[], choice, rationale}
-- fact:     {subject, predicate, object, scope}
-- case:     {scene, what_happened, outcome, referenced_spec?}
-- concept:  {name, entity_type, description}
-- relation: {entity_a, relation, entity_b, description?}
-
-v2(default)— 二分:section 主力 + decision 兜叙事:
+二分 schema:
 - section:  {title, body, topics[], entities[]}  ← 语义独立单元,原文保留
-- decision: 同 v1
-v2 设计动机:实测发现 fact / concept / relation 边界对 LLM 不稳定,
-            把成体系的内容(表格 / 清单 / 映射)拆碎反而丢集合性。
-
-两套 prompt 共存,SECTION 与 5 类合法值并行接受。新 raw 默认走 v2。
+- decision: {scene, signals[], tradeoffs[], choice, rationale,
+             source_raw_ids?, primary_raw_id?, decision_speaker?, rationale_speaker?}
 """
 
 from __future__ import annotations
@@ -30,7 +18,7 @@ from helper.llm import run
 
 log = logging.getLogger(__name__)
 
-ALLOWED_TYPES = {"decision", "fact", "case", "concept", "relation", "section"}
+ALLOWED_TYPES = {"section", "decision"}
 
 
 @dataclass
@@ -54,7 +42,7 @@ class L1Output:
         return not self.error
 
 
-SYSTEM_PROMPT_V2 = """你是知识切片器。把输入文本切成「语义独立单元」,每条归到 section 或 decision。
+SYSTEM_PROMPT = """你是知识切片器。把输入文本切成「语义独立单元」,每条归到 section 或 decision。
 
 【独立单元怎么判 — 核心原则】
 - 单独拿出来能自洽表达一件完整的事
@@ -123,54 +111,6 @@ body 字段是 JSON 字符串值,原文里出现的所有特殊字符必须按 J
 原文如 "模拟器"、"加白" 这种带双引号的内容,在 body 里必须写成 \\"模拟器\\"、\\"加白\\"。
 不转义会直接让整段 JSON 解析失败,这条原子整条丢失。
 检查输出前自己默念一遍:每个 body 字段是否所有 " 都已经写成 \\"。"""
-
-
-SYSTEM_PROMPT = """你是知识原子抽取器。给你一段任意文本(可能是聊天片段,也可能是规章文档),
-你要从中抽出**所有**值得沉淀的"知识原子",每条原子归到下列 5 类之一。
-
-输入可能是两种形态:
-A) 一段独立文本 — 直接抽。
-B) 群聊 @bot 触发,带"## 上下文" + "## 主消息" 两块:
-   - 主消息是被 @bot 的那条,通常很短(如"@bot prd模板风险章节放前面吧")
-   - 上下文是同一对话最近 N 分钟的消息(每行带 [raw#ID @speaker] 前缀)
-   - 抽取时把主消息看作"决策时刻",**上下文是支撑这个决策的素材** —
-     主消息里没说全的 scene / signals / rationale,**应当从上下文补齐**。
-   - 同时记录信息源:见下方 source_raw_ids / decision_speaker / rationale_speaker。
-
-类型与字段:
-1. decision — 某场景下做出的判断。
-   字段: scene / signals(数组) / tradeoffs(数组) / choice / rationale
-   附加(群聊场景填,独立文本可空):
-     source_raw_ids: [raw_id, ...]  本条 decision 引用了哪些 raw(主 + 上下文)
-     primary_raw_id: int             主消息 raw_id(决策本身这一条)
-     decision_speaker: str           主消息说话人(domain / union_id / id 都可)
-     rationale_speaker: str          rationale 主要来自谁(可能 ≠ decision_speaker)
-2. fact — 静态可验证事实(主谓宾)。
-   字段: subject / predicate / object / scope(可空)
-   附加: source_raw_ids(可选)
-3. case — 发生过的案例 / 反例。
-   字段: scene / what_happened / outcome / referenced_spec(可空)
-   附加: source_raw_ids(可选)
-4. concept — 术语 / 概念 / 实体定义。
-   字段: name / entity_type / description
-5. relation — 实体间关系。
-   字段: entity_a / relation / entity_b / description(可空)
-
-输出 JSON 数组,每个元素 {"type": "<五者之一>", ...该 type 的字段}。
-
-硬性要求:
-- 只抽文本里直接出现 / 直接可推导的内容,不编造。
-- **宁可多抽不要漏抽** — 文档/对话里出现的每个独立概念、关系、事实、案例、决策,
-  都单独成一条原子,不要为了简洁合并相似条目。一篇 8K 字文档抽 30+ 条原子是常态,
-  不是异常。如果你犹豫"这条是不是不重要",倾向于抽出来。
-- 抽多少条由文本含量决定:0 / 1 / 几十甚至上百都可,不要用类型预设条数。
-- 群聊场景下,**主消息是决策核心**,如果上下文里也有独立的判断/事实/反例(不是为
-  主消息服务的素材),也分别抽出来 — 一次抽完所有原子。
-- 同一原子重复提及只抽一次,但**字面相似但语义不同**(如同一术语在不同章节有不同
-  侧重)要分别抽。
-- 群聊 decision 的 source_raw_ids 要把"被引用作 signal/rationale 的上下文 raw_id"
-  也列出来,不能只填主消息。
-- 直接输出 JSON 数组,不要解释、不要代码块。空 → []。"""
 
 
 def _format_context_block(context: list[dict] | None) -> str:
@@ -303,30 +243,10 @@ def _chunk_by_size(text: str, max_chars: int) -> list[str]:
     return out
 
 
-def _resolve_system_prompt(version: str | None) -> str:
-    """version=None 时读 settings.l1_prompt_version。未知值回落 v1 + warning。"""
-    if version is None:
-        try:
-            from helper.config import get_settings
-            version = get_settings().l1_prompt_version
-        except Exception:  # noqa: BLE001
-            version = "v1"
-    if version == "v2":
-        return SYSTEM_PROMPT_V2
-    if version != "v1":
-        log.warning("unknown l1_prompt_version=%r, falling back to v1", version)
-    return SYSTEM_PROMPT
-
-
-def _structure_one_chunk(
-    user_prompt: str,
-    *,
-    prompt_version: str | None = None,
-) -> tuple[list[L1Item], str]:
+def _structure_one_chunk(user_prompt: str) -> tuple[list[L1Item], str]:
     """单次 LLM 调用 — 返回 (items, error)。"""
-    system = _resolve_system_prompt(prompt_version)
     try:
-        reply = run("l1_structure", system=system, user=user_prompt, temperature=0)
+        reply = run("l1_structure", system=SYSTEM_PROMPT, user=user_prompt, temperature=0)
     except Exception as e:  # noqa: BLE001
         return [], f"LLM call failed: {type(e).__name__}: {e}"
 
@@ -353,7 +273,6 @@ def structure(
     context: list[dict] | None = None,
     primary_raw_id: int | None = None,
     primary_speaker: str = "",
-    prompt_version: str | None = None,
     user_instruction: str = "",
 ) -> L1Output:
     """L1 入口。LLM/解析失败时返回 error 字段非空,不抛。
@@ -379,7 +298,7 @@ def structure(
             primary_speaker=primary_speaker,
             user_instruction=user_instruction,
         )
-        items, err = _structure_one_chunk(user_prompt, prompt_version=prompt_version)
+        items, err = _structure_one_chunk(user_prompt)
         if err and not items:
             return L1Output(raw_text=raw_text, error=err)
         return L1Output(items=items, raw_text=raw_text)
@@ -397,7 +316,7 @@ def structure(
             chunk, context=None, primary_raw_id=None, primary_speaker="",
             user_instruction=user_instruction,
         )
-        items, err = _structure_one_chunk(chunk_prompt, prompt_version=prompt_version)
+        items, err = _structure_one_chunk(chunk_prompt)
         log.info("l1 chunk %d/%d: %d items, err=%s", i + 1, len(chunks), len(items), err or "ok")
         all_items.extend(items)
         if err:

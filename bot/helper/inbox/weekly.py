@@ -24,7 +24,6 @@ from helper.im.wave_client import WaveAPIError
 from helper.storage import session
 from helper.storage.models import (
     ConflictLog,
-    EntityCandidate,
     InboxDigest,
     InquiryLog,
     L1Result,
@@ -49,8 +48,6 @@ class WeeklyDigest:
     open_conflicts: list[tuple[int, str, str, str, str]] = field(default_factory=list)
     # 列出未答追问全文 — 让 owner 直接看到要补什么。(id, raw_id, question)
     unanswered_inquiries: list[tuple[int, int, str]] = field(default_factory=list)
-    entity_total: int = 0
-    entity_promoted: int = 0
 
 
 def _week_window() -> tuple[datetime, datetime]:
@@ -104,11 +101,6 @@ def build_digest() -> WeeklyDigest:
             .limit(10)
         ).scalars().all()
         d.unanswered_inquiries = [(iq.id, iq.raw_id, iq.question) for iq in inquiry_rows]
-
-        d.entity_total = len(s.execute(select(EntityCandidate.id)).scalars().all())
-        d.entity_promoted = len(s.execute(
-            select(EntityCandidate.id).where(EntityCandidate.promoted_at.is_not(None))
-        ).scalars().all())
     return d
 
 
@@ -135,10 +127,7 @@ def render_card(d: WeeklyDigest) -> str:
             "回「采纳 2-N」用新覆盖旧 / 「保留 2-N」否决新 / 「都留 2-N」并存"
         )
         for n, (_cid, ttype, _slug, _sev, summary) in enumerate(d.open_conflicts, start=1):
-            type_label = {
-                "spec": "规约", "fact": "事实", "case": "案例",
-                "concept": "概念", "relation": "关系",
-            }.get(ttype, ttype)
+            type_label = {"spec": "规约", "memory": "偏好"}.get(ttype, ttype)
             lines.append(f"  2-{n}  [{type_label}] {summary}")
         lines.append("")
     if d.unanswered_inquiries:

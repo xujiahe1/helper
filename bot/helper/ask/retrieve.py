@@ -28,13 +28,9 @@ from sqlalchemy import select
 from helper.compiler import load_bundle
 from helper.storage import fts, session, vector
 from helper.storage.models import (
-    CaseCandidate,
-    EntityCandidate,
-    FactCandidate,
     L1Item,
     Memory,
     RawInput,
-    RelationCandidate,
     SpecCandidate,
 )
 
@@ -51,7 +47,7 @@ SECTION_BODY_CAP = 1500
 
 @dataclass
 class Hit:
-    type: str  # spec / entity / section / decision / fact / case / relation / directive
+    type: str  # spec / section / decision / directive
     ref: str   # slug 或 "raw_id:idx" (atom)
     title: str
     body: str
@@ -107,13 +103,10 @@ def _jaccard_score(query_toks: set[str], doc_text: str) -> float:
 
 # ---------- superseded raw 过滤(差集策略) ----------
 
-# 5 张候选表 + 各自的 raw_refs 字段名(SpecCandidate 历史叫 cluster_raw_ids_json)
+# spec 是唯一的"raw → 候选"中间层。section/decision 在 l1_items 直接 ref raw_id,
+# 不需要走候选反查。
 _CANDIDATE_TABLES: list[tuple[type, str]] = [
     (SpecCandidate, "cluster_raw_ids_json"),
-    (FactCandidate, "raw_refs_json"),
-    (CaseCandidate, "raw_refs_json"),
-    (EntityCandidate, "raw_refs_json"),
-    (RelationCandidate, "raw_refs_json"),
 ]
 
 
@@ -138,12 +131,9 @@ def _parse_raw_refs(j: str | None) -> set[int]:
 def _superseded_raw_ids() -> set[int]:
     """返回"应该被 retrieve 过滤掉的 raw_id"集合。
 
-    策略:差集 = (任一已 superseded 候选支撑的 raw) − (任一仍 alive 候选支撑的 raw)。
-    一条 raw 只要还撑着任何一个未 superseded 候选(decision/fact/concept 等),
-    它在 retrieve 里仍可被召回 — 只过滤"仅被 superseded 候选独占引用"的 raw。
-
-    这样消除以下误伤:同一条 raw 抽出 decision + fact,其中 fact 后来被 supersede,
-    decision 仍然有效 → raw 应保留。
+    策略:差集 = (任一已 superseded spec 支撑的 raw) − (任一仍 alive spec 支撑的 raw)。
+    spec 是唯一的 raw 聚合产物 — section/decision 在 l1_items 直接 ref raw_id,
+    不需要候选反查。
     """
     superseded: set[int] = set()
     alive: set[int] = set()
@@ -283,9 +273,8 @@ def _hydrate_fts_hits(
 
     raw kind 命中直接丢弃 — raw 是原文层,知识已抽到 section/decision,主召回不出 raw。
     spec  → 优先 bundle(已 review),没有再回 SpecCandidate
-    entity/fact/case/relation → 候选表(过滤 superseded_at)
     section/decision → l1_items 反查
-    bundle 命中的 spec / entity 这里也会被反查到,但 _bundle_jaccard_pass 也会出
+    bundle 命中的 spec 这里也会被反查到,但 _bundle_jaccard_pass 也会出
     同 (type, ref),由 RRF 融合层去重。
     """
     if not fts_hits:
@@ -324,80 +313,6 @@ def _hydrate_fts_hits(
                     body=(sc.statement or "") + ("\n" + sc.rationale if sc.rationale else ""),
                     score=score_map[("spec", slug)], sources=["fts"],
                 ))
-        if "entity" in by_kind:
-            slugs = by_kind["entity"]
-            rows = {
-                ec.slug: ec for ec in s.execute(
-                    select(EntityCandidate)
-                    .where(EntityCandidate.slug.in_(slugs))
-                    .where(EntityCandidate.superseded_at.is_(None))
-                ).scalars()
-            }
-            for slug in slugs:
-                ec = rows.get(slug)
-                if ec is None:
-                    continue
-                out.append(Hit(
-                    type="entity", ref=slug, title=ec.name or slug,
-                    body=ec.description or "",
-                    score=score_map[("entity", slug)], sources=["fts"],
-                ))
-        if "fact" in by_kind:
-            slugs = by_kind["fact"]
-            rows = {
-                fc.slug: fc for fc in s.execute(
-                    select(FactCandidate)
-                    .where(FactCandidate.slug.in_(slugs))
-                    .where(FactCandidate.superseded_at.is_(None))
-                ).scalars()
-            }
-            for slug in slugs:
-                fc = rows.get(slug)
-                if fc is None:
-                    continue
-                out.append(Hit(
-                    type="fact", ref=slug,
-                    title=f"{fc.subject} {fc.predicate} {fc.object}".strip(),
-                    body=fc.statement or "",
-                    score=score_map[("fact", slug)], sources=["fts"],
-                ))
-        if "case" in by_kind:
-            slugs = by_kind["case"]
-            rows = {
-                cc.slug: cc for cc in s.execute(
-                    select(CaseCandidate)
-                    .where(CaseCandidate.slug.in_(slugs))
-                    .where(CaseCandidate.superseded_at.is_(None))
-                ).scalars()
-            }
-            for slug in slugs:
-                cc = rows.get(slug)
-                if cc is None:
-                    continue
-                out.append(Hit(
-                    type="case", ref=slug, title=cc.title or slug,
-                    body=(cc.what_happened or "") + " | " + (cc.outcome or ""),
-                    score=score_map[("case", slug)], sources=["fts"],
-                ))
-        if "relation" in by_kind:
-            slugs = by_kind["relation"]
-            rows = {
-                rc.slug: rc for rc in s.execute(
-                    select(RelationCandidate)
-                    .where(RelationCandidate.slug.in_(slugs))
-                    .where(RelationCandidate.superseded_at.is_(None))
-                ).scalars()
-            }
-            for slug in slugs:
-                rc = rows.get(slug)
-                if rc is None:
-                    continue
-                out.append(Hit(
-                    type="relation", ref=slug,
-                    title=f"{rc.entity_a} —[{rc.relation}]→ {rc.entity_b}",
-                    body=rc.description or "",
-                    score=score_map[("relation", slug)], sources=["fts"],
-                ))
         if "section" in by_kind:
             out.extend(_hydrate_l1_atoms(
                 s, "section", by_kind["section"], skip_raw_ids, score_map, "fts",
@@ -410,7 +325,7 @@ def _hydrate_fts_hits(
 
 
 def _fts_pass(question: str, skip_raw_ids: set[int]) -> list[Hit]:
-    """FTS5 + jieba 词面召回,覆盖 raw + 5 类候选。"""
+    """FTS5 + jieba 词面召回,覆盖 spec / section / decision。"""
     try:
         with session() as s:
             hits = fts.search(s, query=question, top_k=FTS_TOP_K)
@@ -457,9 +372,9 @@ def _directive_pass(question: str) -> list[Hit]:
 # ---------- bundle 内存 Jaccard 路径(只扫已编译的小集合) ----------
 
 def _bundle_jaccard_pass(qtoks: set[str]) -> list[Hit]:
-    """bundle 是已编译的 spec/entity/fact/case 摘要(几十~几百条),内存全扫便宜。
+    """bundle 是已编译的 spec 摘要(几十~几百条),内存全扫便宜。
 
-    raw / 候选表的全扫由 _fts_pass 走 FTS5(几万行规模秒级 → 毫秒级)。
+    section/decision 由 _fts_pass / _vector_pass 召回,不进 bundle。
     """
     bundle = load_bundle()
     hits: list[Hit] = []
@@ -475,39 +390,6 @@ def _bundle_jaccard_pass(qtoks: set[str]) -> list[Hit]:
                 score=sc, sources=["jaccard"],
             ))
 
-    for ent in bundle.get("entities", []):
-        text_ = " ".join([str(ent.get("name", "")), str(ent.get("_body", ""))])
-        sc = _jaccard_score(qtoks, text_)
-        if sc > 0:
-            hits.append(Hit(
-                type="entity", ref=str(ent.get("slug", "")),
-                title=str(ent.get("name", "")),
-                body=str(ent.get("_body", ""))[:600],
-                score=sc, sources=["jaccard"],
-            ))
-
-    for fact in bundle.get("facts", []):
-        text_ = " ".join([str(fact.get("subject", "")), str(fact.get("_body", ""))])
-        sc = _jaccard_score(qtoks, text_)
-        if sc > 0:
-            hits.append(Hit(
-                type="fact", ref=str(fact.get("slug", "")),
-                title=str(fact.get("subject", "")) or str(fact.get("slug", "")),
-                body=str(fact.get("_body", ""))[:600],
-                score=sc, sources=["jaccard"],
-            ))
-
-    for case in bundle.get("cases", []):
-        text_ = " ".join([str(case.get("title", "")), str(case.get("_body", ""))])
-        sc = _jaccard_score(qtoks, text_)
-        if sc > 0:
-            hits.append(Hit(
-                type="case", ref=str(case.get("slug", "")),
-                title=str(case.get("title", "")) or str(case.get("slug", "")),
-                body=str(case.get("_body", ""))[:600],
-                score=sc, sources=["jaccard"],
-            ))
-
     hits.sort(key=lambda h: -h.score)
     return hits[:JACCARD_TOP_K]
 
@@ -517,11 +399,11 @@ def _bundle_jaccard_pass(qtoks: set[str]) -> list[Hit]:
 def _hydrate_vector_hits(
     vec_hits: list[vector.VectorHit], skip_raw_ids: set[int]
 ) -> list[Hit]:
-    """vec0 KNN 给的是 (kind, ref, distance);需要把对应 spec / entity / section / decision
+    """vec0 KNN 给的是 (kind, ref, distance);需要把对应 spec / section / decision
     的标题 + 正文取出来。
 
     raw kind 命中直接丢弃 — raw 不进主召回。
-    spec / entity 走 bundle(已编译好,正文可读);
+    spec 走 bundle(已编译好,正文可读);
     section/decision 走 l1_items 反查,与 fts 路径共用 _hydrate_l1_atoms。
     """
     if not vec_hits:
@@ -529,7 +411,6 @@ def _hydrate_vector_hits(
 
     bundle = load_bundle()
     spec_by_slug = {str(sp.get("slug", "")): sp for sp in bundle.get("specs", [])}
-    ent_by_slug = {str(ec.get("slug", "")): ec for ec in bundle.get("entities", [])}
 
     out: list[Hit] = []
 
@@ -555,18 +436,6 @@ def _hydrate_vector_hits(
                 ref=h.ref,
                 title=str(sp.get("title", "")),
                 body=str(sp.get("_body", ""))[:1000],
-                score=readable,
-                sources=["vector"],
-            ))
-        elif h.kind == "entity":
-            ec = ent_by_slug.get(h.ref)
-            if ec is None:
-                continue
-            out.append(Hit(
-                type="entity",
-                ref=h.ref,
-                title=str(ec.get("name", "")),
-                body=str(ec.get("_body", ""))[:600],
                 score=readable,
                 sources=["vector"],
             ))

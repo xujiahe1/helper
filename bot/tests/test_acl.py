@@ -62,24 +62,19 @@ def test_tag_text_llm_failure_retries_then_default(db, settings, llm_stub, acl_r
     assert calls["n"] == 2  # 重试 1 次
 
 
-def test_tag_raw_propagates_to_candidates(db, settings, llm_stub, acl_reset):
-    """tag_raw 给 raw 落标 + 同步派生 entity / fact / case 候选(继承同 topic)。"""
-    import json
+def test_tag_raw_propagates_to_l1_items(db, settings, llm_stub, acl_reset):
+    """tag_raw 给 raw 落标 + 同步派生 L1Item 继承同 topic。"""
     from helper.acl import tag_raw
     from helper.storage import session
-    from helper.storage.models import (
-        CaseCandidate, EntityCandidate, FactCandidate, L1Item, RawInput,
-    )
+    from helper.storage.models import L1Item, RawInput
 
     with session() as s:
         r = RawInput(source_type="im_wave", content_text="螃蟹是哥对周婷的称呼", author_domain="alice")
         s.add(r)
         s.flush()
         raw_id = r.id
-        s.add(L1Item(raw_id=raw_id, idx=0, type="fact", payload_json="{}"))
-        s.add(EntityCandidate(slug="螃蟹", name="螃蟹", description="...", raw_refs_json=json.dumps([raw_id])))
-        s.add(FactCandidate(slug="ge_called_screen_crab", statement="...", raw_refs_json=json.dumps([[raw_id, 0]])))
-        s.add(CaseCandidate(slug="case1", title="x", raw_refs_json=json.dumps([raw_id])))
+        s.add(L1Item(raw_id=raw_id, idx=0, type="section", payload_json="{}"))
+        s.add(L1Item(raw_id=raw_id, idx=1, type="decision", payload_json="{}"))
 
     llm_stub.set("acl_tag", "ge")
     topic = tag_raw(raw_id)
@@ -87,10 +82,8 @@ def test_tag_raw_propagates_to_candidates(db, settings, llm_stub, acl_reset):
 
     with session() as s:
         assert s.get(RawInput, raw_id).acl_topic_id == "ge"
-        assert s.query(L1Item).filter_by(raw_id=raw_id).first().acl_topic_id == "ge"
-        assert s.query(EntityCandidate).filter_by(slug="螃蟹").first().acl_topic_id == "ge"
-        assert s.query(FactCandidate).filter_by(slug="ge_called_screen_crab").first().acl_topic_id == "ge"
-        assert s.query(CaseCandidate).filter_by(slug="case1").first().acl_topic_id == "ge"
+        for it in s.query(L1Item).filter_by(raw_id=raw_id).all():
+            assert it.acl_topic_id == "ge"
 
 
 def test_tag_raw_keeps_existing_topic_when_llm_returns_empty(db, settings, llm_stub, acl_reset):
@@ -156,63 +149,45 @@ def test_tag_raw_first_pass_can_set_empty(db, settings, llm_stub, acl_reset):
         assert s.get(RawInput, raw_id).acl_topic_id == ""
 
 
-def test_tag_raw_propagation_does_not_match_substring(db, settings, llm_stub, acl_reset):
-    """raw_id=1 的标不能错误地继承到 raw_refs_json=[12, 21] 的候选(数字边界)。"""
-    import json
-    from helper.acl import tag_raw
-    from helper.storage import session
-    from helper.storage.models import EntityCandidate, RawInput
-
-    with session() as s:
-        # 真正引用 raw_id=1
-        r1 = RawInput(source_type="im_wave", content_text="哥的事", author_domain="a")
-        s.add(r1); s.flush()
-        rid = r1.id
-        s.add(EntityCandidate(slug="hit", name="hit", raw_refs_json=json.dumps([rid])))
-        # 只是数字 12 / 21 包含 "1" 字符,不能误中
-        s.add(EntityCandidate(
-            slug="miss", name="miss",
-            raw_refs_json=json.dumps([rid + 100, rid + 1000]),
-        ))
-
-    llm_stub.set("acl_tag", "ge")
-    tag_raw(rid)
-
-    with session() as s:
-        assert s.query(EntityCandidate).filter_by(slug="hit").first().acl_topic_id == "ge"
-        assert s.query(EntityCandidate).filter_by(slug="miss").first().acl_topic_id == ""
-
-
 # ---------- 出口过滤 ----------
 
 
 def test_filter_hits_blocks_non_whitelisted_asker(db, settings, llm_stub, acl_reset):
-    """带 ge 标的 raw / entity hit 对非白名单用户不可见。"""
+    """带 ge 标的 raw / section hit 对非白名单用户不可见。"""
+    import json
     from helper.acl import filter_hits
     from helper.ask.retrieve import Hit
     from helper.storage import session
-    from helper.storage.models import EntityCandidate, RawInput
+    from helper.storage.models import L1Item, RawInput
 
     with session() as s:
         r1 = RawInput(source_type="im_wave", content_text="public", acl_topic_id="")
         r2 = RawInput(source_type="im_wave", content_text="ge stuff", acl_topic_id="ge")
         s.add_all([r1, r2]); s.flush()
         rid_pub, rid_ge = r1.id, r2.id
-        s.add(EntityCandidate(slug="哥", name="哥", description="...", acl_topic_id="ge"))
-        s.add(EntityCandidate(slug="iam", name="iam", description="...", acl_topic_id=""))
+        s.add(L1Item(
+            raw_id=rid_ge, idx=0, type="section",
+            payload_json=json.dumps({"title": "哥", "body": "..."}),
+            acl_topic_id="ge",
+        ))
+        s.add(L1Item(
+            raw_id=rid_pub, idx=0, type="section",
+            payload_json=json.dumps({"title": "iam", "body": "..."}),
+            acl_topic_id="",
+        ))
 
     hits = [
         Hit(type="raw", ref=str(rid_pub), title="", body="", score=1.0),
         Hit(type="raw", ref=str(rid_ge), title="", body="", score=0.9),
-        Hit(type="entity", ref="哥", title="", body="", score=0.8),
-        Hit(type="entity", ref="iam", title="", body="", score=0.7),
+        Hit(type="section", ref=f"{rid_ge}:0", title="", body="", score=0.8),
+        Hit(type="section", ref=f"{rid_pub}:0", title="", body="", score=0.7),
     ]
 
     # 非白名单
     allowed, blocked = filter_hits("outsider.user", hits)
     allowed_keys = {(h.type, h.ref) for h in allowed}
-    assert allowed_keys == {("raw", str(rid_pub)), ("entity", "iam")}
-    assert {(h.type, h.ref) for h in blocked} == {("raw", str(rid_ge)), ("entity", "哥")}
+    assert allowed_keys == {("raw", str(rid_pub)), ("section", f"{rid_pub}:0")}
+    assert {(h.type, h.ref) for h in blocked} == {("raw", str(rid_ge)), ("section", f"{rid_ge}:0")}
 
     # 白名单
     allowed2, blocked2 = filter_hits("jiahe.xu", hits)

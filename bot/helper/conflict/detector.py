@@ -29,14 +29,10 @@ from helper.ask.retrieve import retrieve_relevant
 from helper.llm import run
 from helper.storage import session
 from helper.storage.models import (
-    CaseCandidate,
     ConflictLog,
-    EntityCandidate,
-    FactCandidate,
     L1Item,
     Memory,
     RawInput,
-    RelationCandidate,
 )
 
 log = logging.getLogger(__name__)
@@ -48,7 +44,7 @@ _MAX_DECISIONS = 5  # 单条 raw 真有这么多 decision 已经是异常,cap �
 @dataclass
 class ConflictHit:
     raw_id: int
-    target_type: str  # spec / fact / case / relation
+    target_type: str  # spec / memory
     target_slug: str
     summary: str
     severity: str  # low / medium / high
@@ -220,39 +216,27 @@ def _decide_resolution(judged: dict) -> tuple[str, str]:
 # ---------- 入库 + supersede ----------
 
 def _supersede_target(s, target_type: str, target_slug: str, raw_id: int) -> None:
-    """auto_superseded / superseded 都通过这里给候选打 superseded_at。
+    """auto_superseded / superseded 都通过这里给 spec 打 superseded_at。
 
     打完同时把对应 fts/vector 索引清掉 — 否则 retrieve 仍能召回到已废弃候选。
     fts/vec 失败仅 log,不阻塞 supersede 主流程(下次 rebuild 能补)。
     """
-    now = datetime.now(timezone.utc)
-    type_to_kind = {
-        "spec": "spec", "fact": "fact", "case": "case",
-        "concept": "entity", "relation": "relation",
-    }
-    model_cls = {
-        "spec": "SpecCandidate",
-        "fact": "FactCandidate",
-        "case": "CaseCandidate",
-        "concept": "EntityCandidate",
-        "relation": "RelationCandidate",
-    }.get(target_type)
-    if model_cls is None:
+    if target_type != "spec":
         return
-    from helper.storage import models as _m
-    cls = getattr(_m, model_cls)
-    cand = s.execute(select(cls).where(cls.slug == target_slug)).scalar_one_or_none()
+    now = datetime.now(timezone.utc)
+    from helper.storage.models import SpecCandidate
+    cand = s.execute(
+        select(SpecCandidate).where(SpecCandidate.slug == target_slug)
+    ).scalar_one_or_none()
     if cand is not None and cand.superseded_at is None:
         cand.superseded_at = now
         cand.superseded_by = raw_id
-        kind = type_to_kind.get(target_type)
-        if kind:
-            try:
-                from helper.storage import fts as _fts, vector as _vec
-                _fts.delete(s, kind=kind, ref=target_slug)
-                _vec.delete(s, kind=kind, ref=target_slug)
-            except Exception:  # noqa: BLE001
-                log.exception("supersede index cleanup failed kind=%s ref=%s", kind, target_slug)
+        try:
+            from helper.storage import fts as _fts, vector as _vec
+            _fts.delete(s, kind="spec", ref=target_slug)
+            _vec.delete(s, kind="spec", ref=target_slug)
+        except Exception:  # noqa: BLE001
+            log.exception("supersede index cleanup failed ref=%s", target_slug)
 
 
 def _record_conflict(
@@ -356,176 +340,6 @@ def _detect_decision(
     return out
 
 
-# ---------- fact ----------
-
-def _detect_fact(raw_id: int, raw_text: str, items: list[L1Item]) -> list[ConflictHit]:
-    out: list[ConflictHit] = []
-    with session() as s:
-        for it in items:
-            if it.type != "fact":
-                continue
-            try:
-                payload = json.loads(it.payload_json or "{}")
-            except json.JSONDecodeError:
-                continue
-            subject = str(payload.get("subject", "")).strip()
-            predicate = str(payload.get("predicate", "")).strip()
-            obj = str(payload.get("object", "")).strip()
-            scope = str(payload.get("scope", "")).strip()
-            if not (subject and predicate):
-                continue
-            existing = s.execute(
-                select(FactCandidate)
-                .where(FactCandidate.subject == subject[:255])
-                .where(FactCandidate.predicate == predicate[:255])
-                .where(FactCandidate.superseded_at.is_(None))
-            ).scalars().all()
-            for fc in existing:
-                if fc.object == obj and (fc.scope or "") == scope:
-                    continue
-                judged = _normalize_judge(_judge_pair(
-                    raw_text=raw_text,
-                    new_kind="fact",
-                    new_payload={
-                        "subject": subject, "predicate": predicate,
-                        "object": obj, "scope": scope,
-                    },
-                    old_kind="fact",
-                    old_payload={
-                        "subject": fc.subject, "predicate": fc.predicate,
-                        "object": fc.object, "scope": fc.scope or "",
-                    },
-                    entity_names=[subject],
-                ))
-                if judged["verdict"] != "contradicts":
-                    continue
-                resolution, reason = _decide_resolution(judged)
-                hit = _record_conflict(
-                    raw_id, target_type="fact", target_slug=fc.slug,
-                    summary=judged["summary"], severity=judged["severity"],
-                    resolution=resolution, auto_reason=reason,
-                )
-                if hit is not None:
-                    out.append(hit)
-    return out
-
-
-# ---------- case ----------
-
-_TOKEN_RE = re.compile(r"[\w一-鿿]+", re.UNICODE)
-
-
-def _scenes_similar(a: str, b: str) -> bool:
-    ta = {t.lower() for t in _TOKEN_RE.findall(a or "") if len(t) > 1}
-    tb = {t.lower() for t in _TOKEN_RE.findall(b or "") if len(t) > 1}
-    if not ta or not tb:
-        return False
-    return len(ta & tb) / max(len(ta | tb), 1) >= 0.3
-
-
-def _detect_case(raw_id: int, raw_text: str, items: list[L1Item]) -> list[ConflictHit]:
-    out: list[ConflictHit] = []
-    with session() as s:
-        for it in items:
-            if it.type != "case":
-                continue
-            try:
-                payload = json.loads(it.payload_json or "{}")
-            except json.JSONDecodeError:
-                continue
-            scene = str(payload.get("scene", "")).strip()
-            outcome = str(payload.get("outcome", "")).strip()
-            ref_spec = str(payload.get("referenced_spec", "")).strip()
-            if not scene or not outcome:
-                continue
-            q = select(CaseCandidate).where(CaseCandidate.superseded_at.is_(None))
-            if ref_spec:
-                q = q.where(CaseCandidate.referenced_spec == ref_spec[:128])
-            else:
-                q = q.where(CaseCandidate.scene == scene)
-            existing = s.execute(q).scalars().all()
-            for cc in existing:
-                if (cc.outcome or "") == outcome:
-                    continue
-                if not _scenes_similar(cc.scene, scene):
-                    continue
-                judged = _normalize_judge(_judge_pair(
-                    raw_text=raw_text,
-                    new_kind="case",
-                    new_payload={
-                        "scene": scene, "outcome": outcome,
-                        "referenced_spec": ref_spec,
-                    },
-                    old_kind="case",
-                    old_payload={
-                        "scene": cc.scene, "outcome": cc.outcome or "",
-                        "referenced_spec": cc.referenced_spec or "",
-                    },
-                    entity_names=[ref_spec] if ref_spec else [],
-                ))
-                if judged["verdict"] != "contradicts":
-                    continue
-                resolution, reason = _decide_resolution(judged)
-                hit = _record_conflict(
-                    raw_id, target_type="case", target_slug=cc.slug,
-                    summary=judged["summary"], severity=judged["severity"],
-                    resolution=resolution, auto_reason=reason,
-                )
-                if hit is not None:
-                    out.append(hit)
-    return out
-
-
-# ---------- relation ----------
-
-def _detect_relation(raw_id: int, raw_text: str, items: list[L1Item]) -> list[ConflictHit]:
-    out: list[ConflictHit] = []
-    with session() as s:
-        for it in items:
-            if it.type != "relation":
-                continue
-            try:
-                payload = json.loads(it.payload_json or "{}")
-            except json.JSONDecodeError:
-                continue
-            a = str(payload.get("entity_a", "")).strip()
-            rel = str(payload.get("relation", "")).strip()
-            b = str(payload.get("entity_b", "")).strip()
-            if not (a and rel and b):
-                continue
-            existing = s.execute(
-                select(RelationCandidate)
-                .where(RelationCandidate.entity_a == a[:128])
-                .where(RelationCandidate.entity_b == b[:128])
-                .where(RelationCandidate.superseded_at.is_(None))
-            ).scalars().all()
-            for rc in existing:
-                if rc.relation == rel:
-                    continue
-                judged = _normalize_judge(_judge_pair(
-                    raw_text=raw_text,
-                    new_kind="relation",
-                    new_payload={"entity_a": a, "relation": rel, "entity_b": b},
-                    old_kind="relation",
-                    old_payload={
-                        "entity_a": rc.entity_a, "relation": rc.relation,
-                        "entity_b": rc.entity_b,
-                    },
-                    entity_names=[a, b],
-                ))
-                if judged["verdict"] != "contradicts":
-                    continue
-                resolution, reason = _decide_resolution(judged)
-                hit = _record_conflict(
-                    raw_id, target_type="relation", target_slug=rc.slug,
-                    summary=judged["summary"], severity=judged["severity"],
-                    resolution=resolution, auto_reason=reason,
-                )
-                if hit is not None:
-                    out.append(hit)
-    return out
-
-
 # ---------- 主入口 ----------
 
 def detect_for_raw(raw_id: int, *, top_k_specs: int = _TOP_K_SPECS) -> list[ConflictHit]:
@@ -554,9 +368,6 @@ def detect_for_raw(raw_id: int, *, top_k_specs: int = _TOP_K_SPECS) -> list[Conf
     out: list[ConflictHit] = []
     if decisions:
         out.extend(_detect_decision(raw_id, raw_text, decisions, top_k_specs=top_k_specs))
-    out.extend(_detect_fact(raw_id, raw_text, l1_items))
-    out.extend(_detect_case(raw_id, raw_text, l1_items))
-    out.extend(_detect_relation(raw_id, raw_text, l1_items))
 
     auto_n = sum(1 for h in out if h.resolution.startswith("auto_"))
     log.info(
@@ -608,41 +419,24 @@ def resolve(
                     if mem is not None and mem.superseded_at is None:
                         mem.superseded_at = now
                         mem.superseded_by = row.raw_id
-            else:
-                model_cls = {
-                    "spec": "SpecCandidate",
-                    "fact": "FactCandidate",
-                    "case": "CaseCandidate",
-                    "concept": "EntityCandidate",
-                    "relation": "RelationCandidate",
-                }.get(target_type)
-                if model_cls is not None:
-                    from helper.storage import models as _m
-                    cls = getattr(_m, model_cls)
-                    cand = s.execute(
-                        select(cls).where(cls.slug == target_slug)
-                    ).scalar_one_or_none()
-                    if cand is not None and cand.superseded_at is None:
-                        cand.superseded_at = now
-                        cand.superseded_by = row.raw_id
-                        if cand.git_path:
-                            git_to_remove = cand.git_path
-                        # 同步清 fts/vec 索引(retrieve 才不会再召回)
-                        type_to_kind = {
-                            "spec": "spec", "fact": "fact", "case": "case",
-                            "concept": "entity", "relation": "relation",
-                        }
-                        kind = type_to_kind.get(target_type)
-                        if kind:
-                            try:
-                                from helper.storage import fts as _fts, vector as _vec
-                                _fts.delete(s, kind=kind, ref=target_slug)
-                                _vec.delete(s, kind=kind, ref=target_slug)
-                            except Exception:  # noqa: BLE001
-                                log.exception(
-                                    "resolve index cleanup failed kind=%s ref=%s",
-                                    kind, target_slug,
-                                )
+            elif target_type == "spec":
+                from helper.storage.models import SpecCandidate
+                cand = s.execute(
+                    select(SpecCandidate).where(SpecCandidate.slug == target_slug)
+                ).scalar_one_or_none()
+                if cand is not None and cand.superseded_at is None:
+                    cand.superseded_at = now
+                    cand.superseded_by = row.raw_id
+                    if cand.git_path:
+                        git_to_remove = cand.git_path
+                    try:
+                        from helper.storage import fts as _fts, vector as _vec
+                        _fts.delete(s, kind="spec", ref=target_slug)
+                        _vec.delete(s, kind="spec", ref=target_slug)
+                    except Exception:  # noqa: BLE001
+                        log.exception(
+                            "resolve index cleanup failed ref=%s", target_slug,
+                        )
         s.commit()
 
     if git_to_remove:
@@ -674,5 +468,3 @@ def _remove_from_git(rel_path: str, *, reason: str) -> None:
         log.exception("remove %s from git failed", rel_path)
 
 
-# 占位避免 import 警告
-_ = EntityCandidate

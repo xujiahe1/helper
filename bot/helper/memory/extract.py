@@ -21,7 +21,7 @@ from sqlalchemy import select
 
 from helper.llm import run
 from helper.storage import raw_store, session
-from helper.storage.models import ConflictLog, EntityCandidate, Memory, RawInput
+from helper.storage.models import ConflictLog, Memory, RawInput
 
 log = logging.getLogger(__name__)
 
@@ -139,22 +139,10 @@ def _parse_json(text: str) -> dict | None:
 
 
 def _resolve_scope(scope_type: str, scope_ref: str) -> tuple[str, str]:
-    """把 LLM 给的 scope_ref(可能是中文名)对到 EntityCandidate slug。
-
-    匹配不上 → 保留原文当 ref(后续 ask 拼接按字面匹配 entity name 也能命中)。
-    """
+    """LLM 给的 scope_ref 直接当 ref 用 — ask 拼接按字面匹配 entity name 即可命中。"""
     if scope_type != "entity" or not scope_ref:
         return ("global", "")
-    with session() as s:
-        ec = s.execute(
-            select(EntityCandidate).where(
-                EntityCandidate.name == scope_ref,
-                EntityCandidate.superseded_at.is_(None),
-            )
-        ).scalar_one_or_none()
-        if ec is not None:
-            return ("entity", ec.slug)
-    return ("entity", scope_ref)  # 没找到就先记字面值
+    return ("entity", scope_ref)
 
 
 def _detect_conflict_target(scope_type: str, scope_ref: str) -> int | None:

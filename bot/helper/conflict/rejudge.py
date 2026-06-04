@@ -27,12 +27,9 @@ from helper.conflict.detector import (
 )
 from helper.storage import session
 from helper.storage.models import (
-    CaseCandidate,
     ConflictLog,
-    FactCandidate,
     L1Item,
     RawInput,
-    RelationCandidate,
     SpecCandidate,
 )
 
@@ -40,65 +37,40 @@ log = logging.getLogger(__name__)
 
 
 def _load_old_payload(s, target_type: str, target_slug: str) -> tuple[str, dict | str] | None:
-    """按 target_type 反查 candidate,组成给 LLM 看的 old_payload。"""
-    if target_type == "spec":
-        sc = s.execute(select(SpecCandidate).where(SpecCandidate.slug == target_slug)).scalar_one_or_none()
-        if sc is None:
-            return None
-        return f"spec — {sc.title}", (sc.statement or "")[:1200]
-    if target_type == "fact":
-        fc = s.execute(select(FactCandidate).where(FactCandidate.slug == target_slug)).scalar_one_or_none()
-        if fc is None:
-            return None
-        return "fact", {
-            "subject": fc.subject, "predicate": fc.predicate,
-            "object": fc.object, "scope": fc.scope or "",
-        }
-    if target_type == "case":
-        cc = s.execute(select(CaseCandidate).where(CaseCandidate.slug == target_slug)).scalar_one_or_none()
-        if cc is None:
-            return None
-        return "case", {
-            "scene": cc.scene, "outcome": cc.outcome or "",
-            "referenced_spec": cc.referenced_spec or "",
-        }
-    if target_type == "relation":
-        rc = s.execute(select(RelationCandidate).where(RelationCandidate.slug == target_slug)).scalar_one_or_none()
-        if rc is None:
-            return None
-        return "relation", {
-            "entity_a": rc.entity_a, "relation": rc.relation, "entity_b": rc.entity_b,
-        }
-    return None
+    """target_type=spec 反查 SpecCandidate,组成给 LLM 看的 old_payload。"""
+    if target_type != "spec":
+        return None
+    sc = s.execute(select(SpecCandidate).where(SpecCandidate.slug == target_slug)).scalar_one_or_none()
+    if sc is None:
+        return None
+    return f"spec — {sc.title}", (sc.statement or "")[:1200]
 
 
 def _load_new_payload(
     s, raw_id: int, target_type: str
 ) -> tuple[str, dict, list[str]] | None:
-    """从 raw 的 L1Item 里挑出对应 type 的第一条 payload。
+    """从 raw 的 L1Item 里挑出第一条 decision payload(spec target 用)。
 
-    返 (kind, payload, entity_names)。挑不到返 None(说明 L1 没了 / 只有 concept)。
+    返 (kind, payload, entity_names)。挑不到返 None。
     """
+    if target_type != "spec":
+        return None
     items = list(s.execute(
         select(L1Item).where(L1Item.raw_id == raw_id).order_by(L1Item.idx)
     ).scalars())
-    type_map = {"spec": "decision", "fact": "fact", "case": "case", "relation": "relation"}
-    want = type_map.get(target_type)
-    if want is None:
-        return None
     for it in items:
-        if it.type != want:
+        if it.type != "decision":
             continue
         try:
             payload = json.loads(it.payload_json or "{}")
         except json.JSONDecodeError:
             continue
         entity_names = []
-        for k in ("subject", "scene", "scope", "entity_a", "entity_b"):
+        for k in ("subject", "scene", "scope"):
             v = payload.get(k)
             if isinstance(v, str) and v.strip():
                 entity_names.append(v.strip())
-        return want, payload, entity_names
+        return "decision", payload, entity_names
     return None
 
 

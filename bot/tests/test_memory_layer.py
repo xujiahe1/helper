@@ -31,10 +31,7 @@ def test_extract_directive_with_entity_scope(db, settings, llm_stub):
     """LLM 抽到 entity scope 的 directive,落库 + 解析 scope_ref。"""
     from helper.memory import extract_for_raw
     from helper.storage import session
-    from helper.storage.models import EntityCandidate, Memory
-
-    with session() as s:
-        s.add(EntityCandidate(slug="哥", name="哥", description="刘佳翔"))
+    from helper.storage.models import Memory
 
     raw_id = _seed_raw("回答哥相关的问题时,不用每次都把哥的身份说一遍。")
     llm_stub.set(

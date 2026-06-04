@@ -39,8 +39,7 @@ def filter_hits(asker_domain: str, hits: list["Hit"]) -> tuple[list["Hit"], list
     """把 hits 按 asker 是否有权可见拆成 (allowed, blocked)。
 
     Hit 自身不带 acl_topic_id 字段(retrieve 三路融合时不一定存)。这里反查每条 hit
-    对应表的 acl_topic_id 列做判定。Bundle hit (path A jaccard) 用 sources='jaccard'
-    标记;为它们查 SpecCandidate / EntityCandidate。
+    对应表的 acl_topic_id 列做判定。
     """
     if not hits:
         return [], []
@@ -64,14 +63,7 @@ def _resolve_hit_topics(hits: list["Hit"]) -> dict[tuple[str, str], str]:
     from sqlalchemy import select
 
     from helper.storage import session
-    from helper.storage.models import (
-        CaseCandidate,
-        EntityCandidate,
-        FactCandidate,
-        L1Item,
-        RawInput,
-        RelationCandidate,
-    )
+    from helper.storage.models import L1Item, RawInput
 
     by_type: dict[str, list[str]] = {}
     for h in hits:
@@ -87,20 +79,6 @@ def _resolve_hit_topics(hits: list["Hit"]) -> dict[tuple[str, str], str]:
                 ).all()
                 for rid, tid in rows:
                     out[("raw", str(rid))] = tid or ""
-        for kind, model in (
-            ("entity", EntityCandidate),
-            ("fact", FactCandidate),
-            ("case", CaseCandidate),
-            ("relation", RelationCandidate),
-        ):
-            if kind not in by_type:
-                continue
-            slugs = by_type[kind]
-            rows = s.execute(
-                select(model.slug, model.acl_topic_id).where(model.slug.in_(slugs))
-            ).all()
-            for slug, tid in rows:
-                out[(kind, slug)] = tid or ""
 
         # section/decision: ref 形如 "raw_id:idx",用 (raw_id, idx) 复合键反查 l1_items.acl_topic_id
         for kind in ("section", "decision"):
