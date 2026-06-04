@@ -326,7 +326,9 @@ class L1Item(Base):
     二分 type:
       section:  {title, body, topics[], entities[]}  ← 语义独立单元,原文保留
       decision: {scene, signals[], tradeoffs[], choice, rationale,
-                 source_raw_ids?, primary_raw_id?, decision_speaker?, rationale_speaker?}
+                 source_raw_ids?, primary_raw_id?}
+
+    归属人(谁说的)统一靠 raw_inputs.author_domain 反查 — payload 里不存 speaker 字段。
 
     复合主键 (raw_id, idx) — 重跑 raw 时 sink 先 DELETE 同 raw_id 全部行再写,保证幂等。
     """
