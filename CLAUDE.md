@@ -54,5 +54,6 @@
 - **部署纪律**: 本地开发优先,服务器是部署目标不是开发环境;改 Wave 回调 URL、deploy systemd unit 等线上动作只在准备部署时做
 - **领域纪律**: 任何"为某领域优化"的设计都需要先停下来问"这个能复用到其他领域吗",不能则不做
 - **诊断先于推测**: 线上行为不符合预期, **先在外部 IO 边界 (LLM 入参出参 / Wave 出站 / DB 写入) 加 WARN 日志再触发一次**, 不要凭推测改代码 ship。诊断口 `/var/log/helper/helper.err`。
+- **DB 排查纪律**: 服务器运行时库 = `/var/lib/helper/helper.db` (**不**是 `helper.sqlite` —— 后者是 `sqlite3` 命令意外创建的空 stub,看到了立刻 `rm`)。跑裸 SQL 前先 `.tables` + `PRAGMA table_info(<表>)`,**不要凭 ORM 字段名拼物理列**(已知 `ConflictLog.target_slug` 物理列叫 `spec_slug`)。详见 `docs/runtime.md` §6.5。
 - **新 LLM task 三处同步**: 加 task 必须同时改 `bot/helper/policy/defaults/llm_routing.yaml` + `bot/var/helper/git-repo/meta/policies/llm_routing.yaml` + **服务器 `/var/lib/helper/git-repo/meta/policies/llm_routing.yaml`** (运行时实际读这份)。漏第三处 → router 抛 `Unknown task type` → 调用方静默走兜底。
 - **完整踩坑清单**: `docs/runtime.md` §6 — 加新功能前过一遍。

@@ -359,9 +359,26 @@ agent 任务进周报(`source_type='agent_run'` 的 raw 单独统计成功率 / 
 
 外部 API (Wave / KM / IAM) **不要凭印象拼 URL 或假设域名互通**。每次接新接口先在 KM 找官方锚点 + curl 实测一次。host 不可假设互通, token 不可假设共用 (Wave 与 KM 同 host 但 token 各自缓存)。
 
-### 6.5 helper.db 路径固化
+### 6.5 helper.db 真实路径 + 关键 schema 速查
 
-服务器运行时路径就是 **`/var/lib/helper/helper.db`** (历史误写过 `helper.sqlite`, 任何脚本/排查命令统一用前者)。
+服务器运行时**实际**库路径: **`/var/lib/helper/helper.db`** (14 MB+,helper:helper)。
+
+⚠️ 同目录可能存在 0 字节 `helper.sqlite` —— 这是被 `sqlite3 /var/lib/helper/helper.sqlite` 之类的命令**自动创建的空 stub**。任何排查脚本必须用 `helper.db`,不要用 `helper.sqlite`。
+
+⚠️ ORM 逻辑列名 ≠ 物理列名 —— 跑裸 SQL 之前先 `PRAGMA table_info(<表>)`。已知错配:
+
+| ORM 字段 | 实际物理列 | 表 |
+|---|---|---|
+| `ConflictLog.target_slug` | `spec_slug` | conflict_log (历史改名,SQLAlchemy `mapped_column("spec_slug")` 桥接) |
+
+排查任何"DB 里到底有什么"问题前,**先**:
+
+```bash
+ssh root@10.234.81.212 "sqlite3 /var/lib/helper/helper.db '.tables'"
+ssh root@10.234.81.212 "sqlite3 /var/lib/helper/helper.db 'PRAGMA table_info(<表名>);'"
+```
+
+不要凭代码里 ORM 字段名直接拼 SQL。
 
 ### 6.6 bot 自己回复的 raw 不能进检索池
 
