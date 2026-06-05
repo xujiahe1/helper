@@ -222,6 +222,42 @@ def _apply_supersede(memory_id: int) -> None:
                 cl.auto_reason = "memory_audit 判定该 memory 误抽,自动作废相关冲突"
 
 
+def _cleanup_dangling_memory_conflicts() -> int:
+    """扫所有 open + target_type=memory 的 conflict_log, 把 target memory 已 dead 的全部 auto_rejected。
+
+    覆盖**历史残留**: 不管 memory 是被哪条路径 supersede 的(audit / 人工裁决 / 旧 ingest 路径),
+    只要现在已 dead,引用它的 open conflict 一律作废。修早期 audit 上线前/外路径 supersede
+    的 memory 留下的僵尸 conflict —— 不修周报会一直把它们当 2-N 显示骚扰 owner。
+
+    注: _apply_supersede 内的清理只清"本次 supersede 的这条 memory 涉及的 conflict",
+    不覆盖外路径。这函数是兜底全扫。
+    """
+    now = datetime.now(timezone.utc)
+    fixed = 0
+    with session() as s:
+        rows = list(s.execute(
+            select(ConflictLog)
+            .where(ConflictLog.resolution == "open")
+            .where(ConflictLog.target_type == "memory")
+        ).scalars())
+        for cl in rows:
+            try:
+                mid = int(cl.target_slug)
+            except (ValueError, TypeError):
+                continue
+            mem = s.get(Memory, mid)
+            if mem is None or mem.superseded_at is None:
+                continue
+            cl.resolution = "auto_rejected"
+            cl.resolved_by = "memory_audit"
+            cl.resolved_at = now
+            cl.auto_reason = "target memory 已 supersede, 作废残留 conflict"
+            fixed += 1
+    if fixed:
+        log.info("memory_audit cleanup: auto_rejected %d dangling memory conflicts", fixed)
+    return fixed
+
+
 def run_audit() -> AuditReport:
     """跑一轮 audit。第一次 dry_run,后续 apply。
 
@@ -229,6 +265,9 @@ def run_audit() -> AuditReport:
     - dry_run=True:weekly 把 to_supersede 写进 inbox_digest.pending_audit
     - dry_run=False:supersede 已立即生效,weekly 只渲染 "本周自动 supersede N 条" 摘要
     """
+    # 不论 dry_run / apply, 先扫一遍历史残留 conflict — 覆盖外路径 supersede 留下的僵尸。
+    _cleanup_dangling_memory_conflicts()
+
     dry_run = _is_first_run()
     rows = _select_alive_to_audit()
     report = AuditReport(dry_run=dry_run)

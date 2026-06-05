@@ -68,6 +68,11 @@ _SECTION_ACTION_RE = re.compile(
 _SECTION_ANSWER_RE = re.compile(
     r"^\s*答\s*3-(\d+)[\s,，::]+(.+)$", re.DOTALL
 )
+# 单行宽松匹配「3-N <答案>」: 多行批量回执时按行扫,允许省「答」字。
+# 字符集容错: 空白/英文逗号/中文逗号/英文冒号/中文冒号/顿号/连字符/破折号。
+_LINE_ANSWER_LOOSE_RE = re.compile(
+    r"^\s*(?:答\s*)?3-(\d+)[\s,，::、\-—]+(\S.*?)\s*$"
+)
 # memory_audit 首跑 dry-run 确认指令
 _AUDIT_CONFIRM_RE = re.compile(r"^\s*确认\s*audit\s*$", re.IGNORECASE)
 _AUDIT_SKIP_RE = re.compile(r"^\s*跳过\s*audit\s*$", re.IGNORECASE)
@@ -328,6 +333,61 @@ def _judge_answer_coverage(
     return out
 
 
+def _handle_batch_answers(
+    items: list[tuple[int, str]], answer_raw_id: int, sender_domain: str
+) -> ReplyResult:
+    """处理一条消息里多行 3-N 批量回执。
+
+    items: [(n, answer_text), ...] — 来自 _LINE_ANSWER_LOOSE_RE 按行扫的结果。
+    每个 n 对应一个 3-N 主题组, 走 _handle_answer_group 的同样路径(单条直接 close,
+    多条让 LLM 判覆盖)。一条消息只算一次 schedule_l1(同一个 answer_raw_id)。
+    """
+    payload = _load_digest_payload(sender_domain)
+    if payload is None:
+        return ReplyResult(text="⚠️ 还没有最近的 inbox 周报记录,请先发一次「/inbox」。")
+
+    if not answer_raw_id:
+        return ReplyResult(text="⚠️ 内部异常:答复消息没有 raw_id,请稍后重试。")
+
+    parts: list[str] = [f"📝 已批量记录 {len(items)} 条答复(raw#{answer_raw_id})。"]
+    handled_groups = 0
+    closed_total = 0
+    skipped_total = 0
+    for n, answer_text in items:
+        ids = _resolve_inquiry_group(payload, n)
+        if not ids:
+            parts.append(f"\n⚠️ 3-{n} 在最近一次周报里找不到,跳过。")
+            continue
+        # 借用 _handle_answer_group 内部逻辑, 但不重复 raw 绑定 / schedule_l1
+        # 直接构造一个独立的 sub-result, 把它的关闭/跳过统计合并进 parts
+        sub = _handle_answer_group(ids, answer_text, answer_raw_id, sender_domain)
+        handled_groups += 1
+        # 抠 sub.text 头部的 "已记录答复" 那行去掉, 保留下面的关闭/跳过明细
+        sub_lines = sub.text.split("\n")
+        body_lines = [ln for ln in sub_lines if not ln.startswith("📝 已记录答复")]
+        parts.append(f"\n— 3-{n} —")
+        parts.extend(body_lines)
+        # 顺手统计 (粗略 — sub.text 里有"关闭 N 条"形态)
+        for ln in body_lines:
+            if "关闭" in ln and "条子追问" in ln:
+                m = re.search(r"关闭\s+(\d+)\s+条", ln)
+                if m:
+                    closed_total += int(m.group(1))
+            if "留 open" in ln:
+                m = re.search(r"留\s*open[^\d]*(\d+)\s*条", ln)
+                if m:
+                    skipped_total += int(m.group(1))
+
+    parts.append(
+        f"\n\n汇总: 处理 {handled_groups} 个主题组, "
+        f"共关闭 {closed_total} 条子追问, {skipped_total} 条留 open。"
+    )
+    return ReplyResult(
+        text="".join(parts),
+        after_actions=[("schedule_l1", answer_raw_id)],
+    )
+
+
 def _handle_answer_group(
     inquiry_ids: list[int], answer_text: str, answer_raw_id: int, sender_domain: str
 ) -> ReplyResult:
@@ -503,6 +563,27 @@ def try_handle(
         if not ids:
             return ReplyResult(text=f"⚠️ 3-{n} 在最近一次周报里找不到,请核对编号。")
         return _handle_answer_group(ids, answer_text, answer_raw_id, sender_domain)
+
+    # 2.5) 多行批量回执: 一条消息含 ≥ 2 行形如「3-N <答案>」(可省「答」字)
+    # 例: owner 拷贝周报里 14 个 3-N 主题组, 每行写一个答案。
+    # 单行省「答」也能命中(只 1 个匹配也走批量路径, 不影响单条)。
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    batch: list[tuple[int, str]] = []
+    for ln in lines:
+        m = _LINE_ANSWER_LOOSE_RE.match(ln)
+        if m is None:
+            continue
+        try:
+            n = int(m.group(1))
+        except (TypeError, ValueError):
+            continue
+        ans = (m.group(2) or "").strip()
+        if ans:
+            batch.append((n, ans))
+    # 至少要 2 行命中, 才认这是批量回执 — 避免普通闲聊误触发
+    # (单行 3-N 但省「答」字的极少见情况会 fallthrough 到 intent classify, 可接受)
+    if len(batch) >= 2 and len(batch) >= max(1, len(lines) // 2):
+        return _handle_batch_answers(batch, answer_raw_id, sender_domain)
 
     # 3) 老格式: 批准/驳回/跳过 #N(直接当 SpecCandidate.id)
     m = _LEGACY_ACTION_RE.match(text)
