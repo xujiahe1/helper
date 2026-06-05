@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
 from helper.storage.models import ChatContextCutoff, RawInput
+
+_WHITESPACE_RE = re.compile(r"\s+")
 
 
 def _scope_key(chat_id: str, fallback_author: str) -> str:
@@ -185,7 +188,7 @@ def format_context_block(
     exclude_raw_id: int | None = None,
     limit: int = CONTEXT_DEFAULT_LIMIT,
     since_minutes: int = CONTEXT_DEFAULT_MINUTES,
-    max_chars_per_line: int = 200,
+    max_chars_per_line: int = 800,
     asker_domain: str = "",
 ) -> str:
     """拼一段「历史对话」标注块,供 intent classify / ask 共用。
@@ -235,7 +238,10 @@ def format_context_block(
             who = "bot"
         else:
             who = f"用户({r.author_domain or '?'})"
-        body = (r.content_text or "").strip().replace("\n", " ")
+        # 把 \n / \t / 重复空格全压成单空格 — 历史块按行排列, 单条
+        # 仍保留所有 token, 不靠换行做分段。多行原文(如 owner 批量答复
+        # "3-1 ... \n 3-2 ...")才不会被换行切碎丢内容。
+        body = _WHITESPACE_RE.sub(" ", (r.content_text or "")).strip()
         if len(body) > max_chars_per_line:
             body = body[:max_chars_per_line] + "…"
         lines.append(f"[{ts}] {who}: {body}")

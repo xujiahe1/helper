@@ -73,6 +73,18 @@ _SECTION_ANSWER_RE = re.compile(
 _LINE_ANSWER_LOOSE_RE = re.compile(
     r"^\s*(?:答\s*)?3-(\d+)[\s,，::、\-—]+(\S.*?)\s*$"
 )
+# 「反向追问」短语 — 用户在 3-N 行写的不是答案, 而是想让 bot 反过来给解释。
+# batch 路径里命中这条的行**不**进 record_answer, 留 open 让下次周报继续出。
+# 仅匹配整行 = 反问意图(末尾允许标点/空白), 避免把"展开说说方案 X 的细节"这种
+# 包了反问短语的真答案误吃。 大小写无关。
+_BACKQUERY_PATTERNS = (
+    "展开说说", "详细说说", "再说说", "说详细点", "说详细些",
+    "详细解释", "解释下", "解释一下", "讲讲", "具体讲讲", "讲一下",
+    "说说看", "说说", "细说", "展开讲讲", "展开",
+)
+_BACKQUERY_RE = re.compile(
+    r"^\s*(?:" + "|".join(re.escape(p) for p in _BACKQUERY_PATTERNS) + r")\s*[。.!!??~ ]*\s*$"
+)
 # memory_audit 首跑 dry-run 确认指令
 _AUDIT_CONFIRM_RE = re.compile(r"^\s*确认\s*audit\s*$", re.IGNORECASE)
 _AUDIT_SKIP_RE = re.compile(r"^\s*跳过\s*audit\s*$", re.IGNORECASE)
@@ -334,22 +346,30 @@ def _judge_answer_coverage(
 
 
 def _handle_batch_answers(
-    items: list[tuple[int, str]], answer_raw_id: int, sender_domain: str
+    items: list[tuple[int, str]],
+    answer_raw_id: int,
+    sender_domain: str,
+    *,
+    backqueries: list[int] | None = None,
 ) -> ReplyResult:
     """处理一条消息里多行 3-N 批量回执。
 
-    items: [(n, answer_text), ...] — 来自 _LINE_ANSWER_LOOSE_RE 按行扫的结果。
-    每个 n 对应一个 3-N 主题组, 走 _handle_answer_group 的同样路径(单条直接 close,
-    多条让 LLM 判覆盖)。一条消息只算一次 schedule_l1(同一个 answer_raw_id)。
+    items: [(n, answer_text), ...] — 真答复行, 走 _handle_answer_group(LLM 判覆盖,
+        覆盖到的子追问 record_answer + close)。 一条消息只算一次 schedule_l1。
+    backqueries: [n, ...] — 反向追问行(答复文本 = "展开说说"/"讲讲"等), 不动这些
+        主题组的子追问, 留 open 下次周报继续。
     """
+    backqueries = backqueries or []
     payload = _load_digest_payload(sender_domain)
     if payload is None:
         return ReplyResult(text="⚠️ 还没有最近的 inbox 周报记录,请先发一次「/inbox」。")
 
-    if not answer_raw_id:
+    if not answer_raw_id and items:
+        # 真答复需要 raw_id 绑定; 纯反问无答可记, 不强求 raw_id
         return ReplyResult(text="⚠️ 内部异常:答复消息没有 raw_id,请稍后重试。")
 
-    parts: list[str] = [f"📝 已批量记录 {len(items)} 条答复(raw#{answer_raw_id})。"]
+    head = f"📝 已批量记录 {len(items)} 条答复(raw#{answer_raw_id})。" if items else "📝 收到批量回复。"
+    parts: list[str] = [head]
     handled_groups = 0
     closed_total = 0
     skipped_total = 0
@@ -378,14 +398,23 @@ def _handle_batch_answers(
                 if m:
                     skipped_total += int(m.group(1))
 
+    if backqueries:
+        parts.append(
+            f"\n\n🔁 识别到 {len(backqueries)} 条反向追问(展开说说/讲讲等), "
+            f"未当作答复, 这些主题留 open 下次周报继续: "
+            + ", ".join(f"3-{n}" for n in backqueries)
+        )
+
     parts.append(
         f"\n\n汇总: 处理 {handled_groups} 个主题组, "
-        f"共关闭 {closed_total} 条子追问, {skipped_total} 条留 open。"
+        f"共关闭 {closed_total} 条子追问, {skipped_total} 条留 open"
+        + (f", {len(backqueries)} 条反问留 open" if backqueries else "")
+        + "。"
     )
-    return ReplyResult(
-        text="".join(parts),
-        after_actions=[("schedule_l1", answer_raw_id)],
-    )
+    actions: list[tuple[str, int]] = []
+    if items and answer_raw_id:
+        actions.append(("schedule_l1", answer_raw_id))
+    return ReplyResult(text="".join(parts), after_actions=actions)
 
 
 def _handle_answer_group(
@@ -567,8 +596,11 @@ def try_handle(
     # 2.5) 多行批量回执: 一条消息含 ≥ 2 行形如「3-N <答案>」(可省「答」字)
     # 例: owner 拷贝周报里 14 个 3-N 主题组, 每行写一个答案。
     # 单行省「答」也能命中(只 1 个匹配也走批量路径, 不影响单条)。
+    # 反向追问行(answer 文本 = "展开说说"/"讲讲"等)单独归到 backqueries,
+    # 不进 record_answer, 留 open 下次周报继续出。
     lines = [ln for ln in text.splitlines() if ln.strip()]
     batch: list[tuple[int, str]] = []
+    backqueries: list[int] = []
     for ln in lines:
         m = _LINE_ANSWER_LOOSE_RE.match(ln)
         if m is None:
@@ -578,12 +610,16 @@ def try_handle(
         except (TypeError, ValueError):
             continue
         ans = (m.group(2) or "").strip()
-        if ans:
+        if not ans:
+            continue
+        if _BACKQUERY_RE.match(ans):
+            backqueries.append(n)
+        else:
             batch.append((n, ans))
-    # 至少要 2 行命中, 才认这是批量回执 — 避免普通闲聊误触发
-    # (单行 3-N 但省「答」字的极少见情况会 fallthrough 到 intent classify, 可接受)
-    if len(batch) >= 2 and len(batch) >= max(1, len(lines) // 2):
-        return _handle_batch_answers(batch, answer_raw_id, sender_domain)
+    matched = len(batch) + len(backqueries)
+    # 至少要 2 行命中(含反问行), 才认这是批量回执 — 避免普通闲聊误触发
+    if matched >= 2 and matched >= max(1, len(lines) // 2):
+        return _handle_batch_answers(batch, answer_raw_id, sender_domain, backqueries=backqueries)
 
     # 3) 老格式: 批准/驳回/跳过 #N(直接当 SpecCandidate.id)
     m = _LEGACY_ACTION_RE.match(text)
