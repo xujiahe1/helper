@@ -378,6 +378,11 @@ class Memory(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 取代它的 memory id
+    # memory_audit 任务最近一次审过这条 directive 的时间。null = 从没审过(首次审优先)。
+    # 7 天节流: audit.run_if_needed() 只重审 last_audited_at 超过 7 天或为空的 alive memory。
+    # superseded_by=0 表示被 audit 自动 supersede(非 raw 来源,人工裁决/conflict resolve 的
+    # superseded_by 永远是真实 raw_id,不会为 0)。
+    last_audited_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class PendingRouting(Base):

@@ -24,6 +24,23 @@ tasks:
   conflict_judge:  { model: claude-sonnet-4-6, provider: anthropic }
   schedule_parse:  { model: claude-sonnet-4-6, provider: anthropic }
   memory_extract:  { model: claude-sonnet-4-6, provider: anthropic }
+  # memory_audit: 周报/inbox 触发前的存量 memory 复审 — 判断每条 alive directive
+  # 究竟是真行为指令还是误抽的知识/事实(如"X 是 Y" 身份纠正、"X 是 Z,记住"
+  # 评价陈述、"X 不能 Y,因为 Z" 决策依据)。误抽的自动 supersede 掉,避免周报
+  # 一直拿错抽数据骚扰 owner。
+  memory_audit:    { model: claude-sonnet-4-6, provider: anthropic }
+  # inquiry_dedup: 新 inquiry 落库前查询同 scope/spec 的开放追问,LLM 判新问题
+  # 相对已问是子集/换皮/新角度。子集和换皮直接丢,只新角度才入库 — 治本,
+  # 防止跨 raw 同主题追问越堆越多。
+  inquiry_dedup:   { model: claude-sonnet-4-6, provider: anthropic }
+  # inquiry_aggregate: 周报渲染时,同主题(scope_ref / 关联 raw / 关联 spec)的
+  # 多条未答追问聚合成一条总问题,owner 只需回答总问题即可。原始子追问列在
+  # 展开层供需要时查看。
+  inquiry_aggregate: { model: claude-sonnet-4-6, provider: anthropic }
+  # inquiry_answer_match: owner 回 「答 3-N <答案>」时,把答案 + 该组所有子追问
+  # 送 LLM 判断答案语义覆盖了哪些子问题,覆盖的全部一起 close。剩下未覆盖的
+  # 留 open,下次周报继续出现。
+  inquiry_answer_match: { model: claude-sonnet-4-6, provider: anthropic }
   # M8 ACL 内容打标: 入库时给 raw 判 topic, ask 入口给 question 判 topic;
   # 都是结构化短输出(返 topic_id 或空), sonnet 完全够。
   acl_tag:         { model: claude-sonnet-4-6, provider: anthropic, max_tokens: 64 }

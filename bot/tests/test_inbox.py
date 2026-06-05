@@ -31,24 +31,26 @@ def _make_spec_candidate(slug: str = "spec-a", title: str = "T") -> int:
         return sc.id
 
 
-def test_build_digest_collects_pending_with_ids(db, settings, make_raw):
+def test_build_digest_collects_pending_with_ids(db, settings, llm_stub, make_raw):
+    """build_digest 现在会跑 memory_audit 前置 + inquiry 聚合,需要 stub 这些 LLM。"""
     from helper.inbox import build_digest
 
+    # 没 alive memory 时 memory_audit 不会调 LLM,但 inquiry_aggregate 会(单条会跳过 LLM)
     rid = make_raw("p")
     iq_id = _make_inquiry(rid, "边界?")
     sc_id = _make_spec_candidate("foo")
 
     d = build_digest()
-    assert d.unanswered_inquiries
-    assert d.unanswered_inquiries[0][0] == iq_id
-    assert d.unanswered_inquiries[0][1] == rid
-    assert "边界" in d.unanswered_inquiries[0][2]
+    # 单条 inquiry → 1 个独立追问组,不调 LLM 聚合(_llm_group 走 1 条快速路径)
+    assert d.inquiry_groups
+    assert d.inquiry_groups[0].member_ids == [iq_id]
+    assert "边界" in d.inquiry_groups[0].master_question
     assert d.pending_specs
     assert d.pending_specs[0][0] == sc_id
     assert d.pending_specs[0][1] == "foo"
 
 
-def test_render_card_shows_reply_hint(db, settings, make_raw):
+def test_render_card_shows_reply_hint(db, settings, llm_stub, make_raw):
     from helper.inbox import build_digest, render_card
 
     rid = make_raw("x")
@@ -58,7 +60,7 @@ def test_render_card_shows_reply_hint(db, settings, make_raw):
     assert "答 3-N" in body
 
 
-def test_render_card_empty_inbox(db, settings):
+def test_render_card_empty_inbox(db, settings, llm_stub):
     from helper.inbox import build_digest, render_card
 
     body = render_card(build_digest())
@@ -201,7 +203,7 @@ def test_try_handle_answer_not_double_bind(db, settings, make_raw, monkeypatch):
         assert iq.answer_raw_id == first_rid  # 第一次的 raw,没被覆盖
 
 
-def test_send_to_calls_wave(db, settings, wave_send_log):
+def test_send_to_calls_wave(db, settings, llm_stub, wave_send_log):
     from helper.inbox import send_to
 
     ok = send_to("u_owner", receiver_id_type="user_id")

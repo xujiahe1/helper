@@ -93,6 +93,9 @@ def llm_stub(monkeypatch: pytest.MonkeyPatch):
         "helper.im.intent.run",
         "helper.eval.replay.run",
         "helper.memory.extract.run",
+        "helper.memory.audit.run",
+        "helper.inbox.inquiry_group.run",
+        "helper.inbox.reply.run",
         "helper.acl.tagger.run",
     ]
     for site in sites:

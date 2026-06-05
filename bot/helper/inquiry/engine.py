@@ -26,6 +26,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,94 @@ _DEFAULT_FILE = "inquiry_strategies.yaml"
 
 _MAX_INQUIRIES_PER_RAW = 3
 _MAX_CONTEXT_RAWS = 10  # source_raw_ids 引用的上下文最多注入这么多条,避免 prompt 爆炸
+# 跨 raw 去重: 查最近 N 条未答 inquiry,送 LLM 判新问题是否子集/换皮。
+# 60 天窗口 + 最多 50 条 — 防 prompt 爆炸,跨度更长的历史追问已老到 owner 也不会答。
+_DEDUP_WINDOW_DAYS = 60
+_DEDUP_MAX_REFS = 50
+
+
+_DEDUP_SYSTEM_PROMPT = """你是追问去重 judge。
+
+# 背景
+helper 会从专家发的每条 raw 里抽 0..N 条追问问题(问边界、反例、不适用条件)。
+不同 raw 可能涉及同一个规约/同一个实体,LLM 自然会反复问相似问题 — 比如
+「解除适用什么 scope」、「例外情况是什么」、「是否永久生效」 这类问题在
+鳕鱼老师授权、哥的话题授权 各自的 raw 上都会被独立问一遍。
+
+你的任务: 给你**新追问**和**已有未答追问列表**,判断新追问是
+- "subset"(子集): 新追问问的内容已经被某条已有追问完全覆盖
+- "paraphrase"(换皮): 新追问只是已有追问的同义改写,语义无新增
+- "novel"(新角度): 新追问触及了已有都没问的角度
+
+只有 "novel" 才有意义入库。subset / paraphrase 应丢弃 — 等 owner 答了那条
+已有追问,新追问关心的边界自然会被回答。
+
+# 判断标准
+- 同一规约/同一实体下,问"边界 / 例外 / scope / 永久性"这几类问题,只要
+  其中一个被涵盖就算 subset。不要因为措辞不同就当 novel
+- 真 novel 是: 已有追问里完全没人问过的角度(如新追问问"对新加入成员是否生效",
+  已有追问只问"对当前成员的边界" — 这是 novel)
+- 没有任何已有追问可比对(列表为空)→ 直接 novel
+
+# 输出 JSON
+{
+  "verdict": "subset" | "paraphrase" | "novel",
+  "match_id": <已有追问的 id, novel 时填 0>,
+  "reason": "一句话理由"
+}
+
+只输出 JSON,不要 markdown。"""
+
+
+def _existing_open_inquiries(s, exclude_raw_id: int) -> list[InquiryLog]:
+    """拉最近 60 天内、当前 raw 之外、未答的 inquiry,供 dedup judge 使用。
+
+    粗筛: 不靠 scope/spec 列(InquiryLog 没有这些列), 直接全表 60 天窗口。
+    放心扔给 LLM — 50 条上限已经卡死 prompt 爆炸。
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_DEDUP_WINDOW_DAYS)
+    rows = list(s.execute(
+        select(InquiryLog)
+        .where(InquiryLog.created_at >= cutoff)
+        .where(InquiryLog.answer_raw_id.is_(None))
+        .where(InquiryLog.raw_id != exclude_raw_id)
+        .order_by(InquiryLog.created_at.desc())
+        .limit(_DEDUP_MAX_REFS)
+    ).scalars())
+    for r in rows:
+        s.expunge(r)
+    return rows
+
+
+def _judge_dedup(new_question: str, existing: list[InquiryLog]) -> dict | None:
+    if not existing:
+        return {"verdict": "novel", "match_id": 0, "reason": "no existing"}
+    refs = "\n".join(
+        f"[id={iq.id}] {(iq.question or '').strip()}"
+        for iq in existing
+    )
+    user_msg = (
+        f"## 新追问\n{new_question.strip()}\n\n"
+        f"## 已有未答追问列表\n{refs}\n\n"
+        "## 输出\nJSON。"
+    )
+    try:
+        reply = run("inquiry_dedup", system=_DEDUP_SYSTEM_PROMPT, user=user_msg, temperature=0.0)
+    except Exception as e:  # noqa: BLE001
+        log.warning("inquiry_dedup LLM failed q=%r: %s", new_question[:60], e)
+        return None
+    text = (reply or "").strip()
+    m = _FENCE_RE.search(text)
+    if m:
+        text = m.group(1)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        return json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
 
 
 @dataclass
@@ -318,7 +407,7 @@ def generate_inquiries(raw_id: int) -> list[InquiryHit]:
         strategy_priority=priority_map,
     )
 
-    # 幂等:清未答的旧 inquiry,再插新的
+    # 幂等:清未答的旧 inquiry,再做跨 raw dedup,最后插新的
     with session() as s:
         s.execute(
             delete(InquiryLog).where(
@@ -329,13 +418,32 @@ def generate_inquiries(raw_id: int) -> list[InquiryHit]:
                 )
             )
         )
+        # dedup: 拉一次已有未答列表,逐条 judge — 粗暴但可靠;
+        # 同 raw 内先抽出来的 hits 不会自己撞自己(每次 judge 用的是落库前的快照)。
+        existing = _existing_open_inquiries(s, exclude_raw_id=raw_id)
+        kept: list[InquiryHit] = []
         for h in hits:
+            verdict = _judge_dedup(h.question, existing)
+            if verdict is None:
+                # judge 失败 → 保守保留(不丢有用追问), 后续聚合层兜底
+                kept.append(h)
+                continue
+            v = str(verdict.get("verdict", "novel")).lower().strip()
+            if v in ("subset", "paraphrase"):
+                log.info(
+                    "inquiry dedup: drop new q=%r (matched #%s, %s) raw#%d",
+                    h.question[:60], verdict.get("match_id"), v, raw_id,
+                )
+                continue
+            kept.append(h)
+        for h in kept:
             s.add(InquiryLog(
                 raw_id=h.raw_id,
                 strategy_id=h.strategy_id,
                 question=h.question,
             ))
         s.commit()
+    hits = kept
 
     log.info("inquiry: raw#%d → %d question(s) [%s]",
              raw_id, len(hits), ", ".join(h.strategy_id for h in hits))

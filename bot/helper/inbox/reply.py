@@ -7,20 +7,25 @@
 
   1) 待沉淀规约 (1-N)
      批准 1-N / 驳回 1-N / 跳过 1-N
-       - 批准: SpecCandidate.id=N → promote_spec(slug)
-       - 驳回: review_status='rejected'
-       - 跳过: 仅日志,不改状态(下周继续出现)
 
   2) 待修正冲突 (2-N)
-     采纳 2-N: ConflictLog.resolution='superseded' (新覆盖旧,旧候选打 superseded_at)
-     保留 2-N: ConflictLog.resolution='rejected'   (新被否决,既有不动)
-     都留 2-N: ConflictLog.resolution='coexist'    (并存,不动)
+     采纳 2-N: ConflictLog.resolution='superseded'
+     保留 2-N: ConflictLog.resolution='rejected'
+     都留 2-N: ConflictLog.resolution='coexist'
 
-  3) 待答追问 (3-N)
-     答 3-N <文本>: InquiryLog.id=N → record_answer + 触发 L1 抽答复
+  3) 待答追问主题组 (3-N)
+     答 3-N <文本>:
+       - 3-N 现在对应一个**追问主题组**(可能含 1..N 条子追问)
+       - LLM 判 owner 答案语义覆盖了哪些子追问 → 全部一起 close
+       - 没覆盖的子追问留 open,下次周报继续出现
+
+  4) memory_audit 首次确认
+     确认 audit / 跳过 audit
+       - 确认: pending_audit 列表全部真 supersede
+       - 跳过: 仅清空 pending_audit,本次不动 memory(后续每周自动跑 = 不再 dry-run)
 
   兼容老格式:
-  - 批准/驳回/跳过 #N: 仍按 SpecCandidate.id 直接处理(给跨周老候选用)
+  - 批准/驳回/跳过 #N: 仍按 SpecCandidate.id 直接处理
   - 答 #N <文本> / #N <文本>(裸): 按 InquiryLog.id 直接处理
 
 返回值: 给用户的中文回复文案 + 副作用列表(after_actions)。
@@ -37,6 +42,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import select
 
 from helper.config import get_settings
+from helper.llm import run
 from helper.storage import session
 from helper.storage.models import (
     ConflictLog,
@@ -60,8 +66,11 @@ _SECTION_ACTION_RE = re.compile(
     re.IGNORECASE,
 )
 _SECTION_ANSWER_RE = re.compile(
-    r"^\s*答\s*3-(\d+)[\s,，:]+(.+)$", re.DOTALL
+    r"^\s*答\s*3-(\d+)[\s,，::]+(.+)$", re.DOTALL
 )
+# memory_audit 首跑 dry-run 确认指令
+_AUDIT_CONFIRM_RE = re.compile(r"^\s*确认\s*audit\s*$", re.IGNORECASE)
+_AUDIT_SKIP_RE = re.compile(r"^\s*跳过\s*audit\s*$", re.IGNORECASE)
 # 兼容老格式
 _LEGACY_ACTION_RE = re.compile(r"^\s*(批准|驳回|跳过|approve|reject|skip)\s*#?(\d+)\s*$", re.IGNORECASE)
 _LEGACY_ANSWER_EXPLICIT_RE = re.compile(r"^\s*答\s*#?(\d+)[\s,，:]+(.+)$", re.DOTALL)
@@ -115,7 +124,8 @@ def _load_digest_payload(owner: str) -> dict | None:
 
 
 def _resolve_section_id(payload: dict, section: int, n: int) -> int | None:
-    key = {1: "specs", 2: "conflicts", 3: "inquiries"}.get(section)
+    """1-N / 2-N 取单个 id (specs / conflicts);3-N 用 _resolve_inquiry_group 取 id 列表。"""
+    key = {1: "specs", 2: "conflicts"}.get(section)
     if key is None:
         return None
     arr = payload.get(key) or []
@@ -123,6 +133,31 @@ def _resolve_section_id(payload: dict, section: int, n: int) -> int | None:
         return None
     val = arr[n - 1]
     return int(val) if isinstance(val, (int, str)) and str(val).isdigit() else None
+
+
+def _resolve_inquiry_group(payload: dict, n: int) -> list[int] | None:
+    """3-N → 该追问主题组的子追问 id 列表(≥1 条)。
+
+    新格式:payload['inquiries'] = [[id1, id2, ...], [id3], ...]
+    老格式向后兼容:payload['inquiries'] = [id1, id2, ...](每条都当独立组)
+    """
+    arr = payload.get("inquiries") or []
+    if not isinstance(arr, list) or n < 1 or n > len(arr):
+        return None
+    val = arr[n - 1]
+    if isinstance(val, list):
+        out: list[int] = []
+        for x in val:
+            if isinstance(x, int):
+                out.append(x)
+            elif isinstance(x, str) and x.isdigit():
+                out.append(int(x))
+        return out or None
+    if isinstance(val, int):
+        return [val]
+    if isinstance(val, str) and val.isdigit():
+        return [int(val)]
+    return None
 
 
 # ---------- spec 候选 ----------
@@ -206,6 +241,7 @@ def _handle_conflict_action(action: str, log_id: int, sender_domain: str) -> Rep
 
 
 def _handle_answer(inquiry_id: int, answer_raw_id: int, sender_domain: str) -> ReplyResult:
+    """老格式 / 老调用方:单条 inquiry 直接记录答复。"""
     from helper.inquiry import record_answer
 
     with session() as s:
@@ -221,6 +257,182 @@ def _handle_answer(inquiry_id: int, answer_raw_id: int, sender_domain: str) -> R
     return ReplyResult(
         text=f"📝 已记录答复(raw#{answer_raw_id})。\n问: {question_preview}",
         after_actions=[("schedule_l1", answer_raw_id)],
+    )
+
+
+_ANSWER_MATCH_SYSTEM_PROMPT = """你判断答复语义覆盖了哪些子问题。
+
+输入:owner 的答案文本 + 一组未答子追问(各带 id)。
+对每条子追问判断:
+- 答案是否回答了它(完整回答 / 部分回答都算 "covered=true")
+- 完全没涉及到的子问题 covered=false
+
+输出 JSON:
+{
+  "matches": [
+    {"id": <inquiry_id>, "covered": true|false, "reason": "<一句话>"}
+  ]
+}
+
+只输出 JSON,不要 markdown。所有输入 id 都要在 matches 里出现一次。"""
+
+
+def _judge_answer_coverage(
+    answer: str, inquiries: list[InquiryLog]
+) -> dict[int, bool] | None:
+    """LLM 判答案覆盖了哪些子追问。失败返 None,调用方 fallback 全部 close。"""
+    if not inquiries:
+        return {}
+    refs = "\n".join(
+        f"[id={iq.id}] {(iq.question or '').strip()}"
+        for iq in inquiries
+    )
+    user_msg = (
+        f"## owner 答案\n{answer.strip()}\n\n"
+        f"## 子追问列表\n{refs}\n\n## 输出\nJSON。"
+    )
+    try:
+        reply = run(
+            "inquiry_answer_match",
+            system=_ANSWER_MATCH_SYSTEM_PROMPT,
+            user=user_msg,
+            temperature=0.0,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("inquiry_answer_match LLM failed: %s", e)
+        return None
+    text = (reply or "").strip()
+    fence = re.search(r"```(?:json)?\s*(.+?)\s*```", text, re.DOTALL)
+    if fence:
+        text = fence.group(1)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    matches = data.get("matches") if isinstance(data, dict) else None
+    if not isinstance(matches, list):
+        return None
+    out: dict[int, bool] = {}
+    for m in matches:
+        if not isinstance(m, dict):
+            continue
+        try:
+            iq_id = int(m.get("id"))
+        except (TypeError, ValueError):
+            continue
+        out[iq_id] = bool(m.get("covered"))
+    return out
+
+
+def _handle_answer_group(
+    inquiry_ids: list[int], answer_text: str, answer_raw_id: int, sender_domain: str
+) -> ReplyResult:
+    """3-N 主题组答复 — owner 一次回,LLM 判覆盖了哪些子追问,全部一起 close。
+
+    inquiry_ids 是该 3-N 主题下所有子追问 id(可能 1 条 = 独立追问)。
+    """
+    from helper.inquiry import record_answer
+
+    if not inquiry_ids:
+        return ReplyResult(text="⚠️ 找不到对应子追问。")
+
+    # 拉所有子追问 (跳过已答的)
+    with session() as s:
+        rows = list(s.execute(
+            select(InquiryLog).where(InquiryLog.id.in_(inquiry_ids))
+        ).scalars())
+        for r in rows:
+            s.expunge(r)
+    open_rows = [iq for iq in rows if iq.answer_raw_id is None]
+    already_answered = [iq for iq in rows if iq.answer_raw_id is not None]
+
+    if not open_rows:
+        return ReplyResult(text="该主题下所有子追问之前已答过,不重复绑定。")
+
+    # 单条直接全 close (不调 LLM 省成本); 多条走 LLM 判覆盖
+    if len(open_rows) == 1:
+        coverage = {open_rows[0].id: True}
+    else:
+        coverage = _judge_answer_coverage(answer_text, open_rows)
+        if coverage is None:
+            # LLM 失败 fallback: 全部当 covered (owner 给的答案是给主题组用的, 全 close 是合理默认)
+            log.warning("answer coverage LLM failed; fallback close all in group")
+            coverage = {iq.id: True for iq in open_rows}
+
+    closed: list[InquiryLog] = []
+    skipped: list[InquiryLog] = []
+    for iq in open_rows:
+        if coverage.get(iq.id, False):
+            record_answer(iq.id, answer_raw_id)
+            closed.append(iq)
+        else:
+            skipped.append(iq)
+
+    log.info(
+        "inquiry group answer: closed=%d skipped=%d (raw#%d, %s)",
+        len(closed), len(skipped), answer_raw_id, sender_domain,
+    )
+
+    parts = [f"📝 已记录答复(raw#{answer_raw_id})。"]
+    if closed:
+        parts.append(f"\n✓ 关闭 {len(closed)} 条子追问:")
+        for iq in closed[:5]:
+            parts.append(f"  · {(iq.question or '')[:60].replace(chr(10), ' ')}")
+        if len(closed) > 5:
+            parts.append(f"  ... 另 {len(closed) - 5} 条")
+    if skipped:
+        parts.append(f"\n↻ 留 open(下次周报继续) {len(skipped)} 条:")
+        for iq in skipped[:3]:
+            parts.append(f"  · {(iq.question or '')[:60].replace(chr(10), ' ')}")
+    if already_answered:
+        parts.append(f"\n(另有 {len(already_answered)} 条本组之前已答, 跳过)")
+
+    return ReplyResult(
+        text="\n".join(parts),
+        after_actions=[("schedule_l1", answer_raw_id)],
+    )
+
+
+# ---------- memory_audit 首跑确认 ----------
+
+
+def _handle_audit_action(action: str, sender_domain: str) -> ReplyResult:
+    """action ∈ {'confirm', 'skip'}。"""
+    payload = _load_digest_payload(sender_domain)
+    if payload is None:
+        return ReplyResult(text="⚠️ 还没有最近的 inbox 周报记录,请先发一次「/inbox」。")
+    pending = payload.get("pending_audit") or []
+    if not isinstance(pending, list) or not pending:
+        return ReplyResult(text="本次周报没有 audit 待确认项。")
+
+    if action == "skip":
+        # 清掉 pending_audit 但不动 memory; 下次周报重跑 audit 仍是 dry-run
+        # (因为 _is_first_run 看的是 Memory.superseded_by=0 是否存在, 而不是 pending_audit)
+        payload.pop("pending_audit", None)
+        with session() as s:
+            row = s.get(InboxDigest, sender_domain)
+            if row is not None:
+                row.items_json = json.dumps(payload, ensure_ascii=False)
+        return ReplyResult(
+            text=f"⏭ 已跳过本次 audit({len(pending)} 条 directive 保留原状)。"
+                 f"\n下次周报会重新预审 — 若仍想保持自动模式,回「确认 audit」一次性处理。"
+        )
+
+    # confirm
+    from helper.memory import apply_pending
+    n = apply_pending(pending)
+    payload.pop("pending_audit", None)
+    with session() as s:
+        row = s.get(InboxDigest, sender_domain)
+        if row is not None:
+            row.items_json = json.dumps(payload, ensure_ascii=False)
+    return ReplyResult(
+        text=f"✅ 已 supersede {n} 条疑似误抽 directive。\n"
+             f"后续每周自动跑 audit,不再询问 — 若误判可在 git/sqlite 里手动恢复。"
     )
 
 
@@ -245,6 +457,12 @@ def try_handle(
     if not _is_owner(sender_domain):
         return None
     text = text or ""
+
+    # 0) memory_audit 首跑确认
+    if _AUDIT_CONFIRM_RE.match(text):
+        return _handle_audit_action("confirm", sender_domain)
+    if _AUDIT_SKIP_RE.match(text):
+        return _handle_audit_action("skip", sender_domain)
 
     # 1) 周报式: 批准/驳回/跳过/采纳/保留/都留 1-N | 2-N | 3-N
     m = _SECTION_ACTION_RE.match(text)
@@ -271,19 +489,20 @@ def try_handle(
             # 「答」走 _SECTION_ANSWER_RE,这里不会到;到了说明误用了批准/驳回 + 3-N
             return ReplyResult(text="⚠️ 3-N(追问)请用「答 3-N 你的答案」。")
 
-    # 2) 周报式: 答 3-N <文本>
+    # 2) 周报式: 答 3-N <文本> — 走主题组路径,LLM 判覆盖 → 一答 close 多条
     m = _SECTION_ANSWER_RE.match(text)
     if m is not None:
         n = int(m.group(1))
+        answer_text = (m.group(2) or "").strip()
         if not answer_raw_id:
             return ReplyResult(text="⚠️ 内部异常:答复消息没有 raw_id,请稍后重试。")
         payload = _load_digest_payload(sender_domain)
         if payload is None:
             return ReplyResult(text="⚠️ 还没有最近的 inbox 周报记录,请先发一次「/inbox」。")
-        target_id = _resolve_section_id(payload, 3, n)
-        if target_id is None:
+        ids = _resolve_inquiry_group(payload, n)
+        if not ids:
             return ReplyResult(text=f"⚠️ 3-{n} 在最近一次周报里找不到,请核对编号。")
-        return _handle_answer(target_id, answer_raw_id, sender_domain)
+        return _handle_answer_group(ids, answer_text, answer_raw_id, sender_domain)
 
     # 3) 老格式: 批准/驳回/跳过 #N(直接当 SpecCandidate.id)
     m = _LEGACY_ACTION_RE.match(text)

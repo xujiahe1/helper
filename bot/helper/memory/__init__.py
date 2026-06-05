@@ -7,12 +7,22 @@
 详见 docs/roadmap.md Month 5。
 """
 
+from helper.memory.audit import (
+    AuditFinding,
+    AuditReport,
+    apply_pending,
+    run_audit,
+)
 from helper.memory.extract import extract_for_raw, schedule_memory_extract
 from helper.memory.lookup import directives_for_ask, resolve_route_app_id
 
 __all__ = [
+    "AuditFinding",
+    "AuditReport",
+    "apply_pending",
     "directives_for_ask",
     "extract_for_raw",
     "resolve_route_app_id",
+    "run_audit",
     "schedule_memory_extract",
 ]
