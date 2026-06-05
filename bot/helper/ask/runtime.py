@@ -149,11 +149,14 @@ def _parse_route(text: str) -> str | None:
     return raw or None
 
 
-def _format_quoted_message(parent_message_id: str) -> str:
+def _format_quoted_message(parent_message_id: str, *, asker_domain: str = "") -> str:
     """按 wave_msg_id 反查被引用消息的原文, 拼成单独一段。抽不到返空串。
 
     引用对象可能是用户更早的消息, 也可能是 bot 自己之前的回复(im_wave_bot:* 来源)。
     都按时间 + 作者 + 正文一行格式化, 单条上限 800 字, 防爆 prompt。
+
+    asker_domain 非空时按 ACL 过滤: 非白名单 asker quote 了带 acl_topic_id 标的
+    raw → 整段不注入(像没引用过)。防群历史已过滤但 quote 仍把敏感原文塞进 prompt。
     """
     if not parent_message_id:
         return ""
@@ -161,6 +164,18 @@ def _format_quoted_message(parent_message_id: str) -> str:
         row = raw_store.get_by_wave_msg_id(s, parent_message_id)
         if row is None:
             return ""
+        if asker_domain:
+            try:
+                from helper.acl import is_allowed
+                if not is_allowed(asker_domain, getattr(row, "acl_topic_id", "") or ""):
+                    log.info(
+                        "acl blocked quoted msg asker=%s topic=%s",
+                        asker_domain, getattr(row, "acl_topic_id", "") or "",
+                    )
+                    return ""
+            except Exception:  # noqa: BLE001
+                log.exception("acl quoted-msg check failed; default to not inject")
+                return ""
         ts = row.created_at.strftime("%m-%d %H:%M") if row.created_at else "?"
         if (row.source_type or "").startswith("im_wave_bot"):
             who = "bot"
@@ -220,11 +235,19 @@ def ask(
         asker_domain=asker_domain,
     )
 
-    # ACL 入口短路: 问题 + 历史命中受控 topic 且 asker 非白名单 → 直接拒, 不调主路径 LLM。
-    # 防"新内容还没 ingest 时仍泄"或"问题敏感但检索没召回"两种漏点。
+    # quote 段要在 deny 检查前算: 让入口闸能基于 quote 内容判定话题
+    # (题面不敏感但 quote 指向敏感原文的场景)。 _format_quoted_message
+    # 自身已按 asker_domain 过滤 — 非白名单 quote 了敏感 raw 直接返空。
+    quoted = _format_quoted_message(parent_message_id, asker_domain=asker_domain)
+
+    # ACL 入口短路: 问题 + 历史 + quote 命中受控 topic 且 asker 非白名单 → 直接拒,
+    # 不调主路径 LLM。防"新内容还没 ingest 时仍泄"或"问题敏感但检索没召回"两种漏点。
     try:
         from helper.acl import deny_for_question
-        deny = deny_for_question(asker_domain, question, chat_context=ctx)
+        deny_ctx = ctx
+        if quoted:
+            deny_ctx = f"{deny_ctx}\n\n{quoted}" if deny_ctx else quoted
+        deny = deny_for_question(asker_domain, question, chat_context=deny_ctx)
     except Exception:  # noqa: BLE001
         log.exception("acl deny_for_question failed; default to not deny")
         deny = None
@@ -239,7 +262,6 @@ def ask(
     parts = [f"# 用户问题\n{question}"]
     if ctx:
         parts.append(ctx)
-    quoted = _format_quoted_message(parent_message_id)
     if quoted:
         parts.append(quoted)
     inline = _format_inline_docs(inline_context)
