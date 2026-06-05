@@ -8,7 +8,10 @@ from sqlalchemy import select
 
 
 def test_process_raw_writes_l1items(db, settings, llm_stub, retrieve_stub, stub_index_raw, make_raw):
-    """LLM 返 1 条 decision + 1 条 fact → 2 个 L1Item + L1Result.error 空 + raw.processed=True。"""
+    """LLM 返 1 条 decision + 1 条 section → 2 个 L1Item + L1Result.error 空 + raw.processed=True。
+
+    M11 后 L1 只剩 section / decision,fact/concept/entity 都已砍掉。
+    """
     from helper.ingest.sink import process_raw
     from helper.storage import session
     from helper.storage.models import L1Item, L1Result, RawInput
@@ -16,7 +19,7 @@ def test_process_raw_writes_l1items(db, settings, llm_stub, retrieve_stub, stub_
     llm_stub.set("l1_structure", json.dumps([
         {"type": "decision", "scene": "S", "signals": ["a"], "tradeoffs": [],
          "choice": "C", "rationale": "R"},
-        {"type": "fact", "subject": "X", "predicate": "is", "object": "Y", "scope": ""},
+        {"type": "section", "title": "T", "body": "X 是 Y", "topics": [], "entities": []},
     ], ensure_ascii=False))
     # consumers: 追问 + 冲突 — 让它们返空,测主链路写入即可
     llm_stub.set("elicit", "[]")
@@ -31,7 +34,7 @@ def test_process_raw_writes_l1items(db, settings, llm_stub, retrieve_stub, stub_
         items = list(s.execute(select(L1Item).where(L1Item.raw_id == rid)).scalars())
         assert len(items) == 2
         types = {it.type for it in items}
-        assert types == {"decision", "fact"}
+        assert types == {"decision", "section"}
         raw = s.get(RawInput, rid)
         assert raw.processed is True
 
@@ -64,18 +67,20 @@ def test_process_raw_force_rerun_replaces_items(
     from helper.storage.models import L1Item
 
     llm_stub.set("l1_structure", json.dumps(
-        [{"type": "fact", "subject": "A", "predicate": "is", "object": "B"}],
+        [{"type": "section", "title": "T1", "body": "A is B", "topics": [], "entities": []}],
         ensure_ascii=False,
     ))
     llm_stub.set("elicit", "[]")
     rid = make_raw("x")
     process_raw(rid)
 
-    # 改返回结果再 force 跑一次
+    # 改返回结果再 force 跑一次 — 全换成 decision, 验证 force 真清旧
     llm_stub.set("l1_structure", json.dumps(
         [
-            {"type": "concept", "name": "Foo", "entity_type": "term", "description": "d"},
-            {"type": "concept", "name": "Bar", "entity_type": "term", "description": "d"},
+            {"type": "decision", "scene": "S1", "signals": [], "tradeoffs": [],
+             "choice": "C1", "rationale": "R1"},
+            {"type": "decision", "scene": "S2", "signals": [], "tradeoffs": [],
+             "choice": "C2", "rationale": "R2"},
         ],
         ensure_ascii=False,
     ))
@@ -83,7 +88,7 @@ def test_process_raw_force_rerun_replaces_items(
 
     with session() as s:
         items = list(s.execute(select(L1Item).where(L1Item.raw_id == rid)).scalars())
-    assert {it.type for it in items} == {"concept"}
+    assert {it.type for it in items} == {"decision"}
     assert len(items) == 2
 
 

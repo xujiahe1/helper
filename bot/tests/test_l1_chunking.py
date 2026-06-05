@@ -46,7 +46,7 @@ def test_structure_short_doc_single_call(monkeypatch):
 
     def fake_run(task, *, system, user, **kw):
         calls.append(user)
-        return '[{"type":"concept","name":"X","entity_type":"thing","description":"d"}]'
+        return '[{"type":"section","title":"T","body":"x","topics":[],"entities":[]}]'
 
     monkeypatch.setattr(L1, "run", fake_run)
     out = L1.structure("短文本就一句话")
@@ -61,11 +61,11 @@ def test_structure_long_doc_multi_chunk(monkeypatch):
 
     def fake_run(task, *, system, user, **kw):
         calls.append(user)
-        # 每片回 2 条原子,name 带上 chunk 编号区分
+        # 每片回 2 条 section, title 带上 chunk 编号区分
         idx = len(calls)
         return (
-            '[{"type":"concept","name":"X' + str(idx) + '","entity_type":"t","description":"d"},'
-            '{"type":"fact","subject":"S' + str(idx) + '","predicate":"is","object":"O"}]'
+            '[{"type":"section","title":"S' + str(idx) + '-a","body":"b","topics":[],"entities":[]},'
+            '{"type":"section","title":"S' + str(idx) + '-b","body":"b","topics":[],"entities":[]}]'
         )
 
     monkeypatch.setattr(L1, "run", fake_run)
@@ -88,7 +88,7 @@ def test_structure_partial_chunk_failure_keeps_rest(monkeypatch):
         calls[0] += 1
         if calls[0] == 2:
             return "garbage not json"
-        return '[{"type":"fact","subject":"S","predicate":"p","object":"O"}]'
+        return '[{"type":"section","title":"T","body":"x","topics":[],"entities":[]}]'
 
     monkeypatch.setattr(L1, "run", fake_run)
     long_text = "# T\n\n" + "\n\n".join(
