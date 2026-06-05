@@ -9,19 +9,25 @@
 """
 
 from helper.inquiry.engine import (
+    InquiryAuditFinding,
+    InquiryAuditReport,
     InquiryHit,
     evaluate_for_raw,
     generate_inquiries,
     load_strategies,
     mark_hit,
     record_answer,
+    run_inquiry_audit,
 )
 
 __all__ = [
+    "InquiryAuditFinding",
+    "InquiryAuditReport",
     "InquiryHit",
     "evaluate_for_raw",
     "generate_inquiries",
     "load_strategies",
     "mark_hit",
     "record_answer",
+    "run_inquiry_audit",
 ]

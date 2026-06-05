@@ -27,6 +27,7 @@ from sqlalchemy import select
 from helper.im import wave_client
 from helper.im.wave_client import WaveAPIError
 from helper.inbox.inquiry_group import InquiryGroup, aggregate as aggregate_inquiries
+from helper.inquiry import InquiryAuditReport, run_inquiry_audit
 from helper.memory import AuditReport, run_audit
 from helper.storage import session
 from helper.storage.models import (
@@ -58,6 +59,8 @@ class WeeklyDigest:
     inquiry_groups: list[InquiryGroup] = field(default_factory=list)
     # memory_audit 摘要: 本次预审 / 自动 supersede 的统计
     audit: AuditReport | None = None
+    # inquiry_audit 摘要: 本次自动 close 的过期/学究式追问数
+    inquiry_audit: InquiryAuditReport | None = None
 
 
 def _week_window() -> tuple[datetime, datetime]:
@@ -77,8 +80,21 @@ def build_digest() -> WeeklyDigest:
         log.exception("memory audit failed; weekly continues without audit")
         audit_report = None
 
+    # 前置 #2: inquiry audit — 复审存量未答 inquiry 是否仍命中新 G1/G2 判据,
+    # 砍掉旧 prompt 留下的学究式追问。 砍后 hit='no' + answer_raw_id=0,
+    # 后续 SELECT WHERE answer_raw_id IS NULL 自然过滤掉, 不再进周报。
+    inquiry_audit_report: InquiryAuditReport | None
+    try:
+        inquiry_audit_report = run_inquiry_audit()
+    except Exception:  # noqa: BLE001
+        log.exception("inquiry audit failed; weekly continues without it")
+        inquiry_audit_report = None
+
     start, end = _week_window()
-    d = WeeklyDigest(week_start=start, week_end=end, audit=audit_report)
+    d = WeeklyDigest(
+        week_start=start, week_end=end,
+        audit=audit_report, inquiry_audit=inquiry_audit_report,
+    )
     with session() as s:
         d.raw_count = len(s.execute(
             select(RawInput.id).where(RawInput.created_at >= start)
@@ -182,6 +198,16 @@ def render_card(d: WeeklyDigest) -> str:
             )
         elif ar.audited and not ar.to_supersede:
             lines.append(f"🔍 memory_audit: 审 {ar.audited} 条 directive 全部通过")
+    # inquiry_audit 摘要 (旧 prompt 留下的学究式追问自动 close)
+    if d.inquiry_audit is not None:
+        iar = d.inquiry_audit
+        if iar.dropped:
+            lines.append(
+                f"🔍 inquiry_audit: 自动 close {len(iar.dropped)} 条按新判据失效的追问 "
+                f"(审 {iar.audited} 条, 留 {iar.kept} 条真 G1/G2 缺口)"
+            )
+        elif iar.audited:
+            lines.append(f"🔍 inquiry_audit: 审 {iar.audited} 条追问全部仍是 G1/G2 缺口, 保留")
     lines.append("")
 
     if d.pending_specs:
