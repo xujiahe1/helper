@@ -169,16 +169,20 @@ def _resolve_scope(scope_type: str, scope_ref: str) -> tuple[str, str]:
 
 
 def _detect_conflict_target(scope_type: str, scope_ref: str) -> int | None:
-    """同 scope 已有 alive directive → 冲突。返回旧 memory id;无冲突返 None。"""
+    """同 scope 已有 alive directive → 冲突。返回旧 memory id;无冲突返 None。
+
+    多条 alive 共存时取最新一条作为冲突对象;历史脏数据清理留给 memory_audit。
+    """
     with session() as s:
-        existing = s.execute(
-            select(Memory)
+        row = s.execute(
+            select(Memory.id)
             .where(Memory.scope_type == scope_type)
             .where(Memory.scope_ref == scope_ref)
             .where(Memory.superseded_at.is_(None))
             .order_by(Memory.id.desc())
+            .limit(1)
         ).scalar_one_or_none()
-        return existing.id if existing else None
+        return row
 
 
 def extract_for_raw(raw_id: int) -> int:

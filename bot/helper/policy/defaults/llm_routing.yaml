@@ -58,7 +58,7 @@ tasks:
   # ── L1 预筛(mini): 群聊"听"路径上,关键词没命中时让小模型快速判 yes/no ──
   # 群消息无差别全量跑 Sonnet L1 太烧;关键词预筛覆盖大头,边缘 case 让 mini 兜底。
   # 输入只是一句话,目标是过滤噪音,准确率 80% 也比全量 Sonnet 经济得多。
-  l1_prefilter:    { model: qwen3.6-flash, provider: openai }
+  l1_prefilter:    { model: gemini-3.5-flash, provider: openai }
 
   # ── 批量后台: M3 起才用上 ──
   # 用途: 文档批量 ingest 抽事实候选 / Replay judge / L2 候选 entity 批量抽取
@@ -67,10 +67,11 @@ tasks:
   # 整篇文档的章节/段落切片在调用方用规则做,不用 LLM。
   # 整篇长文的"全局理解"(主旨/大方向)走 Sonnet/Opus 主路径,不是 bulk_extract。
   #
-  # 选 Qwen 而非 Claude 的理由:
-  #   1. Athenai 政策禁止 Claude 大批量数据打标
-  #   2. 切片后单元的简单抽取,Qwen flash 准确率够 + 速度快 + 成本低 1-2 个量级
-  bulk_extract:    { model: qwen3.6-flash, provider: openai }
+  # 选 Gemini flash 而非 Claude 的理由:
+  #   1. 切片后单元的简单抽取,flash 级模型准确率够 + 速度快 + 成本低 1-2 个量级
+  #   2. 大批量打标场景把成本压在小模型上,主路径 Sonnet/Opus 留给推理任务
+  # 注:Gemini 输出常带 ```json ... ``` 围栏,parse 层 (batch/ingest._parse_json) 已兼容。
+  bulk_extract:    { model: gemini-3.5-flash, provider: openai }
 
   # ── Embedding (走专用入口 helper.llm.embed,不通过 run()) ──
   # bge-m3: BAAI 开源,中文检索表现强,1024 维(text-embedding-3-large 是 3072 维,
