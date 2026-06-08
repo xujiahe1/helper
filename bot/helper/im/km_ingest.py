@@ -290,7 +290,7 @@ def ingest_text(
 def format_results(results: list[KMIngestResult]) -> str:
     """给 wave reply 用的简短中文回执。
 
-    单条:`📄 已学习《标题》(document, raw#42)`
+    单条:`📄 已学习《标题》`
     多条:逐行汇总 ✓ / ⏭️ / ⚠️
     """
     if not results:
@@ -305,9 +305,9 @@ def format_results(results: list[KMIngestResult]) -> str:
 def _format_one(r: KMIngestResult) -> str:
     label = (r.title or r.enc_id or "未知文档")[:60]
     if r.status == "ok":
-        return f"📄 已学习《{label}》({r.doc_type}, raw#{r.raw_id})"
+        return f"📄 已学习《{label}》"
     if r.status == "relearned":
-        return f"🔄 《{label}》已重新学习 (raw#{r.raw_id})"
+        return f"🔄 《{label}》已重新学习"
     if r.status == "no_permission":
         # 没拉到正文,title 也是空的 — 文案不带《》
         return "❌ 我没权限读这篇文档,你需要先进行授权"
