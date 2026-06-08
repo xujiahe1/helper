@@ -749,3 +749,316 @@ def test_lookup_pulls_directive_by_id_regardless_of_scope(db, settings):
     block = directives_for_ask(entity_refs=[], directive_ids=[mem_id])
     assert "tachi" in block
     assert "艾特 tachi" in block
+
+
+# ---------- entity_alias (改动 1) ----------
+
+
+def test_alias_resolve_fallback_when_no_record(db, settings):
+    from helper.memory.alias import resolve_alias
+
+    assert resolve_alias("未登记") == "未登记"
+    assert resolve_alias("") == ""
+
+
+def test_alias_resolve_canonical(db, settings):
+    """add_alias 后两个名字都映射到 canonical (canonical 自映射也存在)。"""
+    from helper.memory.alias import add_alias, resolve_alias
+    from helper.storage import session
+    from helper.storage.models import EntityAlias
+
+    add_alias("小猫老师", "周婷", source="manual")
+
+    assert resolve_alias("小猫老师") == "周婷"
+    assert resolve_alias("周婷") == "周婷"  # 自映射
+
+    with session() as s:
+        rows = s.execute(select(EntityAlias)).scalars().all()
+        names = {r.name: (r.canonical, r.source) for r in rows}
+        assert names["小猫老师"] == ("周婷", "manual")
+        assert names["周婷"] == ("周婷", "manual")
+
+
+def test_alias_manual_not_overridden_by_auto(db, settings):
+    """manual 是 owner 显式声明, auto 是相似度回写, 不能覆盖。"""
+    from helper.memory.alias import add_alias, resolve_alias
+
+    add_alias("小猫", "周婷", source="manual")
+    add_alias("小猫", "陈雨晴", source="auto")  # 应被忽略
+
+    assert resolve_alias("小猫") == "周婷"
+
+
+def test_alias_mark_not_alias(db, settings):
+    """owner 在周报选 "保留" 否决疑似同义 → 两个名字标 reverted, resolve 返自身。"""
+    from helper.memory.alias import add_alias, mark_not_alias, resolve_alias
+    from helper.storage import session
+    from helper.storage.models import EntityAlias
+
+    # 先有 auto 关联, owner 否决
+    add_alias("X", "Y", source="auto")
+    mark_not_alias("X", "Y")
+
+    assert resolve_alias("X") == "X"
+    assert resolve_alias("Y") == "Y"
+
+    with session() as s:
+        rows = s.execute(select(EntityAlias)).scalars().all()
+        for r in rows:
+            assert r.source == "reverted"
+
+
+def test_extract_alias_declaration_lands_in_table(db, settings, llm_stub):
+    """LLM 输出 aliases 数组 → entity_alias 表有记录, Memory 表无记录。"""
+    from helper.memory import extract_for_raw
+    from helper.storage import session
+    from helper.storage.models import EntityAlias, Memory
+
+    raw_id = _seed_raw("小猫老师就是周婷,记一下。")
+    llm_stub.set(
+        "memory_extract",
+        json.dumps({
+            "directives": [],
+            "aliases": [{"name": "小猫老师", "canonical": "周婷"}],
+        }),
+    )
+
+    n = extract_for_raw(raw_id)
+    assert n == 0  # 没 directive 落 Memory
+
+    with session() as s:
+        memories = s.execute(select(Memory)).scalars().all()
+        assert memories == []
+        aliases = {r.name: r.canonical for r in s.execute(select(EntityAlias)).scalars()}
+        assert aliases.get("小猫老师") == "周婷"
+        assert aliases.get("周婷") == "周婷"
+
+
+def test_extract_scope_ref_normalized_via_alias(db, settings, llm_stub):
+    """先 add_alias, 再抽 directive scope_ref=别名 → Memory 落库 scope_ref=主名。"""
+    from helper.memory import extract_for_raw
+    from helper.memory.alias import add_alias
+    from helper.storage import session
+    from helper.storage.models import Memory
+
+    add_alias("小猫", "周婷", source="manual")
+
+    raw_id = _seed_raw("小猫的问题统一艾特她本人,bot 不要直接答。")
+    llm_stub.set(
+        "memory_extract",
+        json.dumps({"directives": [{
+            "scope_type": "entity", "scope_ref": "小猫",
+            "directive": "她的问题艾特本人,bot 不直接答",
+        }]}),
+    )
+
+    n = extract_for_raw(raw_id)
+    assert n == 1
+
+    with session() as s:
+        rows = s.execute(select(Memory)).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].scope_ref == "周婷"  # 归一到主名
+
+
+# ---------- Memory 向量相似 fallback (改动 2) ----------
+
+
+def _stub_embedding(monkeypatch, vector_map: dict[str, list[float]]):
+    """把 _compute_embedding 替换成查表函数,
+    没记录的 directive 返回空 bytes。"""
+    import struct
+
+    def fake(text: str) -> bytes:
+        vec = vector_map.get(text)
+        if vec is None or len(vec) != 1024:
+            return b""
+        return struct.pack(f"{len(vec)}e", *vec)
+
+    monkeypatch.setattr("helper.memory.extract._compute_embedding", fake)
+
+
+def _vec_with(seed: float) -> list[float]:
+    """生成一个 1024 维向量, 每维都是 seed (常向量), 方便构造可控的余弦。"""
+    return [seed] * 1024
+
+
+def _vec_orthogonal(seed_a: float, seed_b: float, split: int = 512) -> list[float]:
+    """构造跟 _vec_with(x) 余弦相似度可控的向量 — 前 split 维 seed_a, 后段 seed_b。"""
+    return [seed_a] * split + [seed_b] * (1024 - split)
+
+
+def test_extract_writes_embedding(db, settings, llm_stub, monkeypatch):
+    """落 Memory 时 embedding 列非空且长度 = 2048 字节 (fp16 1024 维)。"""
+    from helper.memory import extract_for_raw
+    from helper.storage import session
+    from helper.storage.models import Memory
+
+    _stub_embedding(monkeypatch, {"指令文本 X": _vec_with(0.5)})
+
+    raw_id = _seed_raw("一些原文,触发 LLM 抽出指令文本 X")
+    llm_stub.set(
+        "memory_extract",
+        json.dumps({"directives": [{
+            "scope_type": "entity", "scope_ref": "alice",
+            "directive": "指令文本 X",
+        }]}),
+    )
+
+    n = extract_for_raw(raw_id)
+    assert n == 1
+
+    with session() as s:
+        rows = s.execute(select(Memory)).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].embedding is not None
+        assert len(rows[0].embedding) == 2048
+
+
+def test_detect_semantic_match_above_threshold(db, settings, llm_stub, monkeypatch):
+    """跨 scope + embedding 余弦 ≥ 0.85 → 挂"同义疑似"冲突 + alias_hint 填好。
+
+    两条都用 _vec_with(0.5) 常向量, 余弦 = 1.0, 必然 ≥ 0.85。
+    """
+    from helper.memory import extract_for_raw
+    from helper.storage import session
+    from helper.storage.models import ConflictLog, Memory
+
+    _stub_embedding(monkeypatch, {
+        "directive_old": _vec_with(0.5),
+        "directive_new": _vec_with(0.5),
+    })
+
+    # 先 seed 一条 alive memory (scope=小猫)
+    raw_a = _seed_raw("旧消息")
+    llm_stub.set(
+        "memory_extract",
+        json.dumps({"directives": [{
+            "scope_type": "entity", "scope_ref": "小猫",
+            "directive": "directive_old",
+        }]}),
+    )
+    extract_for_raw(raw_a)
+
+    # 再来一条 scope=周婷 的相似 directive
+    raw_b = _seed_raw("新消息")
+    llm_stub.set(
+        "memory_extract",
+        json.dumps({"directives": [{
+            "scope_type": "entity", "scope_ref": "周婷",
+            "directive": "directive_new",
+        }]}),
+    )
+    extract_for_raw(raw_b)
+
+    with session() as s:
+        memories = s.execute(select(Memory).order_by(Memory.id)).scalars().all()
+        assert len(memories) == 2  # 两条都落, 不是直接覆盖
+        cls = s.execute(select(ConflictLog)).scalars().all()
+        assert len(cls) == 1
+        cl = cls[0]
+        assert cl.target_type == "memory"
+        assert cl.target_slug == str(memories[0].id)  # 旧那条
+        assert cl.alias_hint == "周婷||小猫"  # 新在前, 旧在后
+        assert "[同义疑似]" in cl.summary
+
+
+def test_detect_below_threshold_no_conflict(db, settings, llm_stub, monkeypatch):
+    """跨 scope + 余弦 < 0.85 → 不挂冲突。
+
+    _vec_with(1.0) 跟 _vec_orthogonal(1.0, -1.0, 512) 余弦 = 0 < 0.85。
+    """
+    from helper.memory import extract_for_raw
+    from helper.storage import session
+    from helper.storage.models import ConflictLog
+
+    _stub_embedding(monkeypatch, {
+        "old_dir": _vec_with(1.0),
+        "new_dir": _vec_orthogonal(1.0, -1.0, 512),
+    })
+
+    raw_a = _seed_raw("旧")
+    llm_stub.set("memory_extract", json.dumps({"directives": [{
+        "scope_type": "entity", "scope_ref": "甲", "directive": "old_dir",
+    }]}))
+    extract_for_raw(raw_a)
+
+    raw_b = _seed_raw("新")
+    llm_stub.set("memory_extract", json.dumps({"directives": [{
+        "scope_type": "entity", "scope_ref": "乙", "directive": "new_dir",
+    }]}))
+    extract_for_raw(raw_b)
+
+    with session() as s:
+        cls = s.execute(select(ConflictLog)).scalars().all()
+        assert cls == []
+
+
+def test_resolve_memory_superseded_writes_auto_alias(db, settings):
+    """memory + alias_hint 非空 + resolution=superseded → entity_alias 多 source=auto。"""
+    from helper.conflict import resolve
+    from helper.storage import session
+    from helper.storage.models import ConflictLog, EntityAlias, Memory
+
+    raw_id = _seed_raw("x")
+    with session() as s:
+        old_mem = Memory(scope_type="entity", scope_ref="小猫", directive="d1")
+        new_mem = Memory(scope_type="entity", scope_ref="周婷", directive="d2")
+        s.add_all([old_mem, new_mem])
+        s.flush()
+        cl = ConflictLog(
+            raw_id=raw_id, target_type="memory",
+            target_slug=str(old_mem.id),
+            summary="[同义疑似] ...", severity="medium",
+            alias_hint="周婷||小猫",
+        )
+        s.add(cl)
+        s.flush()
+        log_id = cl.id
+        old_id = old_mem.id
+
+    ok = resolve(log_id, resolution="superseded", resolver_domain="owner")
+    assert ok is True
+
+    with session() as s:
+        # 老 memory supersede
+        m = s.get(Memory, old_id)
+        assert m.superseded_at is not None
+        # alias 表写了 auto
+        rows = s.execute(select(EntityAlias)).scalars().all()
+        d = {r.name: (r.canonical, r.source) for r in rows}
+        assert d.get("周婷") == ("小猫", "auto")
+        # canonical 自映射也存在
+        assert d.get("小猫") == ("小猫", "auto")
+
+
+def test_resolve_memory_rejected_marks_not_alias(db, settings):
+    """memory + alias_hint 非空 + resolution=rejected → 两边 source=reverted。"""
+    from helper.conflict import resolve
+    from helper.storage import session
+    from helper.storage.models import ConflictLog, EntityAlias, Memory
+
+    raw_id = _seed_raw("y")
+    with session() as s:
+        old_mem = Memory(scope_type="entity", scope_ref="A", directive="d1")
+        s.add(old_mem)
+        s.flush()
+        cl = ConflictLog(
+            raw_id=raw_id, target_type="memory",
+            target_slug=str(old_mem.id),
+            summary="[同义疑似] ...", severity="medium",
+            alias_hint="B||A",
+        )
+        s.add(cl)
+        s.flush()
+        log_id = cl.id
+
+    ok = resolve(log_id, resolution="rejected", resolver_domain="owner")
+    assert ok is True
+
+    with session() as s:
+        rows = s.execute(select(EntityAlias)).scalars().all()
+        for r in rows:
+            assert r.source == "reverted"
+        names = {r.name for r in rows}
+        assert {"A", "B"} <= names

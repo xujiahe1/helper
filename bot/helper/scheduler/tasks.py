@@ -78,9 +78,30 @@ async def _inbox_weekly(snapshot: dict) -> None:
              snapshot.get("id"), receiver_id_type, receiver_id, ok)
 
 
+async def _spec_topic_scan(snapshot: dict) -> None:
+    """改动 3: daily 扫所有 SpecTopic, 满足触发判据 (饱和/静默) 的 topic 跑 draft。
+
+    单纯触发 draft, 不发消息 — 沉淀的 SpecCandidate 走周报第 1 段给 owner review。
+    Athenai 是阻塞 SDK 调用, 整段进线程池。
+    """
+    def _run() -> None:
+        from helper.specgen import draft_spec_from_topic, scan_topics_for_draft
+
+        topic_ids = scan_topics_for_draft()
+        log.info("spec_topic_scan: %d topics due for draft", len(topic_ids))
+        for tid in topic_ids:
+            try:
+                draft_spec_from_topic(tid)
+            except Exception:  # noqa: BLE001
+                log.exception("draft_spec_from_topic failed topic=%s", tid)
+
+    await asyncio.to_thread(_run)
+
+
 _DISPATCHERS = {
     "periodic_ask": _periodic_ask,
     "inbox_weekly": _inbox_weekly,
+    "spec_topic_scan": _spec_topic_scan,
 }
 
 

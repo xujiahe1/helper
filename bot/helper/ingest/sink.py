@@ -28,6 +28,25 @@ from helper.storage.models import L1Item, L1Result, RawInput
 log = logging.getLogger(__name__)
 
 
+def _decision_embedding(payload: dict) -> bytes:
+    """改动 3: decision 原子 embedding — scene + choice + rationale 拼成短文本算向量。
+    signals/tradeoffs 噪音大不进; 失败 / 文本空 → 返 b""。 不阻塞主链路。"""
+    parts = [
+        str(payload.get("scene", "")).strip(),
+        str(payload.get("choice", "")).strip(),
+        str(payload.get("rationale", "")).strip(),
+    ]
+    text = " | ".join(p for p in parts if p)
+    if not text:
+        return b""
+    try:
+        from helper.memory.extract import _compute_embedding
+        return _compute_embedding(text)
+    except Exception as e:  # noqa: BLE001
+        log.warning("decision embedding failed: %s", e)
+        return b""
+
+
 def process_raw(
     raw_id: int,
     *,
@@ -104,11 +123,17 @@ def process_raw(
         s.execute(delete(L1Item).where(L1Item.raw_id == raw_id))
         if out.ok:
             for idx, it in enumerate(out.items):
+                embedding_blob = b""
+                # 改动 3: 仅 decision 算 embedding (用于 SpecTopic 语义聚类),
+                # section / fact / case 等不参与 spec 沉淀, 不浪费 embedding 调用。
+                if it.type == "decision":
+                    embedding_blob = _decision_embedding(it.payload)
                 s.add(L1Item(
                     raw_id=raw_id,
                     idx=idx,
                     type=it.type,
                     payload_json=json.dumps(it.payload, ensure_ascii=False),
+                    embedding=embedding_blob,
                 ))
 
         # 标 raw.processed
@@ -181,6 +206,12 @@ def _run_consumers(raw_id: int) -> None:
         tag_raw(raw_id)
     except Exception:  # noqa: BLE001
         log.exception("acl tag_raw failed raw_id=%s", raw_id)
+    # 改动 3: decision 归 SpecTopic 簇 (异步消费 embedding, 不阻塞 conflict/acl)
+    try:
+        from helper.specgen import assign_topic_for_raw
+        assign_topic_for_raw(raw_id)
+    except Exception:  # noqa: BLE001
+        log.exception("assign_topic_for_raw failed raw_id=%s", raw_id)
 
 
 def _process_with_prefilter(raw_id: int) -> None:

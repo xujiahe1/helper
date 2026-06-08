@@ -175,6 +175,9 @@ def render_card(d: WeeklyDigest) -> str:
     lines = [
         f"📋 Helper 周报 ({d.week_start:%m-%d} ~ {d.week_end:%m-%d})",
         "",
+        "💬 回执规则: 私聊 helper 时, 第一行写「周报裁判回执」, 后续每行一条指令。",
+        "  没有这个开头的消息会被当闲聊处理, 不会绑到周报上。",
+        "",
         f"本周新增 {d.raw_count} 条判断",
     ]
     # audit 摘要
@@ -211,14 +214,14 @@ def render_card(d: WeeklyDigest) -> str:
     lines.append("")
 
     if d.pending_specs:
-        lines.append(f"📝 1. 待沉淀规约 ({len(d.pending_specs)}) — 回「批准 1-N」/「驳回 1-N」")
+        lines.append(f"📝 1. 待沉淀规约 ({len(d.pending_specs)}) — 「批准 1-N」/「驳回 1-N」/「跳过 1-N」")
         for n, (_sid, _slug, title) in enumerate(d.pending_specs, start=1):
             lines.append(f"  1-{n}  {title}")
         lines.append("")
     if d.open_conflicts:
         lines.append(
             f"⚠️ 2. 待修正冲突 ({len(d.open_conflicts)}) — "
-            "回「采纳 2-N」用新覆盖旧 / 「保留 2-N」否决新 / 「都留 2-N」并存"
+            "「采纳 2-N」新覆盖旧 / 「保留 2-N」否决新 / 「都留 2-N」并存"
         )
         for n, (_cid, ttype, _slug, _sev, summary) in enumerate(d.open_conflicts, start=1):
             type_label = {"spec": "规约", "memory": "偏好"}.get(ttype, ttype)
@@ -228,7 +231,7 @@ def render_card(d: WeeklyDigest) -> str:
         total_subs = sum(len(g.member_ids) for g in d.inquiry_groups)
         lines.append(
             f"❓ 3. 待回答的追问 ({len(d.inquiry_groups)} 个主题, 共 {total_subs} 条) — "
-            "回「答 3-N 你的答案」(答案覆盖到的子追问会自动一起关闭)"
+            "「3-N 你的答案」(覆盖到的子追问自动一起关闭) / 「3-N 展开说说」让 bot 给解释"
         )
         for n, g in enumerate(d.inquiry_groups, start=1):
             mq = g.master_question.replace("\n", " ").strip()

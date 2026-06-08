@@ -1,35 +1,31 @@
 """Inbox 周报回执 — 解析 owner 私聊里的指令并派发。
 
-只对配了 helper_owner_domain 的那一人开放,且只在私聊上下文(chat_id 空)。
+只对配了 helper_owner_domain 的那一人开放, 且只在私聊上下文(chat_id 空)。
 群聊里不识别 — 避免误触。
 
-支持指令(N 是周报里 1-based 序号,从 owner 最近一次收到的周报里反查真实 ID):
+裁决 vs 闲聊歧义消除: 用一个固定触发词「周报裁判回执」做闸口。文本里没有这个
+词 → 直接放过, 让上层走 intent / 闲聊。有就把它剥掉、剩下按行扫指令。这样
+"3-1 等于 2"、"我有 3 个" 这类闲聊不会再误吃成裁决。
 
-  1) 待沉淀规约 (1-N)
-     批准 1-N / 驳回 1-N / 跳过 1-N
+支持指令(N 是周报里 1-based 序号, 从 owner 最近一次收到的周报里反查真实 ID):
 
-  2) 待修正冲突 (2-N)
-     采纳 2-N: ConflictLog.resolution='superseded'
-     保留 2-N: ConflictLog.resolution='rejected'
-     都留 2-N: ConflictLog.resolution='coexist'
+  消息整体格式:
+    周报裁判回执
+    <每行一条指令>
 
-  3) 待答追问主题组 (3-N)
-     答 3-N <文本>:
-       - 3-N 现在对应一个**追问主题组**(可能含 1..N 条子追问)
-       - LLM 判 owner 答案语义覆盖了哪些子追问 → 全部一起 close
-       - 没覆盖的子追问留 open,下次周报继续出现
+  指令分三段(动词在前 / 编号在前两种写法都支持):
 
-  4) memory_audit 首次确认
-     确认 audit / 跳过 audit
-       - 确认: pending_audit 列表全部真 supersede
-       - 跳过: 仅清空 pending_audit,本次不动 memory(后续每周自动跑 = 不再 dry-run)
+    1-N: 批准 / 驳回 / 跳过        — 待沉淀 SpecCandidate
+    2-N: 采纳 / 保留 / 都留        — 待修正 ConflictLog
+                                       采纳 → superseded, 保留 → rejected, 都留 → coexist
+    3-N <答案>                     — 待答追问主题组(LLM 判覆盖, 自动关相应子追问)
+    3-N 展开说说 / 讲讲 / ...      — 反向追问, bot 给解释, 子追问留 open
 
-  兼容老格式:
-  - 批准/驳回/跳过 #N: 仍按 SpecCandidate.id 直接处理
-  - 答 #N <文本> / #N <文本>(裸): 按 InquiryLog.id 直接处理
+  memory_audit 首次确认(独立, 不需要触发词):
+    确认 audit / 跳过 audit
 
 返回值: 给用户的中文回复文案 + 副作用列表(after_actions)。
-不匹配返 None,让上层走 intent classify。
+不匹配返 None, 让上层走 intent classify。
 """
 
 from __future__ import annotations
@@ -82,9 +78,6 @@ def _match_section_action(line: str) -> tuple[str, int, int] | None:
     if m is not None:
         return (m.group(3).lower(), int(m.group(1)), int(m.group(2)))
     return None
-_SECTION_ANSWER_RE = re.compile(
-    r"^\s*答\s*3-(\d+)[\s,，::]+(.+)$", re.DOTALL
-)
 # 单行宽松匹配「3-N <答案>」: 多行批量回执时按行扫,允许省「答」字。
 # 字符集容错: 空白/英文逗号/中文逗号/英文冒号/中文冒号/顿号/连字符/破折号。
 _LINE_ANSWER_LOOSE_RE = re.compile(
@@ -105,10 +98,11 @@ _BACKQUERY_RE = re.compile(
 # memory_audit 首跑 dry-run 确认指令
 _AUDIT_CONFIRM_RE = re.compile(r"^\s*确认\s*audit\s*$", re.IGNORECASE)
 _AUDIT_SKIP_RE = re.compile(r"^\s*跳过\s*audit\s*$", re.IGNORECASE)
-# 兼容老格式
-_LEGACY_ACTION_RE = re.compile(r"^\s*(批准|驳回|跳过|approve|reject|skip)\s*#?(\d+)\s*$", re.IGNORECASE)
-_LEGACY_ANSWER_EXPLICIT_RE = re.compile(r"^\s*答\s*#?(\d+)[\s,，:]+(.+)$", re.DOTALL)
-_LEGACY_ANSWER_BARE_RE = re.compile(r"^\s*#(\d+)[\s,，:]+(.+)$", re.DOTALL)
+
+# 周报裁决触发词 — 必须出现在文本里(去前缀后再走解析), 否则一律放过让上层走
+# intent 分类。把"裁决 vs 闲聊"歧义消除压成一个固定字符串, 不再靠多行 ≥2 命中、
+# "答" 前缀这种启发式判据。
+_VERDICT_TRIGGER = "周报裁判回执"
 
 
 # ---------- helpers ----------
@@ -659,59 +653,25 @@ def try_handle(
         return None
     text = text or ""
 
-    # 0) memory_audit 首跑确认
+    # 0) memory_audit 首跑确认 — 走自己的固定指令, 不需要触发词
     if _AUDIT_CONFIRM_RE.match(text):
         return _handle_audit_action("confirm", sender_domain)
     if _AUDIT_SKIP_RE.match(text):
         return _handle_audit_action("skip", sender_domain)
 
-    # 1) 周报式: 批准/驳回/跳过/采纳/保留/都留 1-N | 2-N | 3-N (动词在前/编号在前都支持)
-    sa_single = _match_section_action(text)
-    if sa_single is not None:
-        action, section, n = sa_single
-        payload = _load_digest_payload(sender_domain)
-        if payload is None:
-            return ReplyResult(text="⚠️ 还没有最近的 inbox 周报记录,请先发一次「/inbox」。")
-        target_id = _resolve_section_id(payload, section, n)
-        if target_id is None:
-            return ReplyResult(text=f"⚠️ {section}-{n} 在最近一次周报里找不到,请核对编号。")
-        if section == 1:
-            spec_action = {"批准": "approve", "approve": "approve",
-                           "驳回": "reject", "reject": "reject",
-                           "跳过": "skip", "skip": "skip"}.get(action)
-            if spec_action is None:
-                return ReplyResult(text=f"⚠️ 1-N 仅支持「批准 / 驳回 / 跳过」,收到「{action}」。")
-            return _handle_spec_action(spec_action, target_id, sender_domain)
-        if section == 2:
-            return _handle_conflict_action(action, target_id, sender_domain)
-        if section == 3:
-            # 「答」走 _SECTION_ANSWER_RE,这里不会到;到了说明误用了批准/驳回 + 3-N
-            return ReplyResult(text="⚠️ 3-N(追问)请用「答 3-N 你的答案」。")
+    # 1) 必须包含触发词「周报裁判回执」才进入裁决解析。否则一律放过, 让上层走
+    # intent 分类 / 闲聊。这是裁决 vs 闲聊的唯一闸口。
+    if _VERDICT_TRIGGER not in text:
+        return None
+    body = text.replace(_VERDICT_TRIGGER, "", 1).strip()
+    if not body:
+        return ReplyResult(
+            text="⚠️ 「周报裁判回执」后没有内容。\n"
+                 "示例:\n周报裁判回执\n采纳 2-1\n3-1 你的答案"
+        )
 
-    # 2) 周报式: 答 3-N <文本> — 单条答复直接走主题组; 反向追问短语走解释路径
-    m = _SECTION_ANSWER_RE.match(text)
-    if m is not None:
-        n = int(m.group(1))
-        answer_text = (m.group(2) or "").strip()
-        payload = _load_digest_payload(sender_domain)
-        if payload is None:
-            return ReplyResult(text="⚠️ 还没有最近的 inbox 周报记录,请先发一次「/inbox」。")
-        ids = _resolve_inquiry_group(payload, n)
-        if not ids:
-            return ReplyResult(text=f"⚠️ 3-{n} 在最近一次周报里找不到,请核对编号。")
-        if _BACKQUERY_RE.match(answer_text):
-            return ReplyResult(
-                text=f"— 3-{n}(展开)—\n{_explain_inquiry_group(ids)}\n\n"
-                     f"🔁 这条追问保持 open, 下次周报继续出, 你给出正式答复后会一起 close。"
-            )
-        if not answer_raw_id:
-            return ReplyResult(text="⚠️ 内部异常:答复消息没有 raw_id,请稍后重试。")
-        return _handle_answer_group(ids, answer_text, answer_raw_id, sender_domain)
-
-    # 2.5) 多行批量回执: 一条消息可混合 1-N / 2-N 指令 + 多行 3-N 答复 + 反向追问
-    # 例: owner 拷贝周报里 14 个 3-N 主题组, 每行写一个答案; 顶上再带一行「采纳 2-1」。
-    # 反向追问行(答复文本 = "展开说说"/"讲讲"等)走解释路径, 子追问留 open。
-    lines = [ln for ln in text.splitlines() if ln.strip()]
+    # 2) 按行扫: 1-N/2-N 指令(动词在前/编号在前都支持) + 3-N 答复 + 3-N 反问
+    lines = [ln for ln in body.splitlines() if ln.strip()]
     batch: list[tuple[int, str]] = []
     backqueries: list[int] = []
     section_actions: list[tuple[str, int, int]] = []
@@ -734,38 +694,15 @@ def try_handle(
             backqueries.append(n)
         else:
             batch.append((n, ans))
-    matched = len(batch) + len(backqueries) + len(section_actions)
-    # 至少要 2 行命中(含反问/规约/冲突指令), 才认这是批量回执 — 避免普通闲聊误触发
-    if matched >= 2 and matched >= max(1, len(lines) // 2):
-        return _handle_batch_answers(
-            batch, answer_raw_id, sender_domain,
-            backqueries=backqueries, section_actions=section_actions,
+
+    if not (batch or backqueries or section_actions):
+        return ReplyResult(
+            text="⚠️ 「周报裁判回执」里没识别出指令。每行格式:\n"
+                 "  1-N 批准/驳回/跳过\n"
+                 "  2-N 采纳/保留/都留\n"
+                 "  3-N <答案>  或  3-N 展开说说"
         )
-
-    # 3) 老格式: 批准/驳回/跳过 #N(直接当 SpecCandidate.id)
-    m = _LEGACY_ACTION_RE.match(text)
-    if m is not None:
-        legacy_action = {"批准": "approve", "approve": "approve",
-                         "驳回": "reject", "reject": "reject",
-                         "跳过": "skip", "skip": "skip"}[m.group(1).lower()]
-        return _handle_spec_action(legacy_action, int(m.group(2)), sender_domain)
-
-    # 4) 老格式: 答 #N <文本> / #N <文本>
-    m = _LEGACY_ANSWER_EXPLICIT_RE.match(text)
-    if m is not None:
-        if not answer_raw_id:
-            return ReplyResult(text="⚠️ 内部异常:答复消息没有 raw_id,请稍后重试。")
-        return _handle_answer(int(m.group(1)), answer_raw_id, sender_domain)
-
-    m = _LEGACY_ANSWER_BARE_RE.match(text)
-    if m is not None:
-        candidate_id = int(m.group(1))
-        with session() as s:
-            iq = s.get(InquiryLog, candidate_id)
-            is_open_inquiry = iq is not None and iq.answer_raw_id is None
-        if is_open_inquiry:
-            if not answer_raw_id:
-                return ReplyResult(text="⚠️ 内部异常:答复消息没有 raw_id,请稍后重试。")
-            return _handle_answer(candidate_id, answer_raw_id, sender_domain)
-
-    return None
+    return _handle_batch_answers(
+        batch, answer_raw_id, sender_domain,
+        backqueries=backqueries, section_actions=section_actions,
+    )

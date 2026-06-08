@@ -309,3 +309,186 @@ def test_resolve_marks_log(db, settings, make_raw):
         assert row.resolution == "superseded"
         assert row.resolved_by == "owner"
         assert isinstance(row.resolved_at, datetime)
+
+
+# ─── 改动 5: 已批准 spec 防覆写 ──────────────────────────────────
+
+
+def _make_approved_spec(slug: str, statement: str, *, git_path: str | None = None):
+    """seed 一条已 approved 的 SpecCandidate。"""
+    from helper.storage import session
+    from helper.storage.models import SpecCandidate
+
+    with session() as s:
+        sc = SpecCandidate(
+            slug=slug, title=f"T-{slug}",
+            statement=statement, rationale="why",
+            cluster_raw_ids_json=json.dumps([[1, 0]]),
+            review_status="approved",
+            git_path=git_path or f"specs/{slug}.md",
+        )
+        s.add(sc)
+        s.flush()
+        return sc.id
+
+
+def test_draft_hits_approved_spec_parks_as_conflict(db, settings, llm_stub, make_raw):
+    """draft_spec_from_cluster 遇到同 slug 且 approved → 不覆写, 挂 ConflictLog
+    target_type='spec' + pending_payload_json, 等 owner 裁决。"""
+    from helper.specgen.draft import draft_spec_from_cluster
+    from helper.storage import session
+    from helper.storage.models import ConflictLog, SpecCandidate, L1Item
+
+    sid = _make_approved_spec("locked", "OLD statement")
+
+    # 准备 cluster: 2 条 decision
+    rid_a = make_raw("raw a")
+    rid_b = make_raw("raw b")
+    for rid, idx in ((rid_a, 0), (rid_b, 0)):
+        _seed_decision(rid, scene=f"S-{rid}", choice=f"C-{rid}")
+
+    # 触发判据 (改动 4): 普适=true 让 1 条就触发, 2 条照样触发, 焦点在 approved-spec 防覆写
+    llm_stub.set("spec_universal_check", '{"is_universal": true, "reason": "test"}')
+
+    # LLM 给出和已批准 spec 同 slug 的新草稿
+    llm_stub.set("ask", json.dumps({
+        "slug": "locked",
+        "title": "新草稿标题",
+        "statement": "NEW statement",
+        "rationale": "NEW rationale",
+    }, ensure_ascii=False))
+
+    result = draft_spec_from_cluster([(rid_a, 0), (rid_b, 0)])
+    # 已批准 spec 不被覆写, 返的是旧那条 (id=sid)
+    assert result is not None
+    assert result.id == sid
+    with session() as s:
+        # 旧字段没动
+        sc = s.get(SpecCandidate, sid)
+        assert sc.statement == "OLD statement"
+        assert sc.review_status == "approved"
+        # 没有第二条 SpecCandidate
+        rows = list(s.execute(select(SpecCandidate)).scalars())
+        assert len(rows) == 1
+        # ConflictLog 落了一条 + pending_payload 装好新内容
+        conflicts = list(s.execute(
+            select(ConflictLog).where(ConflictLog.target_slug == "locked")
+        ).scalars())
+        assert len(conflicts) == 1
+        cl = conflicts[0]
+        assert cl.target_type == "spec"
+        assert cl.resolution == "open"
+        payload = json.loads(cl.pending_payload_json)
+        assert payload["statement"] == "NEW statement"
+        assert payload["slug"] == "locked"
+
+
+def test_resolve_approved_spec_superseded_overwrites_and_repromotes(
+    db, settings, llm_stub, make_raw, monkeypatch,
+):
+    """采纳 → 用 pending_payload 覆盖 SpecCandidate 字段 + 触发 _repromote_spec。"""
+    from helper.conflict import resolve
+    from helper.storage import session
+    from helper.storage.models import ConflictLog, SpecCandidate
+
+    sid = _make_approved_spec("locked", "OLD")
+    rid = make_raw("trigger")
+    with session() as s:
+        c = ConflictLog(
+            raw_id=rid, target_type="spec", target_slug="locked",
+            summary="approved-overwrite test", severity="medium",
+            pending_payload_json=json.dumps({
+                "slug": "locked", "title": "T",
+                "statement": "NEW", "rationale": "RNEW",
+                "keys": [[rid, 0]],
+            }),
+        )
+        s.add(c)
+        s.flush()
+        log_id = c.id
+
+    repromoted: list[str] = []
+    def _fake_repromote(slug, *, reason):
+        repromoted.append(slug)
+    monkeypatch.setattr("helper.conflict.detector._repromote_spec", _fake_repromote)
+
+    ok = resolve(log_id, resolution="superseded", resolver_domain="owner")
+    assert ok is True
+    with session() as s:
+        sc = s.get(SpecCandidate, sid)
+        # 字段被覆盖
+        assert sc.statement == "NEW"
+        assert sc.rationale == "RNEW"
+        # 仍是 approved (没被打 superseded — 保留原状只更新内容)
+        assert sc.review_status == "approved"
+        assert sc.superseded_at is None
+    assert repromoted == ["locked"]
+
+
+def test_resolve_approved_spec_rejected_keeps_original(db, settings, llm_stub, make_raw):
+    """保留 → 已批准 spec 完全不动, pending_payload 丢弃。"""
+    from helper.conflict import resolve
+    from helper.storage import session
+    from helper.storage.models import ConflictLog, SpecCandidate
+
+    sid = _make_approved_spec("locked", "ORIGINAL")
+    rid = make_raw("trigger")
+    with session() as s:
+        c = ConflictLog(
+            raw_id=rid, target_type="spec", target_slug="locked",
+            summary="x", severity="medium",
+            pending_payload_json=json.dumps({
+                "slug": "locked", "title": "T",
+                "statement": "WOULD-BE-NEW", "rationale": "...",
+                "keys": [[rid, 0]],
+            }),
+        )
+        s.add(c)
+        s.flush()
+        log_id = c.id
+
+    ok = resolve(log_id, resolution="rejected", resolver_domain="owner")
+    assert ok is True
+    with session() as s:
+        sc = s.get(SpecCandidate, sid)
+        assert sc.statement == "ORIGINAL"
+        # 不应再有第二条
+        all_rows = list(s.execute(select(SpecCandidate)).scalars())
+        assert len(all_rows) == 1
+
+
+def test_resolve_approved_spec_coexist_spawns_v2(db, settings, llm_stub, make_raw):
+    """都留 → pending_payload 落成 slug-v2 独立 SpecCandidate (pending review)。"""
+    from helper.conflict import resolve
+    from helper.storage import session
+    from helper.storage.models import ConflictLog, SpecCandidate
+
+    sid = _make_approved_spec("locked", "ORIGINAL")
+    rid = make_raw("trigger")
+    with session() as s:
+        c = ConflictLog(
+            raw_id=rid, target_type="spec", target_slug="locked",
+            summary="x", severity="medium",
+            pending_payload_json=json.dumps({
+                "slug": "locked", "title": "新标题",
+                "statement": "NEW", "rationale": "RNEW",
+                "keys": [[rid, 0]],
+            }),
+        )
+        s.add(c)
+        s.flush()
+        log_id = c.id
+
+    ok = resolve(log_id, resolution="coexist", resolver_domain="owner")
+    assert ok is True
+    with session() as s:
+        # 旧那条没动
+        sc = s.get(SpecCandidate, sid)
+        assert sc.statement == "ORIGINAL"
+        # 新出一条 -v2 candidate, 状态 pending
+        v2 = s.execute(
+            select(SpecCandidate).where(SpecCandidate.slug == "locked-v2")
+        ).scalar_one_or_none()
+        assert v2 is not None
+        assert v2.statement == "NEW"
+        assert v2.review_status == "pending"

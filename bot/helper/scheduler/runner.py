@@ -143,6 +143,34 @@ def ensure_owner_inbox_weekly() -> None:
     log.info("auto-created inbox_weekly task for owner=%s (cron 0 9 * * 1)", owner)
 
 
+def ensure_spec_topic_scan_daily() -> None:
+    """改动 3: 没 spec_topic_scan 任务 → 自动建一条每天 03:00 跑。
+
+    不挂在 owner 上 (跨 owner 的 topic 都扫), 用 receiver_id="" 占位避免 dispatch
+    误发消息 — _spec_topic_scan 不读 receiver_id, 只跑后台 draft。
+    幂等: 已存在 (无论 enabled) 就不动。
+    """
+    with session() as s:
+        existing = s.execute(
+            select(ScheduledTask)
+            .where(ScheduledTask.task_type == "spec_topic_scan")
+            .limit(1)
+        ).scalar_one_or_none()
+        if existing is not None:
+            return
+        s.add(ScheduledTask(
+            owner_user_id="system",
+            cron_expr="0 3 * * *",
+            task_type="spec_topic_scan",
+            params_json="{}",
+            receiver_id="",
+            receiver_id_type="user_id",
+            summary="每日 03:00 扫 SpecTopic, 满足饱和/静默判据的簇触发 spec draft",
+            enabled=True,
+        ))
+    log.info("auto-created spec_topic_scan task (daily 03:00)")
+
+
 def start_scheduler() -> None:
     """FastAPI startup 调。重复调用安全(已启动则忽略)。"""
     global _scheduler
@@ -152,6 +180,10 @@ def start_scheduler() -> None:
         ensure_owner_inbox_weekly()
     except Exception:  # noqa: BLE001
         log.exception("ensure_owner_inbox_weekly failed")
+    try:
+        ensure_spec_topic_scan_daily()
+    except Exception:  # noqa: BLE001
+        log.exception("ensure_spec_topic_scan_daily failed")
     _scheduler = AsyncIOScheduler(timezone=timezone.utc)
     # 每分钟 tick 一次。第一次延迟 5 秒避免与 startup 抢 event loop
     from apscheduler.triggers.interval import IntervalTrigger

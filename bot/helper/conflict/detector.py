@@ -406,9 +406,39 @@ def resolve(
         row.resolved_at = now
 
         git_to_remove: str | None = None
+        spec_to_repromote: str | None = None  # 采纳 approved-overwrite 时用
+        coexist_v2_payload: dict | None = None  # 都留 → 起 -v2 candidate
+
+        # ===== 特殊路径: 已 approved spec 被新草稿挑战 =====
+        # draft 阶段把新草稿塞 pending_payload_json 而不是 SpecCandidate。 此处按
+        # 裁决从 payload 里取出新草稿决定后续动作。
+        target_type = row.target_type or "spec"
+        target_slug = row.target_slug
+        pending_payload: dict | None = None
+        if (
+            target_type == "spec"
+            and target_slug
+            and (row.pending_payload_json or "").strip()
+        ):
+            try:
+                pp = json.loads(row.pending_payload_json)
+                if isinstance(pp, dict):
+                    pending_payload = pp
+            except json.JSONDecodeError:
+                pending_payload = None
+
+        # ===== memory 跨 scope 语义疑似同义场景 =====
+        # alias_hint 形如 "name_a||name_b" (新 scope_ref || 旧 scope_ref)。
+        # superseded → 确认同义, auto 写 alias; coexist → 同义但都保留, 也写 alias;
+        # rejected  → 否决同义, mark_not_alias 防 auto 反复触发。
+        # alias_hint 空 (精确撞 / spec 路径) 不动 alias 表。
+        memory_alias_pair: tuple[str, str] | None = None
+        if target_type == "memory" and (row.alias_hint or ""):
+            parts = row.alias_hint.split("||", 1)
+            if len(parts) == 2 and parts[0] and parts[1]:
+                memory_alias_pair = (parts[0], parts[1])
+
         if resolution == "superseded":
-            target_type = row.target_type or "spec"
-            target_slug = row.target_slug
             if target_type == "memory":
                 try:
                     mem_id = int(target_slug)
@@ -424,7 +454,20 @@ def resolve(
                 cand = s.execute(
                     select(SpecCandidate).where(SpecCandidate.slug == target_slug)
                 ).scalar_one_or_none()
-                if cand is not None and cand.superseded_at is None:
+                if pending_payload is not None and cand is not None and cand.review_status == "approved":
+                    # approved-overwrite 路径: 用新草稿覆盖已批准规约的字段, 然后
+                    # 重新落 git。 旧版本由 git history 保留, 不删文件。
+                    cand.statement = str(pending_payload.get("statement", cand.statement))
+                    cand.rationale = str(pending_payload.get("rationale", cand.rationale))
+                    new_keys = pending_payload.get("keys") or []
+                    if new_keys:
+                        old = json.loads(cand.cluster_raw_ids_json or "[]")
+                        old_t = {tuple(k) if isinstance(k, list) and len(k) == 2 else (k, 0) for k in old}
+                        new_t = {tuple(k) for k in new_keys if isinstance(k, list) and len(k) == 2}
+                        merged = sorted(old_t | new_t)
+                        cand.cluster_raw_ids_json = json.dumps([list(k) for k in merged])
+                    spec_to_repromote = target_slug
+                elif cand is not None and cand.superseded_at is None:
                     cand.superseded_at = now
                     cand.superseded_by = row.raw_id
                     if cand.git_path:
@@ -437,11 +480,106 @@ def resolve(
                         log.exception(
                             "resolve index cleanup failed ref=%s", target_slug,
                         )
+        elif resolution == "coexist" and pending_payload is not None and target_type == "spec":
+            # 都留 → 新草稿改 slug 加 -v2 落独立 SpecCandidate (走正常 review 流程)
+            coexist_v2_payload = pending_payload
+        # rejected: pending_payload 直接丢弃, 已批准 spec 保持不变 (此路径无须额外动作)
         s.commit()
+
+    # alias 联动 — 在主事务 commit 后跑, alias.add_alias / mark_not_alias 自管事务。
+    # 这条同义疑似冲突的 owner 裁决结果固化到 entity_alias 表, 后续 extract 路径
+    # 自动归一这两个名字 (auto) 或不再触发同义 (reverted)。
+    if memory_alias_pair is not None:
+        name_a, name_b = memory_alias_pair
+        if resolution in ("superseded", "coexist"):
+            from helper.memory.alias import add_alias
+            add_alias(name_a, name_b, source="auto")
+        elif resolution == "rejected":
+            from helper.memory.alias import mark_not_alias
+            mark_not_alias(name_a, name_b)
 
     if git_to_remove:
         _remove_from_git(git_to_remove, reason=f"conflict#{log_id}")
+    if spec_to_repromote:
+        _repromote_spec(spec_to_repromote, reason=f"conflict#{log_id}")
+    if coexist_v2_payload is not None:
+        _spawn_v2_candidate(coexist_v2_payload)
     return True
+
+
+def _repromote_spec(slug: str, *, reason: str) -> None:
+    """approved spec 字段被覆盖后, 重新写 git 文件 + commit。 失败仅 log。"""
+    try:
+        from helper.specgen.draft import _spec_md
+        from helper.storage.models import SpecCandidate
+        from helper.config import get_settings
+        from git import Repo
+
+        settings = get_settings()
+        with session() as s:
+            cand = s.execute(
+                select(SpecCandidate).where(SpecCandidate.slug == slug)
+            ).scalar_one_or_none()
+            if cand is None or not cand.git_path:
+                return
+            md = _spec_md(cand)
+            abs_path = settings.helper_spec_git_dir / cand.git_path
+            if not abs_path.parent.exists():
+                abs_path.parent.mkdir(parents=True, exist_ok=True)
+            abs_path.write_text(md, encoding="utf-8")
+            try:
+                from helper.storage import vector as vec
+                vec.index_spec(s, cand.slug)
+            except Exception:  # noqa: BLE001
+                log.exception("re-index_spec failed slug=%s", cand.slug)
+        repo = Repo(settings.helper_spec_git_dir)
+        repo.index.add([str(cand.git_path)])
+        if repo.is_dirty():
+            repo.index.commit(f"spec: re-promote {slug} ({reason})")
+    except Exception:  # noqa: BLE001
+        log.exception("re-promote %s failed", slug)
+
+
+def _spawn_v2_candidate(payload: dict) -> None:
+    """都留路径: 把 pending_payload 落成 slug-v2 的独立 SpecCandidate, 进 pending review。"""
+    try:
+        from helper.storage.models import SpecCandidate
+        old_slug = str(payload.get("slug", "")).strip()
+        if not old_slug:
+            return
+        # 找一个空 -vN 后缀(从 v2 起)
+        new_slug = old_slug
+        with session() as s:
+            n = 2
+            while True:
+                candidate_slug = f"{old_slug}-v{n}"
+                exists = s.execute(
+                    select(SpecCandidate).where(SpecCandidate.slug == candidate_slug)
+                ).scalar_one_or_none()
+                if exists is None:
+                    new_slug = candidate_slug
+                    break
+                n += 1
+                if n > 99:
+                    return  # 异常防呆
+            keys_json = payload.get("keys") or []
+            row = SpecCandidate(
+                slug=new_slug,
+                title=str(payload.get("title", new_slug))[:255],
+                statement=str(payload.get("statement", "")),
+                rationale=str(payload.get("rationale", "")),
+                cluster_raw_ids_json=json.dumps(keys_json, ensure_ascii=False),
+            )
+            s.add(row)
+            s.commit()
+            try:
+                from helper.storage import fts
+                fts.index_spec(s, row.slug)
+            except Exception:  # noqa: BLE001
+                log.exception("fts.index_spec failed slug=%s", row.slug)
+            s.commit()
+    except Exception:  # noqa: BLE001
+        log.exception("spawn v2 candidate failed payload=%s", payload)
 
 
 def _remove_from_git(rel_path: str, *, reason: str) -> None:

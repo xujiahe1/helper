@@ -29,6 +29,10 @@ tasks:
   # 评价陈述、"X 不能 Y,因为 Z" 决策依据)。误抽的自动 supersede 掉,避免周报
   # 一直拿错抽数据骚扰 owner。
   memory_audit:    { model: claude-sonnet-4-6, provider: anthropic }
+  # spec_universal_check: spec 沉淀前的"是不是普适表述"判定 — 普适 (以后/统一/一律)
+  # 1 条 decision 即触发 draft, 单次决定 (这次/暂时/先这样) 走数量阈值或静默期。
+  # 替代旧版 len(cluster_keys) < 2 的硬判据。
+  spec_universal_check: { model: claude-sonnet-4-6, provider: anthropic }
   # inquiry_dedup: 新 inquiry 落库前查询同 scope/spec 的开放追问,LLM 判新问题
   # 相对已问是子集/换皮/新角度。子集和换皮直接丢,只新角度才入库 — 治本,
   # 防止跨 raw 同主题追问越堆越多。

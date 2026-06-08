@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, LargeBinary, String, Text, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -118,6 +118,33 @@ class SpecCandidate(Base):
     git_path: Mapped[str] = mapped_column(String(255), default="")
     superseded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     superseded_by: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 取代它的 raw_id
+    # 改动 3: 来源 SpecTopic 编号; 老 candidate (改动 3 之前手工聚簇生成的) 留 None。
+    # 软关联, 不强 FK — topic 删除时不级联清掉 candidate。
+    topic_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+
+
+class SpecTopic(Base):
+    """改动 3: 语义聚类簇 — bge-m3 embedding + 余弦阈值 0.78 自动聚簇。
+
+    每条 type='decision' 的 L1Item 在 sink 阶段算 embedding (复用 helper.embed),
+    随后异步 assign_topic 与已有 topic 做余弦比较, 命中阈值合入旧簇 (centroid 增量
+    平均更新), 否则新建一个 topic。
+
+    主链路触发 draft 由 `scan_topics_for_draft` 周期性扫这张表决定 (普适 / 饱和≥3 /
+    静默期 ≥ 90d), 替代旧的 "调用方自传 cluster_keys" 模式。
+
+    centroid: fp16 packed 1024d (2048 字节), 与 Memory.embedding 同编码;
+              空 bytes 表示尚未计算 (例如新建中途出错)。
+    """
+
+    __tablename__ = "spec_topics"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    centroid: Mapped[bytes] = mapped_column(LargeBinary, default=b"")
+    decision_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_updated: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    last_promoted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
 class ConflictLog(Base):
@@ -146,6 +173,13 @@ class ConflictLog(Base):
     resolved_by: Mapped[str] = mapped_column(String(64), default="")     # 域账号 / auto-judge
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     auto_reason: Mapped[str] = mapped_column(Text, default="")           # auto_* 时的裁决理由
+    # 已 approved spec 的"待裁决覆写"场景: 新草稿不直接落 SpecCandidate, 而是塞这里
+    # 等 owner 在周报里裁决后, 再用这里的 payload 决定覆写 / 丢弃 / -v2 旁路。
+    # 普通 conflict 这字段为空。 JSON 形如 {"slug","title","statement","rationale","keys"}。
+    pending_payload_json: Mapped[str] = mapped_column(Text, default="")
+    # 同义疑似冲突场景: 存 "name_a||name_b", resolve 时回写 entity_alias 表。
+    # 普通 conflict (精确撞 scope / spec 撞 slug) 此字段为空。
+    alias_hint: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
@@ -343,6 +377,11 @@ class L1Item(Base):
     payload_json: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     acl_topic_id: Mapped[str] = mapped_column(String(32), default="")  # 见 RawInput.acl_topic_id
+    # 改动 3: type='decision' 的 item 在 sink 阶段算 bge-m3 embedding (1024d fp16, 2048 字节);
+    # 其它 type 留空 bytes (省成本)。 失败 / 未算 → b"", 不影响主链路。
+    embedding: Mapped[bytes] = mapped_column(LargeBinary, default=b"")
+    # 改动 3: 归属 SpecTopic.id, 未归簇 = None (老数据 / 非 decision / embed 失败)。
+    topic_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
     __table_args__ = (
         Index("ix_l1_items_type", "type"),
@@ -383,6 +422,38 @@ class Memory(Base):
     # superseded_by=0 表示被 audit 自动 supersede(非 raw 来源,人工裁决/conflict resolve 的
     # superseded_by 永远是真实 raw_id,不会为 0)。
     last_audited_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # directive 文本的 bge-m3 1024 维向量, fp16 编码 (2048 字节)。
+    # 跨 scope 语义相似 fallback 用: scope 不同但向量余弦 ≥ 0.85 → 挂"同义疑似"冲突。
+    # 空 bytes / None 表示没算 (老数据未 backfill 或 embed 失败), 语义 fallback 直接跳过这条。
+    embedding: Mapped[bytes] = mapped_column(LargeBinary, default=b"")
+
+
+class EntityAlias(Base):
+    """同义实体表 — 把同一个人/对象的不同名字归到一个 canonical 主名。
+
+    用法: 任何 scope_ref 落库前先经过 resolve_alias(name) → canonical_name,
+    Memory 表里只存归一后的名字。 这样 "小猫老师" / "周婷" / "陈雨晴" 这种
+    "同一个人三个叫法" 不会在 Memory 表里产生三条独立 alive directive。
+
+    每行表示一个名字 → 主名映射:
+      ('小猫老师', '周婷', 'manual', ...)
+      ('周婷',    '周婷', 'manual', ...)   ← 主名自映射, 方便统一查
+      ('陈雨晴',  '周婷', 'auto',   ...)   ← 系统判同义后落 (owner 在周报"采纳"过)
+
+    source:
+      - manual:   owner 在消息里显式说 "X 就是 Y" 抽出来的
+      - auto:     向量阈值挂冲突 + owner 选 "采纳/都留" 后系统回写
+      - reverted: owner 选 "保留" → 标记两者**不是**同义, 后续不再合并
+                  (这条同样落表, 只是 canonical 等于 name 自身, 防止 auto 路径再触发)
+    """
+
+    __tablename__ = "entity_alias"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(128), unique=True)
+    canonical: Mapped[str] = mapped_column(String(128))
+    source: Mapped[str] = mapped_column(String(16), default="manual")  # manual/auto/reverted
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
 class PendingRouting(Base):
