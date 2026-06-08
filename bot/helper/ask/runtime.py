@@ -278,6 +278,20 @@ def ask(
     #   - global scope 一律拼
     from helper.memory import directives_for_ask
     entity_refs = [h.ref for h in hits if h.type == "entity"]
+    # asker 自己的 canonical 中文名也注入 — 让 scope=entity:<asker 中文名> 的
+    # directive 在他 @bot 提问时生效 (题面里没有他名字也能命中)。 alias 表没记录
+    # 时走 wave OpenAPI lazy 拉一次落 source='auto' 缓存。
+    if asker_domain:
+        try:
+            from helper.memory.alias import resolve_alias
+            asker_canon = resolve_alias(asker_domain)
+            if asker_canon == asker_domain:
+                from helper.im.wave_user import ensure_alias_for_domain
+                asker_canon = ensure_alias_for_domain(asker_domain)
+            if asker_canon and asker_canon != asker_domain:
+                entity_refs.append(asker_canon)
+        except Exception:  # noqa: BLE001
+            log.exception("asker→canonical resolve failed asker=%s", asker_domain)
     directive_ids = [int(h.ref) for h in hits if h.type == "directive" and h.ref.isdigit()]
     prefs = directives_for_ask(entity_refs=entity_refs, directive_ids=directive_ids)
     system_prompt = SYSTEM_PROMPT + ("\n\n" + prefs if prefs else "")
