@@ -296,6 +296,43 @@ def test_conflict_logged_when_same_scope_already_has_alive(db, settings, llm_stu
         assert conflicts[0].target_slug == str(mems[0].id)
 
 
+def test_extract_inherits_route_app_id_when_new_raw_has_none(db, settings, llm_stub):
+    """同 scope 旧 memory 有 route_app_id, 新 raw 是"修正前提"型(原文不含 cli_xxx)
+    → LLM 抽出来的 route_app_id 是空 → 代码层应自动从旧条继承。
+
+    动机: raw#533 实测踩到的真坑 — owner 写"修正一下找 tachi 的前提...", LLM
+    抽出新指令但丢了 route_app_id, 后续 ROUTE 路径反查 tachi 落空。
+    """
+    from helper.memory import extract_for_raw
+    from helper.storage import session
+    from helper.storage.models import Memory
+
+    # seed: 旧 memory 带 route_app_id
+    r1 = _seed_raw("路由 X 类问题给 tachi, app_id 是 cli_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    llm_stub.set("memory_extract", json.dumps({"directives": [{
+        "scope_type": "entity", "scope_ref": "tachi",
+        "directive": "X 类问题路由给 tachi",
+        "route_app_id": "cli_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    }]}))
+    extract_for_raw(r1)
+
+    # 新 raw: 修正前提, 文本里没 cli_xxx → LLM 也只能给 route_app_id="" 的 directive
+    r2 = _seed_raw("修正一下: 只有 X 子集才路由给 tachi")
+    llm_stub.set("memory_extract", json.dumps({"directives": [{
+        "scope_type": "entity", "scope_ref": "tachi",
+        "directive": "只有 X 子集才路由给 tachi",
+        "route_app_id": "",
+    }]}))
+    extract_for_raw(r2)
+
+    with session() as s:
+        new_mem = s.execute(
+            select(Memory).where(Memory.scope_ref == "tachi").order_by(Memory.id.desc())
+        ).scalars().first()
+        # 新条目继承了旧的 route_app_id, 不再是空
+        assert new_mem.route_app_id == "cli_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+
 def test_conflict_resolve_supersede_marks_old_memory(db, settings, llm_stub):
     """裁决"采纳新"(superseded) → 旧 memory 打 superseded_at,新 memory 仍 alive。"""
     from helper.conflict.detector import resolve
