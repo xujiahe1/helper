@@ -48,6 +48,7 @@ from helper.storage.models import (
     ConflictLog,
     InboxDigest,
     InquiryLog,
+    RawInput,
     SpecCandidate,
 )
 
@@ -351,15 +352,20 @@ def _handle_batch_answers(
     sender_domain: str,
     *,
     backqueries: list[int] | None = None,
+    section_actions: list[tuple[str, int, int]] | None = None,
 ) -> ReplyResult:
-    """处理一条消息里多行 3-N 批量回执。
+    """处理一条消息里混合的 1-N / 2-N 指令 + 多行 3-N 答复 + 反向追问。
 
-    items: [(n, answer_text), ...] — 真答复行, 走 _handle_answer_group(LLM 判覆盖,
-        覆盖到的子追问 record_answer + close)。 一条消息只算一次 schedule_l1。
-    backqueries: [n, ...] — 反向追问行(答复文本 = "展开说说"/"讲讲"等), 不动这些
-        主题组的子追问, 留 open 下次周报继续。
+    items: [(n, answer_text), ...] — 3-N 真答复, 走 _handle_answer_group。
+    backqueries: [n, ...] — 反向追问行, 走 _explain_inquiry 让 bot 真给一段解释,
+        子追问留 open 下次周报继续。
+    section_actions: [(action, section, n), ...] — 与 3-N 答复同消息混合的
+        1-N (批准/驳回/跳过) / 2-N (采纳/保留/都留) 指令; 整条规则正则原本只匹配
+        "整段文本就一行" 的形态, 用户在同一条消息里把规约/冲突指令和 3-N 答案
+        合并发就会被静默丢弃, 这里补回。
     """
     backqueries = backqueries or []
+    section_actions = section_actions or []
     payload = _load_digest_payload(sender_domain)
     if payload is None:
         return ReplyResult(text="⚠️ 还没有最近的 inbox 周报记录,请先发一次「/inbox」。")
@@ -368,8 +374,36 @@ def _handle_batch_answers(
         # 真答复需要 raw_id 绑定; 纯反问无答可记, 不强求 raw_id
         return ReplyResult(text="⚠️ 内部异常:答复消息没有 raw_id,请稍后重试。")
 
-    head = f"📝 已批量记录 {len(items)} 条答复(raw#{answer_raw_id})。" if items else "📝 收到批量回复。"
-    parts: list[str] = [head]
+    parts: list[str] = []
+    actions: list[tuple[str, int]] = []
+
+    # 1) 先处理 1-N / 2-N 指令(独立于 3-N 答复)
+    for action, section, n in section_actions:
+        target_id = _resolve_section_id(payload, section, n)
+        if target_id is None:
+            parts.append(f"\n⚠️ {section}-{n} 在最近一次周报里找不到,跳过。")
+            continue
+        if section == 1:
+            spec_action = {"批准": "approve", "approve": "approve",
+                           "驳回": "reject", "reject": "reject",
+                           "跳过": "skip", "skip": "skip"}.get(action)
+            if spec_action is None:
+                parts.append(f"\n⚠️ 1-{n} 仅支持「批准/驳回/跳过」,收到「{action}」,跳过。")
+                continue
+            sub = _handle_spec_action(spec_action, target_id, sender_domain)
+        elif section == 2:
+            sub = _handle_conflict_action(action, target_id, sender_domain)
+        else:
+            continue
+        parts.append(f"\n— {section}-{n} —\n{sub.text}")
+        actions.extend(sub.after_actions)
+
+    # 2) 3-N 答复(原批量逻辑)
+    if items:
+        parts.insert(0, f"📝 已批量记录 {len(items)} 条答复(raw#{answer_raw_id})。")
+    elif section_actions or backqueries:
+        parts.insert(0, "📝 收到批量回复。")
+
     handled_groups = 0
     closed_total = 0
     skipped_total = 0
@@ -378,16 +412,12 @@ def _handle_batch_answers(
         if not ids:
             parts.append(f"\n⚠️ 3-{n} 在最近一次周报里找不到,跳过。")
             continue
-        # 借用 _handle_answer_group 内部逻辑, 但不重复 raw 绑定 / schedule_l1
-        # 直接构造一个独立的 sub-result, 把它的关闭/跳过统计合并进 parts
         sub = _handle_answer_group(ids, answer_text, answer_raw_id, sender_domain)
         handled_groups += 1
-        # 抠 sub.text 头部的 "已记录答复" 那行去掉, 保留下面的关闭/跳过明细
         sub_lines = sub.text.split("\n")
         body_lines = [ln for ln in sub_lines if not ln.startswith("📝 已记录答复")]
         parts.append(f"\n— 3-{n} —")
         parts.extend(body_lines)
-        # 顺手统计 (粗略 — sub.text 里有"关闭 N 条"形态)
         for ln in body_lines:
             if "关闭" in ln and "条子追问" in ln:
                 m = re.search(r"关闭\s+(\d+)\s+条", ln)
@@ -398,20 +428,35 @@ def _handle_batch_answers(
                 if m:
                     skipped_total += int(m.group(1))
 
+    # 3) 反向追问 — 真调 ask 路径生成解释, 子追问保持 open
+    for n in backqueries:
+        ids = _resolve_inquiry_group(payload, n)
+        if not ids:
+            parts.append(f"\n⚠️ 3-{n} 在最近一次周报里找不到,跳过。")
+            continue
+        explanation = _explain_inquiry_group(ids)
+        parts.append(f"\n— 3-{n}(展开)—\n{explanation}")
+
     if backqueries:
         parts.append(
-            f"\n\n🔁 识别到 {len(backqueries)} 条反向追问(展开说说/讲讲等), "
-            f"未当作答复, 这些主题留 open 下次周报继续: "
+            f"\n\n🔁 识别到 {len(backqueries)} 条反向追问 — 已尝试展开解释, "
+            "对应主题组保持 open, 下次周报继续出: "
             + ", ".join(f"3-{n}" for n in backqueries)
         )
 
-    parts.append(
-        f"\n\n汇总: 处理 {handled_groups} 个主题组, "
-        f"共关闭 {closed_total} 条子追问, {skipped_total} 条留 open"
-        + (f", {len(backqueries)} 条反问留 open" if backqueries else "")
-        + "。"
-    )
-    actions: list[tuple[str, int]] = []
+    summary_bits = []
+    if section_actions:
+        summary_bits.append(f"处理 {len(section_actions)} 条规约/冲突指令")
+    if handled_groups:
+        summary_bits.append(
+            f"处理 {handled_groups} 个主题组, "
+            f"共关闭 {closed_total} 条子追问, {skipped_total} 条留 open"
+        )
+    if backqueries:
+        summary_bits.append(f"{len(backqueries)} 条反问展开解释")
+    if summary_bits:
+        parts.append("\n\n汇总: " + "; ".join(summary_bits) + "。")
+
     if items and answer_raw_id:
         actions.append(("schedule_l1", answer_raw_id))
     return ReplyResult(text="".join(parts), after_actions=actions)
@@ -484,6 +529,57 @@ def _handle_answer_group(
         text="\n".join(parts),
         after_actions=[("schedule_l1", answer_raw_id)],
     )
+
+
+# ---------- 反向追问展开 ----------
+
+
+_EXPLAIN_SYSTEM_PROMPT = """你帮 owner 看懂周报里这条追问到底在问什么。
+
+输入会给你一条或多条同主题的子追问 + 原始 raw 上下文。请用中文输出 2-4 句话:
+1. 这条追问的核心点是什么 (用 owner 容易理解的话复述, 不要照抄原句)
+2. 为什么 bot 当时要追问 (raw 里缺了什么信息)
+3. owner 想关闭这条, 大概要回答哪几点
+
+不要 markdown 标题, 不要分段, 不要引用原文长段落。直接给一段紧凑的解释。"""
+
+
+def _explain_inquiry_group(inquiry_ids: list[int]) -> str:
+    """对一组同主题子追问跑 ask 模型, 给 owner 一段解释。
+
+    复用 ask task 的模型路由(走 sonnet), 不新增 task 类型也不写 AskAnswer 表 ——
+    这是 owner 自己看 inbox 时的辅助说明, 不算用户向 bot 提的问题。
+    """
+    with session() as s:
+        rows = list(s.execute(
+            select(InquiryLog).where(InquiryLog.id.in_(inquiry_ids))
+        ).scalars())
+        if not rows:
+            return "⚠️ 找不到对应子追问。"
+        raw_ids = {r.raw_id for r in rows if r.raw_id}
+        raws = {}
+        if raw_ids:
+            for r in s.execute(select(RawInput).where(RawInput.id.in_(raw_ids))).scalars():
+                raws[r.id] = (r.author_domain or "", r.content_text or "")
+
+    parts = ["## 这组追问"]
+    for r in rows:
+        parts.append(f"- (inquiry#{r.id}) {(r.question or '').strip()}")
+    if raws:
+        parts.append("\n## 触发追问的原始消息")
+        for rid, (author, text) in raws.items():
+            snippet = text.strip()
+            if len(snippet) > 600:
+                snippet = snippet[:600] + "…"
+            parts.append(f"- raw#{rid} (作者: {author or '-'}):\n{snippet}")
+    user_msg = "\n".join(parts)
+
+    try:
+        reply = run("ask", system=_EXPLAIN_SYSTEM_PROMPT, user=user_msg, temperature=0.3)
+    except Exception as e:  # noqa: BLE001
+        log.warning("explain inquiry failed ids=%s: %s", inquiry_ids, e)
+        return "⚠️ 解释生成失败,请稍后重试或直接回答原追问。"
+    return (reply or "").strip() or "⚠️ 模型没给出解释,请直接回答原追问。"
 
 
 # ---------- memory_audit 首跑确认 ----------
@@ -578,30 +674,38 @@ def try_handle(
             # 「答」走 _SECTION_ANSWER_RE,这里不会到;到了说明误用了批准/驳回 + 3-N
             return ReplyResult(text="⚠️ 3-N(追问)请用「答 3-N 你的答案」。")
 
-    # 2) 周报式: 答 3-N <文本> — 走主题组路径,LLM 判覆盖 → 一答 close 多条
+    # 2) 周报式: 答 3-N <文本> — 单条答复直接走主题组; 反向追问短语走解释路径
     m = _SECTION_ANSWER_RE.match(text)
     if m is not None:
         n = int(m.group(1))
         answer_text = (m.group(2) or "").strip()
-        if not answer_raw_id:
-            return ReplyResult(text="⚠️ 内部异常:答复消息没有 raw_id,请稍后重试。")
         payload = _load_digest_payload(sender_domain)
         if payload is None:
             return ReplyResult(text="⚠️ 还没有最近的 inbox 周报记录,请先发一次「/inbox」。")
         ids = _resolve_inquiry_group(payload, n)
         if not ids:
             return ReplyResult(text=f"⚠️ 3-{n} 在最近一次周报里找不到,请核对编号。")
+        if _BACKQUERY_RE.match(answer_text):
+            return ReplyResult(
+                text=f"— 3-{n}(展开)—\n{_explain_inquiry_group(ids)}\n\n"
+                     f"🔁 这条追问保持 open, 下次周报继续出, 你给出正式答复后会一起 close。"
+            )
+        if not answer_raw_id:
+            return ReplyResult(text="⚠️ 内部异常:答复消息没有 raw_id,请稍后重试。")
         return _handle_answer_group(ids, answer_text, answer_raw_id, sender_domain)
 
-    # 2.5) 多行批量回执: 一条消息含 ≥ 2 行形如「3-N <答案>」(可省「答」字)
-    # 例: owner 拷贝周报里 14 个 3-N 主题组, 每行写一个答案。
-    # 单行省「答」也能命中(只 1 个匹配也走批量路径, 不影响单条)。
-    # 反向追问行(answer 文本 = "展开说说"/"讲讲"等)单独归到 backqueries,
-    # 不进 record_answer, 留 open 下次周报继续出。
+    # 2.5) 多行批量回执: 一条消息可混合 1-N / 2-N 指令 + 多行 3-N 答复 + 反向追问
+    # 例: owner 拷贝周报里 14 个 3-N 主题组, 每行写一个答案; 顶上再带一行「采纳 2-1」。
+    # 反向追问行(答复文本 = "展开说说"/"讲讲"等)走解释路径, 子追问留 open。
     lines = [ln for ln in text.splitlines() if ln.strip()]
     batch: list[tuple[int, str]] = []
     backqueries: list[int] = []
+    section_actions: list[tuple[str, int, int]] = []
     for ln in lines:
+        sa = _SECTION_ACTION_RE.match(ln)
+        if sa is not None:
+            section_actions.append((sa.group(1).lower(), int(sa.group(2)), int(sa.group(3))))
+            continue
         m = _LINE_ANSWER_LOOSE_RE.match(ln)
         if m is None:
             continue
@@ -616,10 +720,13 @@ def try_handle(
             backqueries.append(n)
         else:
             batch.append((n, ans))
-    matched = len(batch) + len(backqueries)
-    # 至少要 2 行命中(含反问行), 才认这是批量回执 — 避免普通闲聊误触发
+    matched = len(batch) + len(backqueries) + len(section_actions)
+    # 至少要 2 行命中(含反问/规约/冲突指令), 才认这是批量回执 — 避免普通闲聊误触发
     if matched >= 2 and matched >= max(1, len(lines) // 2):
-        return _handle_batch_answers(batch, answer_raw_id, sender_domain, backqueries=backqueries)
+        return _handle_batch_answers(
+            batch, answer_raw_id, sender_domain,
+            backqueries=backqueries, section_actions=section_actions,
+        )
 
     # 3) 老格式: 批准/驳回/跳过 #N(直接当 SpecCandidate.id)
     m = _LEGACY_ACTION_RE.match(text)

@@ -203,19 +203,21 @@ def test_try_handle_answer_not_double_bind(db, settings, make_raw, monkeypatch):
         assert iq.answer_raw_id == first_rid  # 第一次的 raw,没被覆盖
 
 
-def test_try_handle_batch_skips_backquery_lines(db, settings, make_raw, monkeypatch):
-    """batch 回执里, "3-N 展开说说"/"3-N 讲讲" 等反问行不进 record_answer, 留 open。"""
+def test_try_handle_batch_skips_backquery_lines(db, settings, llm_stub, make_raw):
+    """batch 回执里, "3-N 展开说说"/"3-N 讲讲" 等反问行不进 record_answer,
+    走 ask 模型生成解释, 子追问留 open 下次周报继续出。"""
     import json
     from helper.inbox import try_handle_reply
     from helper.storage import session
     from helper.storage.models import InboxDigest, InquiryLog
+
+    llm_stub.set("ask", "这条追问在问 X, 你需要回答 Y 才能 close。")
 
     qrid = make_raw("q")
     iq_a = _make_inquiry(qrid, "问题 A?")
     iq_b = _make_inquiry(qrid, "问题 B?")
     iq_c = _make_inquiry(qrid, "问题 C?")
 
-    # 造 inbox_digest, owner 视图里 3-1 → [iq_a], 3-2 → [iq_b], 3-3 → [iq_c]
     payload = {"specs": [], "conflicts": [], "inquiries": [[iq_a], [iq_b], [iq_c]]}
     with session() as s:
         s.add(InboxDigest(
@@ -227,13 +229,55 @@ def test_try_handle_batch_skips_backquery_lines(db, settings, make_raw, monkeypa
     text = "3-1 真答案 A\n3-2 展开说说\n3-3 讲讲"
     r = try_handle_reply(text, sender_domain="owner", chat_id="", answer_raw_id=answer_rid)
     assert r is not None
-    # iq_a 被关闭(单条直接 close), iq_b/iq_c 留 open
     with session() as s:
         assert s.get(InquiryLog, iq_a).answer_raw_id == answer_rid
         assert s.get(InquiryLog, iq_b).answer_raw_id is None
         assert s.get(InquiryLog, iq_c).answer_raw_id is None
     assert "反向追问" in r.text
-    assert "3-2" in r.text and "3-3" in r.text
+    assert "这条追问在问 X" in r.text
+    # ask 被调了 2 次(3-2 + 3-3 各一次)
+    assert sum(1 for c in llm_stub.calls if c[0] == "ask") == 2
+
+
+def test_try_handle_batch_mixed_section_action_and_answers(db, settings, llm_stub, make_raw, monkeypatch):
+    """同一条消息混合 「采纳 2-1」+ 「3-N 答复」: 都要被识别处理, 不能丢任何一条。"""
+    import json
+    from helper.inbox import try_handle_reply
+    from helper.storage import session
+    from helper.storage.models import ConflictLog, InboxDigest, InquiryLog
+
+    qrid = make_raw("q")
+    iq_a = _make_inquiry(qrid, "问题 A?")
+
+    with session() as s:
+        cl = ConflictLog(
+            raw_id=qrid, target_type="memory", target_slug="42",
+            summary="新旧 directive 冲突", severity="medium",
+        )
+        s.add(cl)
+        s.flush()
+        cl_id = cl.id
+
+    payload = {"specs": [], "conflicts": [cl_id], "inquiries": [[iq_a]]}
+    with session() as s:
+        s.add(InboxDigest(
+            owner_domain="owner",
+            items_json=json.dumps(payload, ensure_ascii=False),
+        ))
+
+    resolved: list[tuple[int, str, str]] = []
+    def _fake_resolve(log_id, *, resolution, resolver_domain):
+        resolved.append((log_id, resolution, resolver_domain))
+        return True
+    monkeypatch.setattr("helper.conflict.resolve", _fake_resolve)
+
+    answer_rid = make_raw("批量回复")
+    text = "采纳 2-1\n\n3-1 真答案 A"
+    r = try_handle_reply(text, sender_domain="owner", chat_id="", answer_raw_id=answer_rid)
+    assert r is not None
+    assert resolved == [(cl_id, "superseded", "owner")]
+    with session() as s:
+        assert s.get(InquiryLog, iq_a).answer_raw_id == answer_rid
 
 
 def test_send_to_calls_wave(db, settings, llm_stub, wave_send_log):
