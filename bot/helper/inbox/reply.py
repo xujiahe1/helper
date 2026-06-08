@@ -62,10 +62,26 @@ class ReplyResult:
 
 
 # 周报编号: 「批准 1-3」「采纳 2-1」「都留 2-2」「答 3-2 内容」
+# 反向写法也支持: 「2-1 采纳」「1-3 批准」 — owner 实际写法常常是「先报编号再报动作」
 _SECTION_ACTION_RE = re.compile(
     r"^\s*(批准|驳回|跳过|采纳|保留|都留|approve|reject|skip)\s*([123])-(\d+)\s*$",
     re.IGNORECASE,
 )
+_SECTION_ACTION_REVERSE_RE = re.compile(
+    r"^\s*([123])-(\d+)\s+(批准|驳回|跳过|采纳|保留|都留|approve|reject|skip)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _match_section_action(line: str) -> tuple[str, int, int] | None:
+    """两种写法都试: 「采纳 2-1」(动词在前) 或「2-1 采纳」(编号在前)。命中返 (action, section, n)。"""
+    m = _SECTION_ACTION_RE.match(line)
+    if m is not None:
+        return (m.group(1).lower(), int(m.group(2)), int(m.group(3)))
+    m = _SECTION_ACTION_REVERSE_RE.match(line)
+    if m is not None:
+        return (m.group(3).lower(), int(m.group(1)), int(m.group(2)))
+    return None
 _SECTION_ANSWER_RE = re.compile(
     r"^\s*答\s*3-(\d+)[\s,，::]+(.+)$", re.DOTALL
 )
@@ -649,12 +665,10 @@ def try_handle(
     if _AUDIT_SKIP_RE.match(text):
         return _handle_audit_action("skip", sender_domain)
 
-    # 1) 周报式: 批准/驳回/跳过/采纳/保留/都留 1-N | 2-N | 3-N
-    m = _SECTION_ACTION_RE.match(text)
-    if m is not None:
-        action = m.group(1).lower()
-        section = int(m.group(2))
-        n = int(m.group(3))
+    # 1) 周报式: 批准/驳回/跳过/采纳/保留/都留 1-N | 2-N | 3-N (动词在前/编号在前都支持)
+    sa_single = _match_section_action(text)
+    if sa_single is not None:
+        action, section, n = sa_single
         payload = _load_digest_payload(sender_domain)
         if payload is None:
             return ReplyResult(text="⚠️ 还没有最近的 inbox 周报记录,请先发一次「/inbox」。")
@@ -702,9 +716,9 @@ def try_handle(
     backqueries: list[int] = []
     section_actions: list[tuple[str, int, int]] = []
     for ln in lines:
-        sa = _SECTION_ACTION_RE.match(ln)
+        sa = _match_section_action(ln)
         if sa is not None:
-            section_actions.append((sa.group(1).lower(), int(sa.group(2)), int(sa.group(3))))
+            section_actions.append(sa)
             continue
         m = _LINE_ANSWER_LOOSE_RE.match(ln)
         if m is None:
