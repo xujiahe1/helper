@@ -48,3 +48,5 @@ topics:
     # 话术绕开入口闸自己脑补出敏感名字。
     output_blocklist_terms:
       - "刘佳翔"
+      - "哥学"
+      - "苏州方法论"

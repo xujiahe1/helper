@@ -45,16 +45,25 @@ def _system_prompt() -> str:
     return _SYSTEM_PROMPT_TMPL.format(topics_block="\n".join(blocks))
 
 
-def _parse_tag(reply: str) -> str:
-    """LLM 输出 → topic_id 或空串。'UNCERTAIN' 视为不确定 → 让上层用 default。"""
+def _parse_tag(reply: str, valid_ids: set[str]) -> str:
+    """LLM 输出 → topic_id 或空串。
+
+    LLM 可能先推理再给结论,倒序扫所有行(结论一般在末尾),逐行去标点后
+    整行匹配 valid_ids;命中精确 id 直接返。显式 UNCERTAIN 返空。
+    都没扫到精确 id → 返空串,让上层走 default_on_uncertain。
+
+    整行精确匹配,不做子串匹配 —— 短 id (如 'ge') 容易在中文推理里误命中。
+    """
     body = (reply or "").strip()
-    # LLM 可能多嘴, 取第一个非空 token
     if not body:
         return ""
-    first = body.splitlines()[0].strip().strip('`"\'').rstrip(",;.").strip()
-    if not first or first.lower() == "uncertain":
-        return ""
-    return first
+    for line in reversed(body.splitlines()):
+        token = line.strip().strip('`"\'').rstrip(",;.。").strip()
+        if token in valid_ids:
+            return token
+        if token.lower() == "uncertain":
+            return ""
+    return ""
 
 
 def tag_text(text: str) -> str:
@@ -76,14 +85,9 @@ def tag_text(text: str) -> str:
     for attempt in (1, 2):
         try:
             reply = run("acl_tag", system=_system_prompt(), user=text, temperature=0.0)
-            tag = _parse_tag(reply)
-            if tag == "":
-                return ""  # LLM 明确不命中
-            if tag in valid_ids:
-                return tag
-            # LLM 返了不在白名单里的字符串 → 当不确定走 default
-            log.warning("acl_tag returned unknown id=%r, fall back to default", tag)
-            return acl.default_on_uncertain
+            tag = _parse_tag(reply, valid_ids)
+            # _parse_tag 已保证返回值要么是 valid_ids 中的 id, 要么是空串
+            return tag
         except Exception as e:  # noqa: BLE001
             last_err = e
             log.warning("acl_tag attempt %d failed: %s", attempt, e)

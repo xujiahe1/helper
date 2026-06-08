@@ -41,9 +41,12 @@ tasks:
   # 送 LLM 判断答案语义覆盖了哪些子问题,覆盖的全部一起 close。剩下未覆盖的
   # 留 open,下次周报继续出现。
   inquiry_answer_match: { model: claude-sonnet-4-6, provider: anthropic }
-  # M8 ACL 内容打标: 入库时给 raw 判 topic, ask 入口给 question 判 topic;
-  # 都是结构化短输出(返 topic_id 或空), sonnet 完全够。
-  acl_tag:         { model: claude-sonnet-4-6, provider: anthropic, max_tokens: 64 }
+  # M8 ACL 内容打标: 入库时给 raw 判 topic, ask 入口给 question 判 topic。
+  # 用 qwen3.6-flash: flash 级判定任务,准确率够 + 成本低 + 速度快。
+  # 不限 max_tokens: 之前限 64 的初衷是"输出就是 ge 这种短 id",但 LLM 实际会先
+  # 做一段自然语言推理再给结论,64 token 把推理截掉,_parse_tag 取不到合法 id
+  # → default,导致大量漏判。放开后让推理走完,_parse_tag 倒序扫所有行精确匹配。
+  acl_tag:         { model: qwen3.6-flash, provider: openai }
   # M9 路由场景: 外部 bot (如 tachi) 私聊回 helper, helper 用这个 task 把对方
   # 原文重新组织成 markdown 卡片再回贴原会话 — 对方可能输出扁平 i18n_text(表格被
   # 压成空格连续行)或带组件的 card(form/button 在 helper app 下过不了校验),
@@ -58,7 +61,7 @@ tasks:
   # ── L1 预筛(mini): 群聊"听"路径上,关键词没命中时让小模型快速判 yes/no ──
   # 群消息无差别全量跑 Sonnet L1 太烧;关键词预筛覆盖大头,边缘 case 让 mini 兜底。
   # 输入只是一句话,目标是过滤噪音,准确率 80% 也比全量 Sonnet 经济得多。
-  l1_prefilter:    { model: gemini-3.5-flash, provider: openai }
+  l1_prefilter:    { model: qwen3.6-flash, provider: openai }
 
   # ── 批量后台: M3 起才用上 ──
   # 用途: 文档批量 ingest 抽事实候选 / Replay judge / L2 候选 entity 批量抽取
@@ -67,11 +70,10 @@ tasks:
   # 整篇文档的章节/段落切片在调用方用规则做,不用 LLM。
   # 整篇长文的"全局理解"(主旨/大方向)走 Sonnet/Opus 主路径,不是 bulk_extract。
   #
-  # 选 Gemini flash 而非 Claude 的理由:
+  # 选 Qwen flash 而非 Claude 的理由:
   #   1. 切片后单元的简单抽取,flash 级模型准确率够 + 速度快 + 成本低 1-2 个量级
   #   2. 大批量打标场景把成本压在小模型上,主路径 Sonnet/Opus 留给推理任务
-  # 注:Gemini 输出常带 ```json ... ``` 围栏,parse 层 (batch/ingest._parse_json) 已兼容。
-  bulk_extract:    { model: gemini-3.5-flash, provider: openai }
+  bulk_extract:    { model: qwen3.6-flash, provider: openai }
 
   # ── Embedding (走专用入口 helper.llm.embed,不通过 run()) ──
   # bge-m3: BAAI 开源,中文检索表现强,1024 维(text-embedding-3-large 是 3072 维,
