@@ -135,6 +135,15 @@ Wave union_id / user_id
 > IAM SDK / 认证网关 是给**登录用户身份**(浏览器/桌面 agent)用的,bot 后台 daemon
 > 用应用凭据自己换 access_token + 直接拿身份,链路更短。
 
+**EntityAlias 自动回填**(M5 用):`bot/helper/im/wave_user.py::get_user_chinese_names()`
+按域账号批量(单次 ≤ 200)调 `/openapi/contact/v1/users/get?uid_type=user_id` 拿
+`name`(中文名),写 `entity_alias(name=域账号, canonical=中文名, source='auto')`。
+两个触发点:
+- ask 路径 lazy 拉:asker_domain 在 alias 表查不到 → `ensure_alias_for_domain()` 当场拉一次,失败不阻塞 ask 主链路
+- 一次性 backfill:`scripts/backfill_wave_user_aliases.py` 扫 `ask_answers.asker_domain` + `raw_inputs.author_domain` 全集铺满
+
+落库后,scope=entity:<中文名> 的 directive 在该 asker 下次提问时即可被注入(详见 architecture.md §3.7 命中路径第 3 路)。
+
 ### 2.7 Topic ACL 数据流(M8)
 
 按数据流顺序 4 道闸,任一命中即生效:
