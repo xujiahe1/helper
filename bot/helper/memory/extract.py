@@ -30,47 +30,52 @@ log = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """你的任务是从用户的话里识别"对 bot 行为的指令"。
 
-# 抽取判定:必须三闸全过才能抽
+# 抽取判定:白名单模式 — 只在落入下列六类形态之一时才抽,其他全部不抽
 
-只有同时满足下面三个条件的内容,才能抽成 directive。任一不满足 → 不抽。
+memory 表只存"约束 bot 自己怎么做"的指令。客观事实、第三方属性、工作流程、
+决策依据等不进 memory(去 L1 / 不进库)。**不在白名单 → 一律不抽**, 即便句子
+带"记住 / 记录下 / 你要知道"等祈使外壳也不抽。
 
-闸 1:**指令的执行动作由 bot 完成**
-  描述第三方人/实体的行为模式、性格、属性、客观事实的内容,即便用对 bot
-  说话的语气("你记住"、"告诉你"、"你知道"),仍是关于第三方/世界的客观陈述,
-  不抽。
-  例外:**用第三方做触发条件,但动作仍由 bot 执行**的情况算 bot 指令,要抽
-  (如"对方是客户时要更礼貌" / "他不喜欢长篇,回答他时简短点" — 动作主语都是 bot)。
+## 白名单(满足任一即可抽)
 
-  闸 1 反面的具体形态(全部不抽,即便带祈使外壳):
-    - **身份纠正/认领**:"X 是 Y / X 不是 Z"、"X 是 Y,不是 W" — 客观事实,
-      改的是世界认知不是 bot 行为(例:"小猫老师是周婷,不是陈雨晴" → 不抽)
-    - **属性/评价陈述 + 祈使外壳**:"X 是 W,记住这一点"、"你要知道 X 很 Y" —
-      "记住"/"你要知道"是表达强调的语气词,本体仍是客观陈述(例:"小猫老师是好人,
-      记住这一点" → 不抽)
-    - **决策依据/技术原理**:"X 不能 Y,因为 Z"、"A 应该 B,原因是 C" — 这是
-      工程/业务决策的"场景→选择→理由"结构,属 L1 decision 范畴,不是 bot 表达
-      方式约束(例:"北杨外包门禁不能直接设为工位楼层,因为 ..." → 不抽,进 L1)
+1. **bot 说话方式**:回答时要/不要 X、用 X 语气、用 X 长度、答得简短/详细、
+   用 X 语言回复、要/不要附引用、要/不要复述身份。
+   例:"回答问题时不要和稀泥,直接给答案" ✅
+2. **路由/转发/艾特**:涉及 X 类问题(由 bot)路由/转发/艾特给 Y。
+   动作主语必须是 bot 自己,不是产品/人。
+   例:"涉及 IAM/认证类问题艾特 tachi" ✅
+   反例:"IAM 需求要让产品艾特杨潇推进" — 动作主语是产品,不是 bot,**不抽**
+3. **称呼**:bot 称呼某人时用 X。
+   例:"陈雨晴本人提问时全程称她为牛姐" ✅
+4. **避谈/隐去**:bot 回答时不要提及 / 隐去 / 不要透露 X。
+   例:"涉及鳕鱼老师的提问应隐去鳕鱼老师" ✅
+5. **答题口径**:对 X 类问题统一回答 / 答案统一用 Y(bot 给出的答案)。
+   例:"对 C 端用户问门禁同步时效统一回答 2 小时" ✅
+   ⚠️ 区分客观事实陈述:"门禁同步实测 2 小时左右" — **不抽**, 这是客观事实, 进 L1
+6. **语义映射**:用户说 X 时按 Y 理解(给 bot 的解析约束)。
+   例:"我说哥时指刘佳翔" ✅(也可走 aliases)
 
-闸 2:**约束的是 bot 怎么说话/怎么呈现答案,不是内容/知识层判断**
-  闸 2 的正面没有封闭枚举:任何形容 bot 表达方式的偏好都算(回复风格、路由
-  去向、避谈、复述与否、称呼、语言、长度、强调、次序、修辞、是否附引用 等等)。
-  闸 2 的反面是确定的:
-    - "哪份资料权威 / 哪个事实最新 / X 取代 Y" 这类**知识层判断**应进 L1
-      (entity / relation / supersession),不进 memory
-    - 即便包着"以 X 为准"、"回答时用 X"这种祈使外壳,只要把它换成
-      "X 是权威 / X 是最新"语义不变,就是知识层,不抽
-    - **替换测试**:把句子换成"X 是 / X 不是 / X 应该 / X 因为"等陈述形态,
-      若语义不变 → 是知识/事实/决策依据,**不抽**;若语义只剩客观描述、丢失了
-      "bot 怎么做"的部分 → 是行为指令,可以抽
+## 黑名单反面(明确不抽,即便句子带祈使语气)
 
-闸 3:**directive 文本里指代必须能 resolve 成唯一确定的对象**
-  历史对话用来把代词映射到具体名字或具体内容片段(如"他"→"刘佳翔"、
-  "那篇"→"X 文档")。必须能从历史对话里 resolve 出**唯一确定**的对象才能抽。
-  - 多义指向的代词("这种情况 / 这么说 / 上面那段"在不同上下文可指多件事)
-    无法 resolve 出唯一对象 → 不抽
-  - 唯一指向的代词("那篇"在上文恰好只出现一篇文档)→ 解析后写进 directive,
-    可以抽
-  - 当前消息里完全没有代词的 → 此闸默认通过
+- **客观事实/数据/技术参数**:"门禁同步 2 小时"、"X 接口的 token 15 天有效"
+- **第三方属性/评价/性格**:"X 不懂 Y"、"X 性格内向"、"X 是好人"、
+  "鳕鱼老师是开门学者" — 描述世界,不是约束 bot
+- **身份纠正/事实声明**:"X 是 Y"、"X 不是 Z"
+- **协作流程/责任分工**:"X 类需求由 Y 推进"、"X 由 Y 负责处理" —
+  动作主语是人/部门,不是 bot
+- **决策依据/技术原理**:"X 不能 Y 因为 Z"、"A 应该 B 原因是 C" — 进 L1
+- **历史/记录陈述**:"过去 X 发生过 Y" — 进 L1
+
+## 替换测试(辅助判断)
+
+把句子改写成"X 是 / X 应该 / X 因为"等纯陈述形态:
+- 语义不变 → 是知识/事实/属性,**不抽**
+- 语义丢失"bot 怎么做" → 是行为指令,**可能抽**(再核对白名单 1-6)
+
+## 指代消解
+
+directive 文本里出现代词("他"、"那篇"、"这种情况")时, 必须能从历史对话
+**唯一**解析出对象才抽。多义/无法解析 → 不抽。当前消息无代词 → 直接判断。
 
 # 关于历史对话
 
@@ -293,6 +298,40 @@ def _cosine(a: list[float], b: list[float]) -> float:
     return dot / (math.sqrt(na) * math.sqrt(nb))
 
 
+_CONFLICT_JUDGE_SYSTEM = """你是 procedural memory 冲突 judge。给你两条 memory directive (新 vs 旧),
+判断它们是否真的冲突 — 即"在相同对象上不能同时成立"。
+
+输出 JSON: {"verdict": "contradicts | refines | none"}
+
+判断标准:
+- contradicts: 同对象, 新旧不可同时成立 (如"用 X 称呼" vs "用 Y 称呼", "要详细回答" vs "要简短")
+- refines:    同方向具体化或边界补充, 本质相容 (如"涉及 X 时要谨慎" + "涉及 X 的子场景 Y 时要更谨慎")
+- none:       完全不在一个话题上, 无关 (如"用牛姐称呼她" vs "她不懂哥哥的想法" — 一个称呼一个属性, 不冲突)
+
+只输出 JSON, 不要 markdown。"""
+
+
+def _judge_memory_conflict(new_directive: str, old_directive: str) -> str:
+    """判断两条 directive 是否真冲突。 失败/超时 fallback 'contradicts' 保守报冲突, 让人裁。
+
+    返回 verdict: contradicts / refines / none。
+    """
+    user = (
+        f"## 新 directive\n{new_directive}\n\n"
+        f"## 旧 directive\n{old_directive}\n\n## 输出\nJSON。"
+    )
+    try:
+        reply = run("conflict_judge", system=_CONFLICT_JUDGE_SYSTEM, user=user, temperature=0.0)
+    except Exception as e:  # noqa: BLE001
+        log.warning("memory conflict judge LLM failed: %s", e)
+        return "contradicts"
+    data = _parse_json(reply) or {}
+    verdict = str(data.get("verdict", "")).lower().strip()
+    if verdict not in ("contradicts", "refines", "none"):
+        return "contradicts"
+    return verdict
+
+
 def _detect_conflict_target(
     scope_type: str, scope_ref: str, embedding: bytes,
 ) -> tuple[int | None, str]:
@@ -433,6 +472,25 @@ def extract_for_raw(raw_id: int) -> int:
         embedding = _compute_embedding(directive)
         old_id, alias_hint = _detect_conflict_target(scope_type, scope_ref, embedding)
 
+        # 同 scope / 跨 scope 同义撞之后, 在落库前过一道 LLM judge:
+        # 排除"语义无关只是 scope 撞"的假冲突 (如同 global scope 下"门禁同步 2 小时"
+        # vs "回答不要和稀泥")。 judge=none/refines → 不开 ConflictLog, 新旧共存。
+        # 失败 fallback contradicts (保守报冲突让人裁)。
+        suppress_conflict = False
+        if old_id is not None:
+            old_directive = ""
+            with session() as _s:
+                _old = _s.get(Memory, old_id)
+                if _old is not None:
+                    old_directive = _old.directive or ""
+            verdict = _judge_memory_conflict(directive, old_directive)
+            if verdict != "contradicts":
+                log.info(
+                    "memory conflict suppressed raw_id=%s old=%d verdict=%s",
+                    raw_id, old_id, verdict,
+                )
+                suppress_conflict = True
+
         with session() as s:
             mem = Memory(
                 scope_type=scope_type,
@@ -447,7 +505,7 @@ def extract_for_raw(raw_id: int) -> int:
             s.flush()
             new_id = mem.id
 
-            if old_id is not None:
+            if old_id is not None and not suppress_conflict:
                 # 冲突走 inbox 周报裁决,不直接覆盖
                 if alias_hint:
                     # 跨 scope 语义撞 — 提示 owner 三选项, resolve 时回写 alias 表
