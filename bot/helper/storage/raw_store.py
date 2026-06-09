@@ -132,6 +132,7 @@ def list_chat_history(
     since_minutes: int | None = None,
     exclude_raw_id: int | None = None,
     fallback_author: str = "",
+    include_bot: bool = True,
 ) -> list[RawInput]:
     """拉某个会话的近期消息。返回按时间正序(老→新)。
 
@@ -149,6 +150,11 @@ def list_chat_history(
     - since_minutes 优先于 since_days
     - exclude_raw_id 把当前那条排除
     - 仅 IM 来源(source_type 以 im_wave 开头)
+
+    include_bot=False: L1 抽取专用 — bot 自答既不是知识也不是新信号,作为 context
+    喂给 LLM 反而会被切成 section/decision 当成知识(且 author_domain 写的是
+    接收方,LLM 完全识别不出哪行是 bot)。所以 L1 路径硬过滤掉 im_wave_bot*。
+    其他调用方(ask/intent/format_context_block)默认 True 保持现状。
     """
     if since_minutes is not None:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=since_minutes)
@@ -158,6 +164,8 @@ def list_chat_history(
         RawInput.created_at >= cutoff.replace(tzinfo=None),
         RawInput.source_type.like("im_wave%"),
     )
+    if not include_bot:
+        q = q.filter(~RawInput.source_type.like("im_wave_bot%"))
     if chat_id:
         q = q.filter(RawInput.chat_id == chat_id)
     elif fallback_author:

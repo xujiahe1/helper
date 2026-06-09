@@ -88,6 +88,7 @@ def process_raw(
                 since_minutes=30,
                 limit=20,
                 exclude_raw_id=raw_id,
+                include_bot=False,
             )
             if ctx_rows:
                 context_payload = [
