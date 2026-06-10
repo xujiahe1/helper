@@ -160,32 +160,66 @@ def _format_quoted_message(parent_message_id: str, *, asker_domain: str = "") ->
     """
     if not parent_message_id:
         return ""
+    ts = "?"
+    who = "用户"
+    body = ""
     with session() as s:
         row = raw_store.get_by_wave_msg_id(s, parent_message_id)
-        if row is None:
-            return ""
-        if asker_domain:
-            try:
-                from helper.acl import is_allowed
-                if not is_allowed(asker_domain, getattr(row, "acl_topic_id", "") or ""):
-                    log.info(
-                        "acl blocked quoted msg asker=%s topic=%s",
-                        asker_domain, getattr(row, "acl_topic_id", "") or "",
-                    )
+        if row is not None:
+            if asker_domain:
+                try:
+                    from helper.acl import is_allowed
+                    if not is_allowed(asker_domain, getattr(row, "acl_topic_id", "") or ""):
+                        log.info(
+                            "acl blocked quoted msg asker=%s topic=%s",
+                            asker_domain, getattr(row, "acl_topic_id", "") or "",
+                        )
+                        return ""
+                except Exception:  # noqa: BLE001
+                    log.exception("acl quoted-msg check failed; default to not inject")
                     return ""
-            except Exception:  # noqa: BLE001
-                log.exception("acl quoted-msg check failed; default to not inject")
-                return ""
-        ts = row.created_at.strftime("%m-%d %H:%M") if row.created_at else "?"
-        if (row.source_type or "").startswith("im_wave_bot"):
-            who = "bot"
-        else:
-            who = f"用户({row.author_domain or '?'})"
-        body = (row.content_text or "").strip()
-    if len(body) > 800:
-        body = body[:800] + "…"
+            ts = row.created_at.strftime("%m-%d %H:%M") if row.created_at else "?"
+            if (row.source_type or "").startswith("im_wave_bot"):
+                who = "bot"
+            else:
+                who = f"用户({row.author_domain or '?'})"
+            body = (row.content_text or "").strip()
+            # 兜底 1: row 拿到但 content_text 是 envelope JSON (历史 raw 在 merge_forward
+            # 抽取器上线前入库的, 或非 text/rich_text 类型抽不到文本退化存的原文) →
+            # 走 wave OpenAPI 拉一次远端, 用新抽取器再解一遍。
+            if body and (body.startswith("{\"schema\"") or body.startswith("{\"message_list\"")):
+                body = ""
+
+    # 兜底 2: 本地完全反查不到 → 走 wave OpenAPI message/get 拉远端。
+    # 适用场景: bot 没在源群 / 历史早于 bot 入群 / webhook 错过投递。
+    if not body:
+        try:
+            from helper.im import wave_client
+            from helper.im.wave_webhook import extract_text_from_content
+            remote = wave_client.get_message(parent_message_id)
+            if remote:
+                remote_text = extract_text_from_content(
+                    remote.get("msg_type", "") or "",
+                    remote.get("content", "") or "",
+                )
+                if remote_text:
+                    body = remote_text.strip()
+                    log.info(
+                        "quoted parent fallback via OpenAPI parent=%s len=%d",
+                        parent_message_id, len(body),
+                    )
+            else:
+                log.warning(
+                    "quoted parent not in raw_inputs and OpenAPI fetch returned empty parent=%s asker=%s",
+                    parent_message_id, asker_domain,
+                )
+        except Exception:  # noqa: BLE001
+            log.exception("quoted parent OpenAPI fallback failed parent=%s", parent_message_id)
+
     if not body:
         return ""
+    if len(body) > 1500:
+        body = body[:1500] + "…"
     return (
         "## 用户引用的消息(用户在问当前问题时显式引用了这条 — 这就是问题所指的对象)\n"
         f"[{ts}] {who}: {body}"

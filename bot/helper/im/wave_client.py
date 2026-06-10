@@ -343,6 +343,37 @@ def update_card_active(
     )
 
 
+# ---------- 按 msg_id 拉历史消息 ----------
+
+def get_message(msg_id: str) -> dict[str, Any] | None:
+    """按 msg_id 反查单条消息的全量数据。
+
+    用途: ask 路径里 quote 反查本地 raw_inputs 拿不到时(bot 没在那个群 / 历史
+    早于 bot 入群 / 错过投递), 调这个接口直接拉远端原文。
+
+    返回 data.message 字典, 形如 {msg_id, msg_type, content, create_time, ...}
+    跟 webhook envelope 里 event.message 同结构, 可直接喂给 extract_text_from_content。
+
+    抓不到/无权限 → 返 None, 不抛, 不阻塞调用方。
+    """
+    if not msg_id:
+        return None
+    try:
+        data = _post(
+            "/openapi/im/v1/message/get",
+            params={"msg_id": msg_id},
+            json_body={},
+        )
+    except WaveAPIError as e:
+        log.warning("wave message/get failed msg_id=%s: %s", msg_id, e)
+        return None
+    except Exception:  # noqa: BLE001
+        log.exception("wave message/get unexpected error msg_id=%s", msg_id)
+        return None
+    msg = data.get("message")
+    return msg if isinstance(msg, dict) else None
+
+
 # ---------- 拉表情回复(👍/👎 + 其它) ----------
 
 def get_message_reactions(

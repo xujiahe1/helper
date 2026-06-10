@@ -88,57 +88,118 @@ def _extract_message(payload: dict[str, Any]) -> dict[str, Any] | None:
     return msg if isinstance(msg, dict) else None
 
 
-def _extract_message_text(payload: dict[str, Any]) -> str | None:
-    """从 Wave 消息事件里抠出用户的纯文本。
+def extract_text_from_content(msg_type: str, content_str: str) -> str | None:
+    """从 Wave 消息的 (msg_type, content) 抽纯文本。
 
-    Wave/Lark 协议: event.message.content 是个 JSON 字符串,text 类消息形如
-    {"text": "实际内容"};rich_text 形如 {"tags":[{"items":[{"type":"text","content":{"text":"..."}}, ...]}]};
-    其它类型(image / video / file / card)就没有可读文本。抽不到返 None,调用方退化存原文。
+    支持:
+      - text:        {"text": "..."}                          → 直接返
+      - rich_text:   {"tags":[{"items":[{"type":"text"|"url",...}]}]} → 拼接段
+      - merge_forward: {"message_list":[{sender, message}, ...]}      → 递归每条嵌套 message
+                       格式化成 "[姓名/域账号] 正文" 多行, 单条上限 800 字, 总上限 4000 字
+      - card / 其它: 没可读文本, 返 None
+
+    Wave webhook 入站、merge_forward 子消息、OpenAPI message/get 三处都共用这个抽取器。
     """
-    msg = _extract_message(payload)
-    if msg is None:
-        return None
-    content = msg.get("content")
-    if not isinstance(content, str):
+    if not isinstance(content_str, str):
         return None
     try:
-        inner = json.loads(content)
+        inner = json.loads(content_str)
     except json.JSONDecodeError:
         return None
     if not isinstance(inner, dict):
         return None
+
     # text 类
-    text = inner.get("text") or inner.get("content")
-    if isinstance(text, str) and text.strip():
-        return text.strip()
-    # rich_text 类: 把所有段的 text / url 拼起来
-    # 注意: type=="url" 段必须取 content.url 拼进去,否则用户在消息里粘贴的 KM 链接、
-    # 外部链接会被整段丢掉,下游 km_ingest.find_km_urls 永远找不到 URL。
-    tags = inner.get("tags")
-    if isinstance(tags, list):
-        chunks: list[str] = []
-        for tag in tags:
-            if not isinstance(tag, dict):
-                continue
-            items = tag.get("items")
-            if not isinstance(items, list):
-                continue
-            for it in items:
-                if not isinstance(it, dict):
+    if msg_type in ("text", ""):
+        text = inner.get("text") or inner.get("content")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+
+    # rich_text 类: 把所有段的 text / url 拼起来。
+    # type=="url" 段必须取 content.url 拼进去, 否则用户在消息里粘贴的 KM 链接、
+    # 外部链接会被整段丢掉, 下游 km_ingest.find_km_urls 永远找不到 URL。
+    if msg_type in ("rich_text", ""):
+        tags = inner.get("tags")
+        if isinstance(tags, list):
+            chunks: list[str] = []
+            for tag in tags:
+                if not isinstance(tag, dict):
                     continue
-                c = it.get("content")
-                if not isinstance(c, dict):
+                items = tag.get("items")
+                if not isinstance(items, list):
                     continue
-                t = it.get("type")
-                if t == "text" and isinstance(c.get("text"), str):
-                    chunks.append(c["text"])
-                elif t == "url" and isinstance(c.get("url"), str):
-                    chunks.append(c["url"])
-            chunks.append("\n")
-        joined = "".join(chunks).strip()
-        if joined:
-            return joined
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    c = it.get("content")
+                    if not isinstance(c, dict):
+                        continue
+                    t = it.get("type")
+                    if t == "text" and isinstance(c.get("text"), str):
+                        chunks.append(c["text"])
+                    elif t == "url" and isinstance(c.get("url"), str):
+                        chunks.append(c["url"])
+                chunks.append("\n")
+            joined = "".join(chunks).strip()
+            if joined:
+                return joined
+
+    # merge_forward: 把每条嵌套消息抽成可读文本, 格式 "[发送人] 正文"。
+    # bot 自己的回复(card / text 都跳过), 防注入大量 ack 噪音。
+    if msg_type == "merge_forward":
+        msg_list = inner.get("message_list")
+        if isinstance(msg_list, list):
+            lines: list[str] = []
+            total = 0
+            MAX_PER_MSG = 800
+            MAX_TOTAL = 4000
+            for entry in msg_list:
+                if not isinstance(entry, dict):
+                    continue
+                sender = entry.get("sender") or {}
+                inner_msg = entry.get("message") or {}
+                if not isinstance(inner_msg, dict):
+                    continue
+                inner_type = inner_msg.get("msg_type", "") or ""
+                inner_content = inner_msg.get("content", "") or ""
+                # bot 自己发的卡片 / 文本(/inbox 等) 跳过, 不算原对话内容
+                if isinstance(sender, dict) and sender.get("id_type") == "app_id":
+                    continue
+                inner_text = extract_text_from_content(inner_type, inner_content)
+                if not inner_text:
+                    continue
+                if len(inner_text) > MAX_PER_MSG:
+                    inner_text = inner_text[:MAX_PER_MSG] + "…"
+                # 发送人 label: 优先 user_id (域账号), 其次 union_id
+                who = ""
+                if isinstance(sender, dict):
+                    if sender.get("id_type") == "user_id":
+                        who = sender.get("id") or ""
+                    else:
+                        who = sender.get("id") or ""
+                line = f"[{who}] {inner_text}" if who else inner_text
+                lines.append(line)
+                total += len(line)
+                if total > MAX_TOTAL:
+                    lines.append("(以下内容过长已截断)")
+                    break
+            joined = "\n".join(lines).strip()
+            if joined:
+                return joined
+
     return None
+
+
+def _extract_message_text(payload: dict[str, Any]) -> str | None:
+    """从 Wave webhook payload 里抠出用户的纯文本。 实质委托 extract_text_from_content。"""
+    msg = _extract_message(payload)
+    if msg is None:
+        return None
+    content = msg.get("content")
+    msg_type = msg.get("msg_type", "") if isinstance(msg.get("msg_type"), str) else ""
+    if not isinstance(content, str):
+        return None
+    return extract_text_from_content(msg_type, content)
 
 
 def _extract_sender(payload: dict[str, Any]) -> tuple[str, str]:
@@ -343,6 +404,21 @@ async def wave_callback(
     wave_msg_id = msg.get("msg_id", "") if isinstance(msg.get("msg_id"), str) else ""
     parent_msg_id = msg.get("quote_msg_id", "") if isinstance(msg.get("quote_msg_id"), str) else ""
     thread_id = msg.get("thread_id", "") if isinstance(msg.get("thread_id"), str) else ""
+
+    # 诊断: 入站消息事件统一打一行 WARN, 看 msg_type / quote / extracted 长度 /
+    # content 头 200 字。 用于排查 quote 反查不到 / image / merge_forward 等抽不到文本场景。
+    try:
+        _content_head = (msg.get("content") or "")[:200] if isinstance(msg.get("content"), str) else ""
+        log.warning(
+            "wave webhook in: event=%s msg_id=%s msg_type=%s quote=%s thread=%s "
+            "chat=%s sender=%s/%s extracted_len=%s content_head=%r",
+            event_type, wave_msg_id, media_type, parent_msg_id, thread_id,
+            chat_id, sender_id, sender_id_type,
+            len(extracted) if isinstance(extracted, str) else None,
+            _content_head,
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("wave webhook in: diag log failed")
 
     def _persist_raw() -> int:
         with session() as sess:
